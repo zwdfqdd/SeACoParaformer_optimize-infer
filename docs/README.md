@@ -7,7 +7,8 @@
 ### 系统要求
 
 - Python >= 3.12
-- CUDA 12.1（GPU 推理）
+- CUDA 12.1 + cuDNN 9（GPU 推理）
+- onnxruntime-gpu == 1.19.2
 - Docker + Docker Compose
 
 ### 安装依赖
@@ -35,12 +36,15 @@ python scripts/download_vad.py --output-dir ./models/vad
 models/
 ├── asr/
 │   ├── fp16/
-│   │   ├── model.onnx       # ASR 主模型（fp16）
+│   │   ├── model.onnx       # ASR 主模型（fp16，线上部署用）
 │   │   └── model_eb.onnx    # 热词 bias encoder（fp16）
 │   ├── fp32/
 │   │   ├── model.onnx       # ASR 主模型（fp32，验证用）
 │   │   └── model_eb.onnx    # bias encoder（fp32）
 │   ├── am.mvn               # CMVN 归一化参数
+│   ├── config.yaml          # 模型配置
+│   ├── configuration.json   # 模型元信息
+│   ├── seg_dict             # 分词词典
 │   └── tokens.json          # 词表文件
 └── vad/
     └── silero_vad.onnx      # VAD 模型

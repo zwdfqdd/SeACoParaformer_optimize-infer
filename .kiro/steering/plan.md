@@ -6,8 +6,10 @@
     1.构建运行环境，分为模型转化环境和模型推理环境。有gpu使用gpu,没有则使用cpu
         1).环境与部署
             Python 版本>=3.12
-            GPU 推理时 CUDA/cuDNN 版本. cuda:12.1
+            GPU 推理时 CUDA/cuDNN 版本: CUDA 12.1 + cuDNN 9（通过 NVIDIA apt 源安装 libcudnn9-cuda-12）
+            onnxruntime-gpu==1.19.2（要求 cuDNN 9）
             Docker 内部署,Dockerfile 编写、镜像分层策略、多阶段构建分离转换环境和推理环境
+            pip 源：清华镜像加速（pypi.tuna.tsinghua.edu.cn）
             模型文件存放路径：models/{asr,vad}
         2).requirements.txt
             提供 requirements-convert.txt 与 requirements-infer.txt
@@ -113,6 +115,10 @@
         10).HTTP status code 约定：正常 200，参数错误 400，服务内部错误 500
         11).推理优化：
             ONNX Runtime 开启 graph_optimization_level=ORT_ENABLE_ALL
+            ONNX Runtime 禁用内存模式（enable_mem_pattern=False, enable_cpu_mem_arena=False）：
+                原因：CIF predictor 输出动态 token 数量，ORT 内存缓存会因 shape 变化导致
+                      第二次推理时 decoder self_attn Mul 节点广播失败（180 is invalid）
+                影响：每次推理重新分配内存，性能略降（约 5-10%），但保证多次推理稳定性
             GPU 推理使用 IO Binding 减少数据拷贝
             服务启动时模型预热（dummy inference）
             batch 内按音频段长度分桶（bucket 队列划分为 5s/8s/12s/15s），减少 padding 开销

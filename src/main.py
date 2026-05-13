@@ -127,12 +127,14 @@ def _reload_config():
 
 
 def _load_resources():
-    """加载 CMVN 参数和 Tokenizer 词表。"""
+    """加载 CMVN 参数和 Tokenizer 词表。配置文件统一在 models/asr 下。"""
     global _cmvn_mean, _cmvn_istd
     import os
 
+    config_dir = settings.get_asr_config_dir()  # models/asr
+
     # 加载 CMVN
-    cmvn_path = os.path.join(settings.MODEL_DIR, "asr", "fp16", "am.mvn")
+    cmvn_path = os.path.join(config_dir, "am.mvn")
     if os.path.exists(cmvn_path):
         try:
             _cmvn_mean, _cmvn_istd = load_cmvn(cmvn_path)
@@ -143,9 +145,9 @@ def _load_resources():
         logger.warning(f"CMVN 文件不存在: {cmvn_path}，将跳过归一化")
 
     # 加载 Tokenizer
-    vocab_path = os.path.join(settings.MODEL_DIR, "asr", "fp16", "tokens.json")
+    vocab_path = os.path.join(config_dir, "tokens.json")
     if not os.path.exists(vocab_path):
-        vocab_path = os.path.join(settings.MODEL_DIR, "asr", "fp16", "tokens.txt")
+        vocab_path = os.path.join(config_dir, "tokens.txt")
 
     if os.path.exists(vocab_path):
         try:

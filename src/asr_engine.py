@@ -64,6 +64,10 @@ class ASREngine:
 
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # 禁用内存模式：CIF predictor 输出动态 token 数量，
+        # ORT 内存缓存会因 shape 变化导致第二次推理 Mul 广播失败
+        sess_options.enable_mem_pattern = False
+        sess_options.enable_cpu_mem_arena = False
 
         if self._device == "cpu":
             cpu_count = os.cpu_count() or 4

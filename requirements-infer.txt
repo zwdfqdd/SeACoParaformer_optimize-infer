@@ -1,5 +1,5 @@
 # 推理服务环境依赖
-onnxruntime-gpu==1.18.1
+onnxruntime-gpu==1.19.2
 torch==2.3.1
 torchaudio==2.3.1
 numpy>=1.26.0

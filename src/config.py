@@ -48,5 +48,10 @@ class Settings:
     def get_vad_model_path(cls) -> str:
         return os.path.join(cls.MODEL_DIR, "vad", "silero_vad.onnx")
 
+    @classmethod
+    def get_asr_config_dir(cls) -> str:
+        """ASR 配置文件目录（am.mvn, tokens.json 等）。"""
+        return os.path.join(cls.MODEL_DIR, "asr")
+
 
 settings = Settings()

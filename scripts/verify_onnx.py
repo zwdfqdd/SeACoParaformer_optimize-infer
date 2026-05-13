@@ -208,19 +208,17 @@ def infer_onnx(onnx_dir, audio_data, sr):
             sys.exit(f"错误：{onnx_dir} 下未找到 .onnx 文件")
     print(f"  模型: {onnx_path}")
 
+    # 配置文件统一在 models/asr 下（onnx_dir 的父目录）
+    config_dir = onnx_dir.parent
+
     # 加载 CMVN
     cmvn_mean, cmvn_istd = None, None
-    for search_dir in [onnx_dir, onnx_dir.parent]:
-        for name in ["am.mvn", "am.mvn.json", "am.mvn.npy"]:
-            p = search_dir / name
-            if p.exists():
-                cmvn_mean, cmvn_istd = _load_cmvn(str(p))
-                print(f"  CMVN: {p}")
-                break
-        if cmvn_mean is not None:
-            break
+    cmvn_path = config_dir / "am.mvn"
+    if cmvn_path.exists():
+        cmvn_mean, cmvn_istd = _load_cmvn(str(cmvn_path))
+        print(f"  CMVN: {cmvn_path}")
 
-    # 特征提取（自实现，对齐官方 WavFrontend）
+    # 特征提取
     features = _extract_features(audio_data, cmvn_mean, cmvn_istd)
     print(f"  特征: shape={features.shape}")
 
@@ -251,13 +249,11 @@ def infer_onnx(onnx_dir, audio_data, sr):
     # 解码
     token_ids = np.argmax(logits[0], axis=-1)
     token_list = None
-    for search_dir in [onnx_dir, onnx_dir.parent]:
-        for name in ["tokens.json", "tokens.txt"]:
-            p = search_dir / name
-            if p.exists():
-                token_list = _load_tokenizer(str(p))
-                break
-        if token_list:
+    config_dir_tokens = onnx_dir.parent
+    for name in ["tokens.json", "tokens.txt"]:
+        p = config_dir_tokens / name
+        if p.exists():
+            token_list = _load_tokenizer(str(p))
             break
 
     if token_list:
@@ -288,7 +284,7 @@ def main():
     parser = argparse.ArgumentParser(description="ONNX 精度验证（导出环境）")
     parser.add_argument("--audio", required=True, help="WAV 16kHz 单声道音频")
     parser.add_argument("--model-id", default="iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
-    parser.add_argument("--onnx-dir", default="./models/asr/fp16", help="ONNX 模型目录（含 model.onnx, am.mvn, tokens.json）")
+    parser.add_argument("--onnx-dir", default="./models/asr/fp16", help="ONNX 模型目录（含 model.onnx；am.mvn 和 tokens.json 在父目录 models/asr 下）")
     args = parser.parse_args()
 
     if not Path(args.audio).exists():

@@ -1,21 +1,29 @@
 # ============================================================
 # Stage 1: 模型转换阶段（含 PyTorch + ONNX 导出工具）
 # ============================================================
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04 AS converter
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04 AS converter
 
 WORKDIR /app
 
-# 禁止交互式提示（时区选择等）
+# 禁止交互式提示
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Asia/Shanghai
 
-# 安装 Python 3.12 和系统依赖
+# 安装 Python 3.12 + cuDNN 9 + 系统依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     software-properties-common \
     tzdata \
     curl \
+    wget \
+    lrzsz \
+    vim \
+    gnupg2 \
     && ln -sf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone \
+    && wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
+    && dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    libcudnn9-cuda-12 \
     && add-apt-repository ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
     python3.12 \
@@ -23,39 +31,49 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12-dev \
     libsndfile1 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# 使用 ensurepip 安装 pip（Python 3.12 无 distutils）
+# 安装 pip + 配置清华源加速
 RUN python -m ensurepip --upgrade \
-    && python -m pip install --no-cache-dir --upgrade pip
+    && python -m pip install --no-cache-dir --upgrade pip \
+    && pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    && pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn
 
 COPY requirements-convert.txt .
-RUN python -m pip install --no-cache-dir -r requirements-convert.txt
+RUN python -m pip install --no-cache-dir -r requirements-convert.txt \
+    && rm -rf ~/.cache/pip
 
 COPY scripts/ scripts/
 COPY models/ models/
+COPY test_data/ test_data/
 
-# 模型转换在任务2中通过脚本执行
+# 模型转换通过脚本执行
 # RUN python scripts/export_onnx.py
 
 # ============================================================
 # Stage 2: 推理服务阶段（轻量化，仅含 ONNX Runtime）
 # ============================================================
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04 AS inference
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04 AS inference
 
 WORKDIR /app
 
-# 禁止交互式提示（时区选择等）
+# 禁止交互式提示
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Asia/Shanghai
 
-# 安装 Python 3.12 和系统依赖
+# 安装 Python 3.12 + cuDNN 9 + 系统依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     software-properties-common \
     curl \
+    wget \
+    gnupg2 \
     tzdata \
     && ln -sf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone \
+    && wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
+    && dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    libcudnn9-cuda-12 \
     && add-apt-repository ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
     python3.12 \
@@ -63,20 +81,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12-dev \
     libsndfile1 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# 使用 ensurepip 安装 pip（避免 distutils 缺失问题）
+# 安装 pip + 配置清华源加速
 RUN python -m ensurepip --upgrade \
-    && python -m pip install --no-cache-dir --upgrade pip
+    && python -m pip install --no-cache-dir --upgrade pip \
+    && pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    && pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn
 
 COPY requirements-infer.txt .
-RUN python -m pip install --no-cache-dir -r requirements-infer.txt
+RUN python -m pip install --no-cache-dir -r requirements-infer.txt \
+    && rm -rf ~/.cache/pip
 
 # 复制服务代码和配置
 COPY src/ src/
 COPY configs/ configs/
-
-# 将本地模型文件打包进镜像（构建前需先准备好 models/ 目录）
+COPY test_data/ test_data/
+s
+# 模型文件打包进镜像
 COPY models/ models/
 
 # 环境变量默认值
