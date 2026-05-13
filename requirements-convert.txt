@@ -1,0 +1,12 @@
+# 模型转换环境依赖
+torch==2.3.1
+torchaudio==2.3.1
+onnx==1.16.1
+onnxruntime==1.18.1
+onnxconverter-common==1.14.0
+numpy>=1.26.0
+scipy>=1.13.0
+soundfile==0.12.1
+funasr==1.3.1
+funasr-torch>=0.1.1
+modelscope==1.36.3

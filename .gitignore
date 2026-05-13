@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 模型文件（体积大，不纳入版本控制）
+models/asr/**/*.onnx
+models/asr/**/*.bin
+models/asr/**/*.pt
+models/vad/**/*.onnx
+models/vad/**/*.pt
+models/vad/**/*.jit
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 环境变量
+.env
+
+# 日志
+logs/
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
