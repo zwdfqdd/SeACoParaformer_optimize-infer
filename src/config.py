@@ -33,11 +33,15 @@ class Settings:
 
     @classmethod
     def get_device(cls) -> str:
-        """自动检测推理设备：有 GPU 用 GPU，没有用 CPU。"""
+        """
+        自动检测推理设备：有 GPU 用 GPU，没有用 CPU。
+        
+        检测逻辑：通过 torch.cuda.is_available() 验证 CUDA 驱动是否真正可用，
+        避免 onnxruntime-gpu 包含 CUDAExecutionProvider 但无驱动时 segfault。
+        """
         try:
-            import onnxruntime as ort
-            providers = ort.get_available_providers()
-            if "CUDAExecutionProvider" in providers:
+            import torch
+            if torch.cuda.is_available():
                 return "cuda"
         except ImportError:
             pass
