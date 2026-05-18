@@ -115,5 +115,6 @@ ENV VERBOSE=0
 
 EXPOSE 8080
 
-# 启动服务（单进程模式，不 fork 子进程，避免空闲 CPU 占用）
-CMD ["python", "-m", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# 启动服务
+# WORKS=1 时单进程模式（推荐 GPU 服务），WORKS>1 时多 worker（仅 CPU 服务）
+CMD python -m uvicorn src.main:app --host 0.0.0.0 --port 8080 --workers ${WORKS:-1}
