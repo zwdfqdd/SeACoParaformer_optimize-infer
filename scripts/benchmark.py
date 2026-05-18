@@ -1,7 +1,7 @@
 """
 推理性能基准测试脚本
 
-对比 PT / ONNX fp32 / ONNX fp16 三种推理方式的性能。
+对比 PT / ONNX fp32 / ONNX int8 三种推理方式的性能。
 模型 warmup 后多次推理，统计各阶段耗时。
 
 指标：
@@ -14,7 +14,7 @@
 
 用法：
     python scripts/benchmark.py --audio test_data/audio_16000_30s.wav --runs 10
-    python scripts/benchmark.py --audio test_data/audio_16000_30s.wav --runs 10 --onnx-fp32-dir ./models/asr/fp32 --onnx-fp16-dir ./models/asr/fp16
+    python scripts/benchmark.py --audio test_data/audio_16000_30s.wav --runs 10 --onnx-fp32-dir ./models/asr/fp32 --onnx-int8-dir ./models/asr/int8
 """
 
 import argparse
@@ -171,7 +171,7 @@ def main():
     parser.add_argument("--audio", required=True, help="WAV 16kHz 单声道音频")
     parser.add_argument("--model-id", default="iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
     parser.add_argument("--onnx-fp32-dir", default="./models/asr/fp32")
-    parser.add_argument("--onnx-fp16-dir", default="./models/asr/fp16")
+    parser.add_argument("--onnx-int8-dir", default="./models/asr/int8")
     parser.add_argument("--warmup", type=int, default=3, help="预热次数")
     parser.add_argument("--runs", type=int, default=10, help="测试次数")
     args = parser.parse_args()
@@ -340,52 +340,49 @@ def main():
         print(f"  跳过: {fp32_model} 不存在")
 
     # ============================================================
-    # 3. ONNX fp16 推理
+    # 3. ONNX int8 推理（CPU）
     # ============================================================
     print()
     print("-" * 40)
-    print("[3/3] ONNX fp16 推理")
+    print("[3/3] ONNX int8 推理 (CPU)")
     print("-" * 40)
-    fp16_dir = Path(args.onnx_fp16_dir)
-    fp16_model = fp16_dir / "model.onnx"
-    if fp16_model.exists():
+    int8_dir = Path(args.onnx_int8_dir)
+    int8_model = int8_dir / "model.onnx"
+    if int8_model.exists():
         # 复用特征（配置文件统一在 models/asr）
         if features is None:
-            config_dir = fp16_dir.parent
+            config_dir = int8_dir.parent
             cmvn_mean, cmvn_istd = None, None
             cmvn_path = config_dir / "am.mvn"
             if cmvn_path.exists():
                 cmvn_mean, cmvn_istd = load_cmvn(str(cmvn_path))
             features = extract_features_torchaudio(pcm, cmvn_mean, cmvn_istd)
 
-        sess_options_fp16 = ort.SessionOptions()
-        sess_options_fp16.enable_mem_pattern = False
-        sess_options_fp16.enable_cpu_mem_arena = False
-        providers = ort.get_available_providers()
-        if "CUDAExecutionProvider" in providers:
-            exec_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        else:
-            exec_providers = ["CPUExecutionProvider"]
-        sess_fp16 = ort.InferenceSession(str(fp16_model), sess_options_fp16, providers=exec_providers)
-        print(f"  设备: {sess_fp16.get_providers()[0]}")
-        fp16_times = infer_onnx(sess_fp16, features, warmup=args.warmup, runs=args.runs)
-        fp16_avg = np.mean(fp16_times)
-        fp16_std = np.std(fp16_times)
-        total_avg_fp16 = feat_avg + fp16_avg
-        fp16_rtf = total_avg_fp16 / audio_duration
-        fp16_rtx = audio_duration / total_avg_fp16
-        print(f"  模型推理: {fp16_avg*1000:.1f}ms ± {fp16_std*1000:.1f}ms")
-        print(f"  总耗时(特征+推理): {total_avg_fp16*1000:.1f}ms")
-        print(f"  RTF: {fp16_rtf:.4f}")
-        print(f"  RTX: {fp16_rtx:.2f}x")
-        results["onnx_fp16"] = {
-            "feat_ms": feat_avg*1000, "infer_ms": fp16_avg*1000,
-            "total_ms": total_avg_fp16*1000, "std_ms": fp16_std*1000,
-            "rtf": fp16_rtf, "rtx": fp16_rtx,
-        }
-        del sess_fp16
+        sess_options_int8 = ort.SessionOptions()
+        sess_options_int8.enable_mem_pattern = False
+        sess_options_int8.enable_cpu_mem_arena = False
+        # int8 仅支持 CPU
+        sess_int8 = ort.InferenceSession(str(int8_model), sess_options_int8, providers=["CPUExecutionProvider"])
+        print(f"  设备: CPUExecutionProvider")
+        int8_times = infer_onnx(sess_int8, features, warmup=args.warmup, runs=args.runs)
+        if int8_times:
+            int8_avg = np.mean(int8_times)
+            int8_std = np.std(int8_times)
+            total_avg_int8 = feat_avg + int8_avg
+            int8_rtf = total_avg_int8 / audio_duration
+            int8_rtx = audio_duration / total_avg_int8
+            print(f"  模型推理: {int8_avg*1000:.1f}ms ± {int8_std*1000:.1f}ms")
+            print(f"  总耗时(特征+推理): {total_avg_int8*1000:.1f}ms")
+            print(f"  RTF: {int8_rtf:.4f}")
+            print(f"  RTX: {int8_rtx:.2f}x")
+            results["onnx_int8"] = {
+                "feat_ms": feat_avg*1000, "infer_ms": int8_avg*1000,
+                "total_ms": total_avg_int8*1000, "std_ms": int8_std*1000,
+                "rtf": int8_rtf, "rtx": int8_rtx,
+            }
+        del sess_int8
     else:
-        print(f"  跳过: {fp16_model} 不存在")
+        print(f"  跳过: {int8_model} 不存在")
 
     # ============================================================
     # 汇总
@@ -405,9 +402,9 @@ def main():
     if "onnx_fp32" in results:
         r = results["onnx_fp32"]
         print(f"{'ONNX fp32':<12} {r['infer_ms']:<12.1f} {r['total_ms']:<12.1f} {r['rtf']:<10.4f} {r['rtx']:<10.2f}")
-    if "onnx_fp16" in results:
-        r = results["onnx_fp16"]
-        print(f"{'ONNX fp16':<12} {r['infer_ms']:<12.1f} {r['total_ms']:<12.1f} {r['rtf']:<10.4f} {r['rtx']:<10.2f}")
+    if "onnx_int8" in results:
+        r = results["onnx_int8"]
+        print(f"{'ONNX int8':<12} {r['infer_ms']:<12.1f} {r['total_ms']:<12.1f} {r['rtf']:<10.4f} {r['rtx']:<10.2f}")
 
     # 保存结果
     output_path = Path("benchmark_results.json")

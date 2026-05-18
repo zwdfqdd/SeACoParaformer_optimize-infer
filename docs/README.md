@@ -36,11 +36,11 @@ python scripts/download_vad.py --output-dir ./models/vad
 models/
 ├── asr/
 │   ├── fp32/
-│   │   ├── model.onnx       # ASR 主模型（fp32，当前线上部署）
+│   │   ├── model.onnx       # ASR 主模型（fp32，GPU 线上部署）
 │   │   └── model_eb.onnx    # 热词 bias encoder（fp32）
-│   ├── fp16/
-│   │   ├── model.onnx       # ASR 主模型（fp16，待修复）
-│   │   └── model_eb.onnx    # bias encoder（fp16）
+│   ├── int8/
+│   │   ├── model.onnx       # ASR 主模型（int8 动态量化，CPU 线上部署）
+│   │   └── model_eb.onnx    # bias encoder（int8）
 │   ├── am.mvn               # CMVN 归一化参数
 │   ├── config.yaml          # 模型配置
 │   ├── configuration.json   # 模型元信息
@@ -81,10 +81,12 @@ HOST_PORT=9000 docker-compose up -d
 | BATCH_TIMEOUT | 10 | batch 等待超时（毫秒） |
 | LOG_LEVEL | INFO | 日志级别 |
 | MAX_CONCURRENT_REQUESTS | 2000 | 最大并发请求数 |
+| MODEL_PRECISION | auto | 模型精度（auto/fp32/int8） |
 | VERBOSE | 0 | 详细日志输出（1=开启） |
 
 > 容器内部固定端口 8080，通过 HOST_PORT 映射到宿主机。
 > GPU 推理服务 WORKS 必须为 1（单进程），靠 asyncio + 线程池实现并发。
+> MODEL_PRECISION=auto 时：GPU 环境自动选 fp32，CPU 环境优先选 int8（若存在）。
 
 ## API 示例
 
@@ -164,17 +166,21 @@ SeACoParaformer/
 │   └── scheduler.py        # GPU Scheduler（bucket 分桶 + dynamic batch）
 ├── scripts/                # 导出环境工具脚本
 │   ├── export_onnx.py      # ONNX 导出（CIF 向量化 + fp16 转换）
+│   ├── convert_int8.py     # fp32 → int8 动态量化（CPU 部署用）
+│   ├── convert_fp16.py     # fp32 → fp16 混合精度转换
 │   ├── download_vad.py     # VAD 模型下载
-│   ├── verify_onnx.py      # 精度验证（PT vs ONNX）
+│   ├── verify_onnx.py      # 精度验证（PT vs ONNX，支持指定设备）
 │   └── benchmark.py        # 性能基准测试（VAD/PT/fp32/fp16）
 ├── tests/                  # 测试脚本
 │   ├── test_service.py     # 服务压测（并发/RTF/QPS）
+│   ├── test_single.py      # 单次请求测试
+│   ├── test_model.py       # 模型直接推理测试
 │   └── test_vad.py         # VAD 单独测试
 ├── models/                 # 模型文件（不纳入版本控制）
 │   ├── asr/                # ASR 配置 + 模型
 │   │   ├── am.mvn, tokens.json, config.yaml  # 配置文件
-│   │   ├── fp32/model.onnx, model_eb.onnx    # fp32 模型（当前线上部署）
-│   │   └── fp16/model.onnx, model_eb.onnx    # fp16 模型（待修复）
+│   │   ├── fp32/model.onnx, model_eb.onnx    # fp32 模型（GPU 线上部署）
+│   │   └── int8/model.onnx, model_eb.onnx    # int8 模型（CPU 线上部署）
 │   └── vad/silero_vad.onnx # VAD 模型
 ├── docs/                   # 文档
 ├── logs/                   # 日志（按天轮转，保留7天）

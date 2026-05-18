@@ -20,7 +20,7 @@ docker run -it --gpus all \
 
 # ===== 在容器内执行 =====
 
-# Step 1: Patch FunASR 源码（消除 CIF Loop 算子，使 fp16 可用）
+# Step 1: Patch FunASR 源码（消除 CIF Loop 算子）
 cp /usr/local/lib/python3.12/dist-packages/funasr/models/bicif_paraformer/cif_predictor.py /tmp/cif_predictor_backup.py
 
 sed -i '1a from funasr.models.paraformer.cif_predictor import cif_v1_export as _cif_v1_export, cif_wo_hidden_v1 as _cif_wo_hidden_v1' \
@@ -32,24 +32,27 @@ sed -i 's/acoustic_embeds, cif_peak = cif_export(hidden, alphas, self.threshold)
 sed -i 's/us_cif_peak = cif_wo_hidden_export(us_alphas, self.threshold - 1e-4)/us_cif_peak = _cif_wo_hidden_v1(us_alphas, self.threshold - 1e-4)/' \
   /usr/local/lib/python3.12/dist-packages/funasr/models/bicif_paraformer/cif_predictor.py
 
-# Step 2: 导出模型（fp32 + fp16）
-python scripts/export_onnx.py --output-dir ./models/asr
+# Step 2: 导出 fp32 模型
+python scripts/export_onnx.py --skip-fp16 --output-dir ./models/asr
 
-# Step 3: 下载 VAD 模型
+# Step 3: int8 量化（CPU 部署用）
+python scripts/convert_int8.py --input-dir ./models/asr/fp32 --output-dir ./models/asr/int8
+
+# Step 4: 下载 VAD 模型
 python scripts/download_vad.py --output-dir ./models/vad
 
 # 完成后退出容器
 exit
 ```
 
-> 说明：sed patch 将 CIF predictor 中带 for 循环的 `cif_export`（导出为 ONNX Loop 算子）替换为向量化的 `cif_v1_export`（使用 cumsum，无 Loop），使 fp16 转换不再出现 Sequence 类型冲突。
+> 说明：sed patch 将 CIF predictor 中带 for 循环的 `cif_export`（导出为 ONNX Loop 算子）替换为向量化的 `cif_v1_export`（使用 cumsum，无 Loop）。
 
 导出产物：
 ```
-models/asr/fp32/model.onnx      # ASR 主模型 fp32（当前线上部署）
+models/asr/fp32/model.onnx      # ASR 主模型 fp32（GPU 线上部署）
 models/asr/fp32/model_eb.onnx   # 热词 bias encoder fp32
-models/asr/fp16/model.onnx      # fp16 模型（待修复）
-models/asr/fp16/model_eb.onnx   # fp16 bias encoder（待修复）
+models/asr/int8/model.onnx      # int8 动态量化（CPU 线上部署）
+models/asr/int8/model_eb.onnx   # int8 bias encoder
 models/vad/silero_vad.onnx      # VAD 模型
 ```
 
@@ -91,20 +94,21 @@ docker-compose up -d
 # 1. 导出 fp32
 python scripts/export_onnx.py --skip-fp16 --output-dir ./models/asr
 
-# 2. 自定义 op_block_list 转 fp16
-python scripts/export_onnx.py \
-  --output-dir ./models/asr \
-  --op-block-list LayerNormalization Softmax ReduceMean
+# 2. int8 量化（CPU 部署）
+python scripts/convert_int8.py --input-dir ./models/asr/fp32 --output-dir ./models/asr/int8
 
-# 3. 验证
-python scripts/verify_onnx.py --audio test.wav
+# 3. 验证 fp32（GPU）
+python scripts/verify_onnx.py --audio test.wav --onnx-dir ./models/asr/fp32 --device cuda
+
+# 4. 验证 int8（CPU）
+python scripts/verify_onnx.py --audio test.wav --onnx-dir ./models/asr/int8 --device cpu
 ```
 
-### 调整精度敏感算子
+### 关于 fp16
 
-默认 op_block_list 为：`Range`
-
-仅 Range 算子需要保留 fp32（不支持 fp16 输入），其余算子均可安全转换。
+fp16 模型在 GPU 原生 fp16 kernel 下 CIF cumsum 精度崩溃（输出乱码），**不可用于 GPU 推理**。
+仅在 CPU 推理时可用（ORT 自动 cast 回 fp32），但无实际意义（不如直接用 int8）。
+GPU 精度优化留待 v2 使用 TensorRT 选择性量化解决。
 
 ---
 

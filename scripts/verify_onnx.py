@@ -10,7 +10,8 @@ ONNX 模型精度验证脚本（导出环境）
 
 用法：
     python scripts/verify_onnx.py --audio test.wav
-    python scripts/verify_onnx.py --audio test.wav --onnx-dir ./models/asr/fp16
+    python scripts/verify_onnx.py --audio test.wav --onnx-dir ./models/asr/fp32 --device cuda
+    python scripts/verify_onnx.py --audio test.wav --onnx-dir ./models/asr/int8 --device cpu
 """
 
 import argparse
@@ -191,12 +192,12 @@ def infer_pytorch(model_id, audio_data):
     return text
 
 
-def infer_onnx(onnx_dir, audio_data, sr):
+def infer_onnx(onnx_dir, audio_data, sr, device="cpu"):
     """
     ONNX 推理：内联 _extract_features + onnxruntime + 内联 tokenizer。
     模拟线上部署的完整路径，不依赖 FunASR。
     """
-    print("\n[ONNX 推理] (自实现前端 + onnxruntime)")
+    print(f"\n[ONNX 推理] (自实现前端 + onnxruntime, device={device})")
     onnx_dir = Path(onnx_dir)
 
     # 查找 onnx 模型文件
@@ -223,7 +224,22 @@ def infer_onnx(onnx_dir, audio_data, sr):
     print(f"  特征: shape={features.shape}")
 
     # ORT 推理
-    sess = ort.InferenceSession(str(onnx_path))
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_options.enable_mem_pattern = False
+    sess_options.enable_cpu_mem_arena = False
+
+    if device == "cuda":
+        providers = [
+            ("CUDAExecutionProvider", {"device_id": 0}),
+            "CPUExecutionProvider",
+        ]
+    else:
+        providers = ["CPUExecutionProvider"]
+
+    sess = ort.InferenceSession(str(onnx_path), sess_options, providers=providers)
+    actual_provider = sess.get_providers()[0]
+    print(f"  设备: {device} (provider: {actual_provider})")
     inputs = sess.get_inputs()
     print(f"  模型输入: {[(i.name, i.shape, i.type) for i in inputs]}")
 
@@ -284,7 +300,8 @@ def main():
     parser = argparse.ArgumentParser(description="ONNX 精度验证（导出环境）")
     parser.add_argument("--audio", required=True, help="WAV 16kHz 单声道音频")
     parser.add_argument("--model-id", default="iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
-    parser.add_argument("--onnx-dir", default="./models/asr/fp16", help="ONNX 模型目录（含 model.onnx；am.mvn 和 tokens.json 在父目录 models/asr 下）")
+    parser.add_argument("--onnx-dir", default="./models/asr/fp32", help="ONNX 模型目录（含 model.onnx；am.mvn 和 tokens.json 在父目录 models/asr 下）")
+    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="ONNX 推理设备（默认 cpu）")
     args = parser.parse_args()
 
     if not Path(args.audio).exists():
@@ -298,7 +315,7 @@ def main():
 
     pcm, sr = load_audio(args.audio)
     pt_text = infer_pytorch(args.model_id, pcm)
-    onnx_text = infer_onnx(args.onnx_dir, pcm, sr)
+    onnx_text = infer_onnx(args.onnx_dir, pcm, sr, device=args.device)
 
     print("\n" + "=" * 50)
     print("对比结果")

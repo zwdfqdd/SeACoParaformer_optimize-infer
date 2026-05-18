@@ -14,6 +14,7 @@ services:
       - BATCH_TIMEOUT=${BATCH_TIMEOUT:-10}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-2000}
+      - MODEL_PRECISION=${MODEL_PRECISION:-auto}
     restart: unless-stopped
     deploy:
       resources:
@@ -28,4 +29,4 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 420s

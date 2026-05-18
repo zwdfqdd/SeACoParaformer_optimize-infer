@@ -424,7 +424,7 @@ def _build_response(
         token_ids = np.argmax(logits, axis=-1).flatten()
         text = tokenizer.decode(token_ids)
 
-        # 使用有效时间戳（去除 overlap）
+        # 使用原始 VAD 时间戳
         detail[str(i)] = SegmentDetail(
             text=text,
             start_ms=chunk.effective_start_ms,

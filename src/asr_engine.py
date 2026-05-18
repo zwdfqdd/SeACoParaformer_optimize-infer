@@ -11,7 +11,7 @@ SeACo-Paraformer 双模型架构：
 
 优化：
 - graph_optimization_level=ORT_ENABLE_ALL
-- GPU 推理使用 IO Binding
+- enable_mem_pattern=False（避免动态 shape 缓存冲突）
 - 服务启动时模型预热（dummy inference）
 """
 
@@ -46,6 +46,8 @@ class ASREngine:
     def load(self):
         """加载 ASR 主模型和 bias encoder。"""
         self._device = settings.get_device()
+        precision = settings.get_model_precision()
+        logger.info(f"模型精度策略: {precision} (设备: {self._device})")
         self._load_main_model()
         self._load_bias_model()
         self._warmup()

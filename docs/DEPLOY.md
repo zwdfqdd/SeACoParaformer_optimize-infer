@@ -54,6 +54,7 @@ BATCH=12
 BATCH_TIMEOUT=10
 LOG_LEVEL=INFO
 MAX_CONCURRENT_REQUESTS=2000
+MODEL_PRECISION=auto
 VERBOSE=0
 ```
 
@@ -65,10 +66,19 @@ VERBOSE=0
 | BATCH_TIMEOUT | 10 | batch 等待超时（毫秒） |
 | LOG_LEVEL | INFO | 日志级别（DEBUG/INFO/WARNING/ERROR） |
 | MAX_CONCURRENT_REQUESTS | 2000 | 最大并发请求数 |
+| MODEL_PRECISION | auto | 模型精度选择（auto/fp32/int8） |
 | VERBOSE | 0 | 详细日志输出（1=开启，输出各阶段耗时） |
 
 > **重要**：GPU 推理服务 WORKS 必须为 1（单进程模式），靠 asyncio + CPU 线程池实现并发。
 > 多 worker 会导致多进程 fork，空闲时 CPU 占用异常。
+
+### MODEL_PRECISION 说明
+
+| 值 | 行为 |
+|------|------|
+| auto | GPU 环境自动选 fp32，CPU 环境优先选 int8（若存在） |
+| fp32 | 强制使用 fp32 模型（GPU/CPU 均可） |
+| int8 | 强制使用 int8 量化模型（仅 CPU） |
 
 ---
 

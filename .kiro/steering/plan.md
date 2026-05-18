@@ -18,16 +18,25 @@
         导出产物（双模型架构）：
             model.onnx — ASR 主模型（encoder + predictor + decoder）
             model_eb.onnx — SeACo bias encoder（热词编码器）
-        1).FunASR AutoModel.export() 导出 fp32 ONNX → onnxconverter-common 转 fp16，opset_version=16。
-        CIF 向量化导出（消除 Loop 算子，使 fp16 转换可行）：
-            问题：FunASR bicif_paraformer 中 CifPredictorV3Export 调用的 cif_export/cif_wo_hidden_export 是带 for 循环的 TorchScript 函数，导出为 ONNX Loop 算子，fp16 转换时 Sequence 类型不兼容。
+        1).FunASR AutoModel.export() 导出 fp32 ONNX，opset_version=16。
+        CIF 向量化导出（消除 Loop 算子）：
+            问题：FunASR bicif_paraformer 中 CifPredictorV3Export 调用的 cif_export/cif_wo_hidden_export 是带 for 循环的 TorchScript 函数，导出为 ONNX Loop 算子。
             方案：在转换容器内修改 FunASR 源码，将 Loop 版本替换为 paraformer 模块中的向量化版本（cumsum 实现）：
                 sed 修改 /usr/local/lib/python3.12/dist-packages/funasr/models/bicif_paraformer/cif_predictor.py：
                     1. 顶部添加 import：from funasr.models.paraformer.cif_predictor import cif_v1_export as _cif_v1_export, cif_wo_hidden_v1 as _cif_wo_hidden_v1
                     2. 替换 cif_export → _cif_v1_export
                     3. 替换 cif_wo_hidden_export → _cif_wo_hidden_v1
-            效果：导出的 ONNX 无 Loop 算子，fp16 转换成功。
-            fp16 转换 op_block_list：仅需 ["Range"]（Range 算子不支持 fp16 输入，其余算子均可安全转换）
+            效果：导出的 ONNX 无 Loop 算子。
+        模型精度方案：
+            方案一（GPU 线上）：直接使用 fp32 模型 + CUDAExecutionProvider
+                原因：fp16 模型在 GPU 原生 fp16 kernel 下 CIF cumsum 精度崩溃，输出乱码
+                fp16 仅在 CPU 推理时可用（ORT 自动 cast 回 fp32 计算）
+            方案二（CPU 线上）：fp32 → int8 动态量化（onnxruntime.quantization.quantize_dynamic）
+                量化 MatMul/Gemm 权重为 int8，模型缩小约 75%
+                无需校准数据集，适用于 CPUExecutionProvider
+            转换脚本：
+                scripts/convert_int8.py — fp32 → int8 动态量化
+                scripts/convert_fp16.py — fp32 → fp16（备用，仅 CPU 可用）
         2).转换后精度验证（scripts/verify_onnx.py）：
             验证对象：
                 PT 模型：FunASR AutoModel.generate() 加载原始 PyTorch 模型推理
@@ -43,15 +52,19 @@
     3.构建fastapi服务
         1).环境变量：
             变量（运行时可调）：
-                WORKS：uvicorn workers 数量（GPU 服务建议 1）
+                WORKS：uvicorn workers 数量（GPU 服务必须 1）
                 BATCH：最大 batch size（合法值：1,2,4,8,12）
                 PORT：容器内部端口
                 BATCH_TIMEOUT：batch 等待超时（毫秒）
                 LOG_LEVEL：日志级别
                 MAX_CONCURRENT_REQUESTS：最大并发请求数
+                MODEL_PRECISION：模型精度选择（auto/fp32/int8）
             固定参数（模型已打包进镜像）：
                 MODEL_DIR=./models
-                DEVICE=auto（有 GPU 用 GPU）
+            MODEL_PRECISION 策略：
+                auto：GPU 环境自动选 fp32，CPU 环境优先选 int8（若存在）
+                fp32：强制 fp32（GPU/CPU 均可）
+                int8：强制 int8 动态量化模型（仅 CPU）
             默认配置：
                 WORKS=1
                 BATCH=12
@@ -59,6 +72,7 @@
                 BATCH_TIMEOUT=10 # 毫秒
                 LOG_LEVEL=INFO
                 MAX_CONCURRENT_REQUESTS=2000
+                MODEL_PRECISION=auto
         2).多请求合并推理，具体 batch 组装与调度逻辑见 3.16 GPU Scheduler。
         3).热词注入方式：API 支持传入 hotwords 参数，设定为可选参数。
         4).音频切段的 VAD 策略：静音检测切段，直接用官方 ONNX 文件。VAD 只输出时间戳列表 [(start_ms, end_ms), ...]，不修改音频数据。
@@ -106,7 +120,7 @@
                 原因：CIF predictor 输出动态 token 数量，ORT 内存缓存会因 shape 变化导致
                       第二次推理时 decoder self_attn Mul 节点广播失败（180 is invalid）
                 影响：每次推理重新分配内存，性能略降（约 5-10%），但保证多次推理稳定性
-            GPU 推理使用 IO Binding 减少数据拷贝
+            GPU 推理禁用 IO Binding（动态 shape 下不稳定，回退到普通 session.run）
             batch 内按音频段长度分桶（bucket 队列划分为 2s/4s/8s），减少 padding 开销
             VAD 与 ASR 流水线并行处理；vad采用cpu，ASR根据实际选择设备。
             batch按照，1，2，4，8，12 进行合并。
@@ -215,9 +229,13 @@
 版本管理：
     v1（当前版本）：
         目标：
-            1. 生成基础推理模型（ONNX fp16，CIF 向量化导出）
+            1. 生成基础推理模型（ONNX fp32 + int8 动态量化）
             2. 完成工业级推理应用工程方案，提高推理吞吐率，CPU/GPU 使用率
             3. 构建可用镜像（转换镜像 + 推理镜像）
+        模型精度方案：
+            GPU 线上：fp32 模型 + CUDAExecutionProvider（精度稳定）
+            CPU 线上：int8 动态量化模型 + CPUExecutionProvider（模型缩小 75%）
+            fp16 已验证不可用：GPU 原生 fp16 kernel 下 CIF cumsum 精度崩溃
         架构：三级流水线并行
             Stage 1 - VAD（CPU 线程池）：多请求 VAD 并行检测，完成后立即将 segments 送入下一级
             Stage 2 - 特征提取（CPU 线程池）：VAD 完成后立即开始，按 chunk 粒度提交，不等整个请求完成
@@ -229,8 +247,9 @@
             - 单请求延迟 = max(VAD, 特征提取, ASR)，而非三者之和
     v2（量化优化）：
         目标：
-            1. 在不同 GPU 硬件上优化模型（2080 Ti INT8、A10 INT8/INT4）
-            2. 模型优化（TensorRT 转换、量化校准、精度对比）
+            1. 在不同 GPU 硬件上优化模型（TensorRT fp16/INT8）
+            2. 解决 ONNX fp16 GPU 精度问题（TensorRT 选择性量化）
+            3. 模型优化（TensorRT 转换、量化校准、精度对比）
 文档与交付物:
     README.md：环境准备、启动命令、API 示例（curl/Python）
     API.md：请求/响应 schema、错误码字典、热词格式说明

@@ -11,7 +11,7 @@
 
 用法：
     python tests/test_model.py --audio test_data/audio_16000_30s.wav
-    python tests/test_model.py --audio test_data/audio_16000_30s.wav --model-dir ./models/asr/fp16
+    python tests/test_model.py --audio test_data/audio_16000_30s.wav --model-dir ./models/asr/int8 --device cpu
     python tests/test_model.py --audio test_data/audio_16000_30s.wav --hotwords 张三 李四
 """
 
@@ -62,7 +62,7 @@ def load_onnx_session(model_path: str, device: str = "auto"):
 def main():
     parser = argparse.ArgumentParser(description="模型直接推理测试")
     parser.add_argument("--audio", required=True, help="WAV 16kHz 单声道音频路径")
-    parser.add_argument("--model-dir", default="./models/asr/fp32", help="ONNX 模型目录")
+    parser.add_argument("--model-dir", default="./models/asr/fp32", help="ONNX 模型目录（fp32 或 int8）")
     parser.add_argument("--config-dir", default="./models/asr", help="配置文件目录（am.mvn, tokens.json）")
     parser.add_argument("--hotwords", nargs="*", default=None, help="热词列表")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="推理设备")
