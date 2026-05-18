@@ -46,10 +46,10 @@ exit
 
 导出产物：
 ```
-models/asr/fp16/model.onnx      # ASR 主模型 fp16（线上部署用）
-models/asr/fp16/model_eb.onnx   # 热词 bias encoder fp16
-models/asr/fp32/model.onnx      # fp32 原始模型（验证用）
-models/asr/fp32/model_eb.onnx   # fp32 bias encoder
+models/asr/fp32/model.onnx      # ASR 主模型 fp32（当前线上部署）
+models/asr/fp32/model_eb.onnx   # 热词 bias encoder fp32
+models/asr/fp16/model.onnx      # fp16 模型（待修复）
+models/asr/fp16/model_eb.onnx   # fp16 bias encoder（待修复）
 models/vad/silero_vad.onnx      # VAD 模型
 ```
 
@@ -58,7 +58,7 @@ models/vad/silero_vad.onnx      # VAD 模型
 ```bash
 python scripts/verify_onnx.py \
   --audio test_data/audio_16000_30s.wav \
-  --onnx-dir ./models/asr/fp16
+  --onnx-dir ./models/asr/fp32
 ```
 
 验证逻辑：
@@ -102,16 +102,9 @@ python scripts/verify_onnx.py --audio test.wav
 
 ### 调整精度敏感算子
 
-默认 op_block_list 为：`LayerNormalization Softmax ReduceMean BatchNormalization Range Where Gather Loop SequenceInsert SequenceAt SequenceConstruct ConcatFromSequence SplitToSequence`
+默认 op_block_list 为：`Range`
 
-如果 fp16 精度不达标，可以进一步扩大：
-
-```bash
-python scripts/export_onnx.py \
-  --op-block-list LayerNormalization Softmax ReduceMean BatchNormalization Range Where Gather Loop SequenceInsert SequenceAt SequenceConstruct ConcatFromSequence SplitToSequence Add Mul
-```
-
-保留更多算子为 fp32 会增大模型体积但提高精度。
+仅 Range 算子需要保留 fp32（不支持 fp16 输入），其余算子均可安全转换。
 
 ---
 

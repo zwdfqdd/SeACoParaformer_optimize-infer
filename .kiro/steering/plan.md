@@ -27,6 +27,7 @@
                     2. 替换 cif_export → _cif_v1_export
                     3. 替换 cif_wo_hidden_export → _cif_wo_hidden_v1
             效果：导出的 ONNX 无 Loop 算子，fp16 转换成功。
+            fp16 转换 op_block_list：仅需 ["Range"]（Range 算子不支持 fp16 输入，其余算子均可安全转换）
         2).转换后精度验证（scripts/verify_onnx.py）：
             验证对象：
                 PT 模型：FunASR AutoModel.generate() 加载原始 PyTorch 模型推理
@@ -37,65 +38,51 @@
             运行环境：在转换容器内执行（需要 torch + funasr + onnxruntime）
             依赖说明：
                 PT 推理依赖 funasr（仅转换环境）
-                ONNX 推理使用自实现模块（与推理服务一致，不依赖 funasr）
+                ONNX 推理使用内联 torchaudio 特征提取 + 内联 tokenizer（不引用 src/，脚本自包含）
         3).opset_version=16
     3.构建fastapi服务
         1).环境变量：
-            变量：
-                WORKS：works 是 uvicorn workers 数量
-                BATCH:每个 worker 独立 batch 
-                PORT、MODEL_DIR、DEVICE、BATCH_TIMEOUT、LOG_LEVEL
-                MAX_BATCH_DURATION # 单次 GPU 推理 batch 中，所有 chunk 的总音频时长不得超过 30 秒
-                MAX_CONCURRENT_REQUESTS:服务同时允许处理的最大请求数
+            变量（运行时可调）：
+                WORKS：uvicorn workers 数量（GPU 服务建议 1）
+                BATCH：最大 batch size（合法值：1,2,4,8,12）
+                PORT：容器内部端口
+                BATCH_TIMEOUT：batch 等待超时（毫秒）
+                LOG_LEVEL：日志级别
+                MAX_CONCURRENT_REQUESTS：最大并发请求数
+            固定参数（模型已打包进镜像）：
+                MODEL_DIR=./models
+                DEVICE=auto（有 GPU 用 GPU）
             默认配置：
                 WORKS=1
-                BATCH=1
-                PORT=30960
-                MODEL_DIR=./models
-                DEVICE=auto
+                BATCH=12
+                PORT=8080
                 BATCH_TIMEOUT=10 # 毫秒
                 LOG_LEVEL=INFO
-                MAX_BATCH_DURATION=30 # 秒
                 MAX_CONCURRENT_REQUESTS=2000
         2).多请求合并推理，具体 batch 组装与调度逻辑见 3.16 GPU Scheduler。
         3).热词注入方式：API 支持传入 hotwords 参数，设定为可选参数。
         4).音频切段的 VAD 策略：静音检测切段，直接用官方 ONNX 文件。VAD 只输出时间戳列表 [(start_ms, end_ms), ...]，不修改音频数据。
-        5).对长音频切段处理，min=5s, opt=12s， max=15s；
-            Chunk 调整规则
-                第一段 <5s：
-                拼接到下一段前部
-                最后一段 <5s：
-                拼接到上一段尾部
-            Overlap 策略
-                chunk 间增加：
-                200ms overlap
-                减少边界切词
-            Chunk Metadata
-                系统内部维护：
-                ChunkMeta = {
-                    "chunk_id": int,
-                    "segment_index": int,
-
-                    "raw_start_ms": int,
-                    "raw_end_ms": int,
-
-                    "overlap_left_ms": int,
-                    "overlap_right_ms": int
-                }
-                用于：
-                    时间戳恢复
-                    overlap 去重
-                    字幕定位
-                    后处理
-            Overlap 去重策略
-                由于 overlap 会导致：
-                chunk 边界重复识别
-                后处理阶段需要进行 overlap merge。
-                支持：
-                    token 时间戳对齐
-                    文本编辑距离
-                    chunk 尾首 token 对齐
-                避免重复文本输出。
+        5).VAD 后音频段处理（强制归入固定桶边界）：
+            桶边界：2s, 4s, 8s（对应 LFR 帧数 34, 67, 134）
+            处理步骤：
+                Step 1 - 合并相邻短段：
+                    遍历 VAD 段，将相邻段合并直到满足最小桶（2s）
+                    合并后不超过最大桶（8s）
+                    合并范围：第一个段 start_ms 到最后一个段 end_ms（包含中间静音）
+                    时间戳保留原始位置
+                Step 2 - 超长段切分：
+                    合并后仍超过 8s 的段，按 8s 固定切分
+                Step 3 - 最后一段处理：
+                    切分后最后一段 < 2s 时合并到前一段（合并后 ≤ 8s）
+                Step 4 - 就近桶归类 + pad（由 Scheduler 执行）：
+                    ≤ 2s → pad 到 34 帧
+                    2s < x ≤ 4s → pad 到 67 帧
+                    4s < x ≤ 8s → pad 到 134 帧
+                    speech_lengths 传桶长度（保证 attention mask 匹配）
+                    输出按实际有效帧数截断
+            Chunk Metadata：
+                ChunkMeta = { chunk_id, segment_index, raw_start_ms, raw_end_ms }
+                时间戳对齐：保留原始 VAD 时间戳，响应中直接使用
             切分只操作时间戳区间，最后按最终区间从原始 PCM 数组中 slice 提取音频片段。
         6).输入输出定义：
             输入{"b64":"wav_16k——1channel 的b64"， "hotwords": ["张三", "李四"]};
@@ -120,11 +107,19 @@
                       第二次推理时 decoder self_attn Mul 节点广播失败（180 is invalid）
                 影响：每次推理重新分配内存，性能略降（约 5-10%），但保证多次推理稳定性
             GPU 推理使用 IO Binding 减少数据拷贝
-            服务启动时模型预热（dummy inference）
-            batch 内按音频段长度分桶（bucket 队列划分为 5s/8s/12s/15s），减少 padding 开销
+            batch 内按音频段长度分桶（bucket 队列划分为 2s/4s/8s），减少 padding 开销
             VAD 与 ASR 流水线并行处理；vad采用cpu，ASR根据实际选择设备。
-        12).VAD 切段处理
-                使用默认配置文件加载配置。最小语音段（min_speech_duration=0.5s）、段间合并策略，避免切碎有效语音。
+            batch按照，1，2，4，8，12 进行合并。
+            服务启动时模型预热（dummy inference），在不同音频段，不同batch下都预热一次。
+        12).VAD 切段处理（对齐官方 Silero VAD OnnxWrapper）
+                推理参数：
+                    window_size=512 samples, context_size=64 samples
+                    state shape=(2, batch, 128)
+                    输入：拼接 context + chunk → (batch, 576)
+                    sr：标量 int64
+                后处理参数：
+                    threshold=0.5, neg_threshold=0.35
+                    min_speech=250ms, min_silence=100ms, speech_pad=30ms
                 合并阶段维护 offset mapping（segment_index → raw_start_ms/raw_end_ms），不物理拼接音频数据，只操作时间戳区间列表。
                 合并后交给后续切段(5)处理识别。
         13).可观测性与运维
@@ -135,7 +130,9 @@
             链路追踪
                 可选集成 OpenTelemetry，标记 VAD/ASR/PostProcess 各阶段 span，便于性能瓶颈定位
             配置热更新
-                支持通过 SIGHUP 或 HTTP 接口动态调整 BATCH_TIMEOUT、LOG_LEVEL，避免重启服务
+                支持通过 SIGHUP 信号动态调整 BATCH_TIMEOUT、LOG_LEVEL，避免重启服务
+                实现：asyncio 事件循环注册 SIGHUP handler（单进程模式下有效）
+                用法：kill -HUP <pid>（修改环境变量后发送信号）
         14).业务错误码定义（便于客户端精准处理）：
             错误码表：
                 SUCCESS=0                 # 成功
@@ -158,24 +155,20 @@
             全流程仅维护一份原始 PCM 数据
         16).GPU Scheduler（GPU 统一调度器）
             Bucket 管理
-                根据 chunk 时长：5s,8s,12s,15s,进入不同 bucket。
-                保证：
-                    同 batch 内长度接近
-                减少 padding。
+                根据 chunk 时长归入固定桶：2s/4s/8s（LFR 帧数 34/67/134）
+                同桶内 chunk pad 到桶边界，保证 shape 固定
             Dynamic Batch 组装
-                GPU Scheduler 会在：BATCH_TIMEOUT时间窗口内持续收集请求。
-                达到：batch_size或MAX_BATCH_DURATION即立即触发推理
-            统一 GPU 提交:
-                所有 GPU inference：
-                    统一由 scheduler 提交。
-                避免：
-                    多线程直接调用 CUDA
-                造成：
-                    stream 冲突
-                    context 切换
-                    GPU utilization 降低
+                GPU Scheduler 在 BATCH_TIMEOUT 窗口内持续收集同桶 chunk
+                达到合法 batch size（1,2,4,8,12）立即触发推理
+                超时后按实际数量 pad 到最近合法 batch size 推理
+            统一 GPU 提交
+                所有 GPU inference 统一由 scheduler 在 GPU 专用单线程池中提交
+                避免多线程直接调用 CUDA 造成 stream 冲突
             OOM Fallback
-                当出现CUDA out of memory, scheduler 自动减小 batch,重新切 batch,CPU fallback避免服务崩溃
+                当 GPU 推理出现 CUDA OOM 时：
+                    1. 减半 batch size 重试
+                    2. 仍失败则逐条推理
+                    3. 仍失败则返回 ASR_INFER_FAILED 错误
         17).特征提取（使用 torchaudio.compliance.kaldi.fbank，确保与训练时特征完全一致）
             文件：src/feature_extractor.py
             依赖：torch + torchaudio（仅用于 fbank 计算，不用于模型推理）
@@ -206,52 +199,38 @@
                 prometheus-client, opentelemetry — 可观测性
             不包含 funasr/modelscope（模型转换环境专用）
         20).性能优化实现方案
-            特征提取优化（src/feature_extractor.py）：
-                分帧：使用 np.lib.stride_tricks.as_strided 零拷贝视图替代 Python for 循环
-                LFR 堆叠：向量化高级索引 + reshape 替代双层 for 循环
-                Mel 滤波器矩阵：模块级预计算缓存（单例），避免每次调用重新创建
-                窗函数：模块级常量 _WINDOW 预计算
-                功率谱：real**2 + imag**2 替代 np.abs()**2（避免 sqrt 开销）
-                log/max：np.maximum(out=) + np.log(out=) 原地操作，减少内存分配
+            特征提取（src/feature_extractor.py）：
+                使用 torchaudio.compliance.kaldi.fbank 确保与训练时特征完全一致
+                LFR 堆叠：torch as_strided 向量化
             请求处理流程优化（src/main.py）：
-                特征提取并行化：通过 asyncio.run_in_executor 将 CPU 密集的特征提取放入线程池，不阻塞 FastAPI 事件循环
-                多 chunk 特征提取批量执行：一次性提取所有 chunk 特征后统一提交 GPU Scheduler
+                三级流水线：Stage1(VAD) + Stage2(特征提取) 在独立 CPU 线程池，Stage3(GPU) 在 GPU 专用线程池
+                多请求间各 Stage 独立并行，CPU/GPU 同时满载
             GPU 调度优化（src/scheduler.py）：
-                每轮调度清空 bucket 所有可组装 batch（while 循环），避免高并发时积压
-                BATCH_TIMEOUT 每次循环重新读取 settings，支持热更新即时生效
+                固定 shape bucket + 合法 batch size 推理
+                达到合法 batch 立即触发，超时按实际数量触发
+                GPU 专用单线程池，避免 stream 冲突
+                OOM Fallback：减半 batch 重试 → 逐条推理 → 返回错误
 任务管理：
     任务依赖关系：任务 1 → 任务 2 → 任务 3，顺序执行
 版本管理：
-    v1（当前版本，已完成）：
-        fp16 ONNX 推理服务，CER ≤ 5%（实测 2.23%）
-        设备：2080 Ti / A10
+    v1（当前版本）：
+        目标：
+            1. 生成基础推理模型（ONNX fp16，CIF 向量化导出）
+            2. 完成工业级推理应用工程方案，提高推理吞吐率，CPU/GPU 使用率
+            3. 构建可用镜像（转换镜像 + 推理镜像）
+        架构：三级流水线并行
+            Stage 1 - VAD（CPU 线程池）：多请求 VAD 并行检测，完成后立即将 segments 送入下一级
+            Stage 2 - 特征提取（CPU 线程池）：VAD 完成后立即开始，按 chunk 粒度提交，不等整个请求完成
+            Stage 3 - ASR 推理（GPU Scheduler）：持续收集 chunk，按 bucket 分桶组 batch，统一 GPU 推理
+            结果路由：按 request_id + chunk_id 合并，所有 chunk 完成后返回响应
+        设计原则：
+            - CPU 和 GPU 同时满载（VAD/特征提取占 CPU，ASR 占 GPU）
+            - 请求间不互相阻塞（流水线各级独立）
+            - 单请求延迟 = max(VAD, 特征提取, ASR)，而非三者之和
     v2（量化优化）：
-        目标设备：2080 Ti（INT8）、A10（INT8/INT4）
-        任务：
-            1).ONNX INT8 量化推理
-                使用 onnxruntime 动态量化或静态量化（需校准数据集）
-                对比 fp16 基线的 CER 损失
-            2).ONNX INT4 量化推理（仅 A10）
-                使用 onnxruntime GPTQ/AWQ 风格量化（如支持）
-                对比 fp16 基线的 CER 损失
-            3).TensorRT INT8 推理
-                将 fp32 ONNX 转为 TensorRT engine（INT8 校准）
-                对比 fp16 基线的 CER 损失和推理速度
-            4).TensorRT INT4 推理（仅 A10）
-                TensorRT FP8/INT4 量化（Ampere+ 架构）
-                对比 fp16 基线的 CER 损失和推理速度
-            5).精度对比报告
-                统一测试集，对比各方案：
-                    fp32 ONNX（基线 CER=0%）
-                    fp16 ONNX（当前 CER=2.23%）
-                    INT8 ONNX
-                    INT8 TensorRT
-                    INT4 ONNX（A10）
-                    INT4 TensorRT（A10）
-                指标：CER、RTF（Real-Time Factor）、显存占用、吞吐量
-        硬件约束：
-            2080 Ti（Turing）：支持 fp16、INT8，不支持 INT4
-            A10（Ampere）：支持 fp16、INT8、INT4/FP8
+        目标：
+            1. 在不同 GPU 硬件上优化模型（2080 Ti INT8、A10 INT8/INT4）
+            2. 模型优化（TensorRT 转换、量化校准、精度对比）
 文档与交付物:
     README.md：环境准备、启动命令、API 示例（curl/Python）
     API.md：请求/响应 schema、错误码字典、热词格式说明

@@ -45,6 +45,7 @@ RUN python -m pip install --no-cache-dir -r requirements-convert.txt \
 
 COPY scripts/ scripts/
 COPY models/ models/
+COPY tests/ tests/
 COPY test_data/ test_data/
 
 # 模型转换通过脚本执行
@@ -96,23 +97,21 @@ RUN python -m pip install --no-cache-dir -r requirements-infer.txt \
 # 复制服务代码和配置
 COPY src/ src/
 COPY configs/ configs/
+COPY tests/ tests/
 COPY test_data/ test_data/
-s
+
 # 模型文件打包进镜像
 COPY models/ models/
 
-# 环境变量默认值
+# 环境变量默认值（仅保留运行时可调参数）
 ENV WORKS=1
-ENV BATCH=1
-ENV PORT=30960
-ENV MODEL_DIR=./models
-ENV DEVICE=auto
+ENV BATCH=12
+ENV PORT=8080
 ENV BATCH_TIMEOUT=10
 ENV LOG_LEVEL=INFO
-ENV MAX_BATCH_DURATION=30
 ENV MAX_CONCURRENT_REQUESTS=2000
 
-EXPOSE ${PORT}
+EXPOSE 8080
 
-# 启动服务
-CMD ["sh", "-c", "uvicorn src.main:app --host 0.0.0.0 --port ${PORT} --workers ${WORKS}"]
+# 启动服务（单进程模式，不 fork 子进程，避免空闲 CPU 占用）
+CMD ["python", "-m", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080"]

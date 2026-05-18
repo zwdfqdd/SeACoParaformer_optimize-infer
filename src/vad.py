@@ -2,6 +2,7 @@
 VAD 模块 — 语音活动检测
 
 使用 Silero VAD 官方 ONNX 模型进行静音检测切段。
+对齐官方 OnnxWrapper 实现（context 拼接、state shape=(2,batch,128)）。
 VAD 只输出时间戳列表 [(start_ms, end_ms), ...]，不修改音频数据。
 运行在 CPU 上，与 ASR 推理并行。
 """
@@ -14,6 +15,17 @@ import onnxruntime as ort
 from src.config import settings
 from src.errors import ASRException, ErrorCode
 from src.logger import logger
+
+
+# VAD 参数
+SAMPLE_RATE = 16000
+WINDOW_SIZE = 512  # 16kHz 下每窗口 512 samples
+CONTEXT_SIZE = 64  # 上下文 samples（拼接到输入前）
+THRESHOLD = 0.5
+NEG_THRESHOLD = 0.35  # threshold - 0.15
+MIN_SPEECH_MS = 250
+MIN_SILENCE_MS = 100
+SPEECH_PAD_MS = 30
 
 
 @dataclass
@@ -30,30 +42,19 @@ class VADSegment:
 class SileroVAD:
     """
     Silero VAD ONNX 推理引擎。
-
-    配置：
-    - min_speech_duration: 最小语音段时长 0.5s
-    - 段间合并策略：相邻段间隔 < 300ms 则合并
+    对齐官方 OnnxWrapper 实现。
     """
-
-    SAMPLE_RATE = 16000
-    WINDOW_SIZE = 512  # Silero VAD 窗口大小（16kHz 下约 32ms）
-    MIN_SPEECH_DURATION_MS = 500  # 最小语音段 0.5s
-    MERGE_GAP_MS = 300  # 段间合并阈值
 
     def __init__(self):
         self._session: ort.InferenceSession | None = None
-        self._h = np.zeros((2, 1, 64), dtype=np.float32)
-        self._c = np.zeros((2, 1, 64), dtype=np.float32)
 
     def load(self):
         """加载 VAD ONNX 模型（CPU）。"""
         model_path = settings.get_vad_model_path()
         try:
             sess_options = ort.SessionOptions()
-            sess_options.graph_optimization_level = (
-                ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            )
+            sess_options.inter_op_num_threads = 1
+            sess_options.intra_op_num_threads = 1
             self._session = ort.InferenceSession(
                 model_path,
                 sess_options,
@@ -73,22 +74,19 @@ class SileroVAD:
     def detect(self, pcm: np.ndarray, sample_rate: int = 16000) -> list[VADSegment]:
         """
         对 PCM 音频进行 VAD 检测。
-
-        参数:
-            pcm: float32 PCM 数据，shape=(samples,)
-            sample_rate: 采样率（必须为 16000）
-
-        返回:
-            语音段时间戳列表 [(start_ms, end_ms), ...]
+        线程安全：每次调用独立维护 state，不共享实例状态。
         """
         if self._session is None:
             raise ASRException(ErrorCode.VAD_SEGMENT_ERROR, "VAD 模型未加载")
 
         try:
-            raw_segments = self._run_vad(pcm, sample_rate)
-            merged_segments = self._merge_segments(raw_segments)
-            filtered_segments = self._filter_short(merged_segments)
-            return filtered_segments
+            speeches = self._get_speech_timestamps(pcm)
+            segments = []
+            for s in speeches:
+                start_ms = int(s["start"] / SAMPLE_RATE * 1000)
+                end_ms = int(s["end"] / SAMPLE_RATE * 1000)
+                segments.append(VADSegment(start_ms=start_ms, end_ms=end_ms))
+            return segments
         except ASRException:
             raise
         except Exception as e:
@@ -97,96 +95,94 @@ class SileroVAD:
                 f"VAD 推理异常: {e}",
             )
 
-    def _run_vad(
-        self, pcm: np.ndarray, sample_rate: int
-    ) -> list[VADSegment]:
-        """逐窗口运行 VAD，收集语音概率并提取语音段。"""
-        num_samples = len(pcm)
-        speeches: list[VADSegment] = []
-        is_speech = False
-        speech_start = 0
-        threshold = 0.5
+    def _get_speech_timestamps(self, pcm: np.ndarray) -> list[dict]:
+        """
+        对齐官方 get_speech_timestamps 逻辑。
+        state 作为局部变量，保证线程安全。
+        """
+        audio_length = len(pcm)
 
-        # 重置状态
-        h = np.zeros((2, 1, 64), dtype=np.float32)
-        c = np.zeros((2, 1, 64), dtype=np.float32)
-        sr = np.array([sample_rate], dtype=np.int64)
+        # 局部状态（线程安全）
+        state = np.zeros((2, 1, 128), dtype=np.float32)
+        context = np.zeros((1, CONTEXT_SIZE), dtype=np.float32)
 
-        for i in range(0, num_samples, self.WINDOW_SIZE):
-            chunk = pcm[i: i + self.WINDOW_SIZE]
-            if len(chunk) < self.WINDOW_SIZE:
-                chunk = np.pad(chunk, (0, self.WINDOW_SIZE - len(chunk)))
+        # 逐窗口推理获取概率
+        speech_probs = []
+        for i in range(0, audio_length, WINDOW_SIZE):
+            chunk = pcm[i: i + WINDOW_SIZE]
+            if len(chunk) < WINDOW_SIZE:
+                chunk = np.pad(chunk, (0, WINDOW_SIZE - len(chunk)))
+            chunk = chunk.reshape(1, -1).astype(np.float32)
 
-            input_data = chunk.reshape(1, -1).astype(np.float32)
-
-            # Silero VAD 输入: input, sr, h, c
-            inputs = {
-                "input": input_data,
-                "sr": sr,
-                "h": h,
-                "c": c,
+            # 拼接 context
+            x = np.concatenate([context, chunk], axis=1)
+            ort_inputs = {
+                "input": x,
+                "state": state,
+                "sr": np.array(SAMPLE_RATE, dtype=np.int64),
             }
+            ort_outs = self._session.run(None, ort_inputs)
+            out, state = ort_outs[0], ort_outs[1]
+            context = x[:, -CONTEXT_SIZE:]
 
-            try:
-                output, hn, cn = self._session.run(None, inputs)
-                h = hn
-                c = cn
-            except Exception:
-                # 某些版本的 Silero VAD 输入格式不同，尝试备选
-                inputs_alt = {"input": input_data, "sr": sr, "state": h}
-                results = self._session.run(None, inputs_alt)
-                output = results[0]
-                if len(results) > 1:
-                    h = results[1]
+            prob = float(out.flatten()[0])
+            speech_probs.append(prob)
 
-            prob = float(output.flatten()[0])
-            current_ms = int(i / sample_rate * 1000)
+        # 后处理
+        min_speech_samples = SAMPLE_RATE * MIN_SPEECH_MS / 1000
+        min_silence_samples = SAMPLE_RATE * MIN_SILENCE_MS / 1000
+        speech_pad_samples = SAMPLE_RATE * SPEECH_PAD_MS / 1000
 
-            if prob >= threshold and not is_speech:
-                is_speech = True
-                speech_start = current_ms
-            elif prob < threshold and is_speech:
-                is_speech = False
-                speeches.append(VADSegment(
-                    start_ms=speech_start,
-                    end_ms=current_ms,
-                ))
+        triggered = False
+        speeches = []
+        current_speech = {}
+        temp_end = 0
 
-        # 处理末尾未关闭的语音段
-        if is_speech:
-            end_ms = int(num_samples / sample_rate * 1000)
-            speeches.append(VADSegment(start_ms=speech_start, end_ms=end_ms))
+        for i, prob in enumerate(speech_probs):
+            cur_sample = WINDOW_SIZE * i
+
+            if prob >= THRESHOLD and temp_end:
+                temp_end = 0
+
+            if prob >= THRESHOLD and not triggered:
+                triggered = True
+                current_speech["start"] = cur_sample
+                continue
+
+            if prob < NEG_THRESHOLD and triggered:
+                if not temp_end:
+                    temp_end = cur_sample
+                if cur_sample - temp_end < min_silence_samples:
+                    continue
+                else:
+                    current_speech["end"] = temp_end
+                    if (current_speech["end"] - current_speech["start"]) > min_speech_samples:
+                        speeches.append(current_speech)
+                    current_speech = {}
+                    temp_end = 0
+                    triggered = False
+                    continue
+
+        if current_speech and (audio_length - current_speech.get("start", audio_length)) > min_speech_samples:
+            current_speech["end"] = audio_length
+            speeches.append(current_speech)
+
+        # padding
+        for i, speech in enumerate(speeches):
+            if i == 0:
+                speech["start"] = int(max(0, speech["start"] - speech_pad_samples))
+            if i != len(speeches) - 1:
+                silence_duration = speeches[i + 1]["start"] - speech["end"]
+                if silence_duration < 2 * speech_pad_samples:
+                    speech["end"] += int(silence_duration // 2)
+                    speeches[i + 1]["start"] = int(max(0, speeches[i + 1]["start"] - silence_duration // 2))
+                else:
+                    speech["end"] = int(min(audio_length, speech["end"] + speech_pad_samples))
+                    speeches[i + 1]["start"] = int(max(0, speeches[i + 1]["start"] - speech_pad_samples))
+            else:
+                speech["end"] = int(min(audio_length, speech["end"] + speech_pad_samples))
 
         return speeches
-
-    def _merge_segments(self, segments: list[VADSegment]) -> list[VADSegment]:
-        """合并相邻且间隔小于阈值的语音段。"""
-        if not segments:
-            return []
-
-        merged: list[VADSegment] = [segments[0]]
-
-        for seg in segments[1:]:
-            last = merged[-1]
-            gap = seg.start_ms - last.end_ms
-
-            if gap <= self.MERGE_GAP_MS:
-                # 合并：扩展上一段的结束时间
-                merged[-1] = VADSegment(
-                    start_ms=last.start_ms,
-                    end_ms=seg.end_ms,
-                )
-            else:
-                merged.append(seg)
-
-        return merged
-
-    def _filter_short(self, segments: list[VADSegment]) -> list[VADSegment]:
-        """过滤掉短于最小时长的语音段。"""
-        return [
-            seg for seg in segments
-            if seg.duration_ms >= self.MIN_SPEECH_DURATION_MS
-        ]
 
 
 # 全局单例

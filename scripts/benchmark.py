@@ -198,6 +198,63 @@ def main():
     results = {}
 
     # ============================================================
+    # 0. VAD 推理（CPU）
+    # ============================================================
+    print("-" * 40)
+    print("[0/3] VAD 推理 (CPU, Silero VAD)")
+    print("-" * 40)
+    vad_path = Path("./models/vad/silero_vad.onnx")
+    if not vad_path.exists():
+        vad_path = Path(args.onnx_fp32_dir).parent.parent / "vad" / "silero_vad.onnx"
+
+    if vad_path.exists():
+        print(f"  模型: {vad_path}")
+        vad_opts = ort.SessionOptions()
+        vad_opts.inter_op_num_threads = 1
+        vad_opts.intra_op_num_threads = 1
+        vad_sess = ort.InferenceSession(str(vad_path), providers=["CPUExecutionProvider"], sess_options=vad_opts)
+
+        # VAD 推理函数（对齐官方 OnnxWrapper：context 拼接 + state(2,1,128)）
+        window_size = 512
+        context_size = 64
+        num_windows = len(pcm) // window_size
+
+        def run_vad_once():
+            state = np.zeros((2, 1, 128), dtype=np.float32)
+            context = np.zeros((1, context_size), dtype=np.float32)
+            sr_val = np.array(SAMPLE_RATE, dtype=np.int64)
+            for w in range(num_windows):
+                chunk = pcm[w * window_size:(w + 1) * window_size].reshape(1, -1).astype(np.float32)
+                x = np.concatenate([context, chunk], axis=1)  # (1, 576)
+                feed = {"input": x, "state": state, "sr": sr_val}
+                out, state = vad_sess.run(None, feed)
+                context = x[:, -context_size:]
+
+        # warmup
+        for _ in range(args.warmup):
+            run_vad_once()
+
+        # 计时
+        vad_times = []
+        for _ in range(args.runs):
+            t0 = time.perf_counter()
+            run_vad_once()
+            vad_times.append(time.perf_counter() - t0)
+
+        vad_avg = np.mean(vad_times)
+        vad_std = np.std(vad_times)
+        vad_rtf = vad_avg / audio_duration
+        print(f"  窗口数: {num_windows}")
+        print(f"  平均耗时: {vad_avg*1000:.1f}ms ± {vad_std*1000:.1f}ms")
+        print(f"  RTF: {vad_rtf:.4f}")
+        print(f"  RTX: {audio_duration/vad_avg:.2f}x")
+        results["vad_cpu"] = {"avg_ms": vad_avg*1000, "std_ms": vad_std*1000, "rtf": vad_rtf, "rtx": audio_duration/vad_avg}
+        del vad_sess
+    else:
+        print(f"  跳过: VAD 模型不存在")
+    print()
+
+    # ============================================================
     # 1. PT 推理
     # ============================================================
     print("-" * 40)
@@ -339,6 +396,9 @@ def main():
     print("=" * 60)
     print(f"{'方案':<12} {'推理(ms)':<12} {'总耗时(ms)':<12} {'RTF':<10} {'RTX':<10}")
     print("-" * 56)
+    if "vad_cpu" in results:
+        r = results["vad_cpu"]
+        print(f"{'VAD (CPU)':<12} {r['avg_ms']:<12.1f} {r['avg_ms']:<12.1f} {r['rtf']:<10.4f} {r['rtx']:<10.2f}")
     if "pt" in results:
         r = results["pt"]
         print(f"{'PT':<12} {r['avg_ms']:<12.1f} {r['avg_ms']:<12.1f} {r['rtf']:<10.4f} {r['rtx']:<10.2f}")

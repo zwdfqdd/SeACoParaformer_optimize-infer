@@ -120,20 +120,49 @@ class ASREngine:
             logger.warning(f"Bias encoder 加载失败（基础识别不受影响）: {e}")
 
     def _warmup(self):
-        """模型预热。"""
-        logger.info("ASR 模型预热中...")
-        try:
-            dummy_feats = np.random.randn(1, 100, 560).astype(np.float32)
-            dummy_lengths = np.array([100], dtype=np.int32)
+        """
+        模型预热：对所有 bucket(音频段长度) × batch 组合执行一次推理。
+        
+        plan.md 3.11 要求：
+        - 音频段长度桶：2s/4s/8s → LFR 帧数约 34/67/134
+        - batch：1, 2, 4, 8, 12
+        - 在不同音频段、不同 batch 下都预热一次
+        
+        预热后所有 shape 命中 ORT kernel cache，推理延迟稳定。
+        """
+        logger.info("ASR 模型预热中（bucket × batch 全组合）...")
 
-            feed_dict = {self._input_names[0]: dummy_feats}
-            if len(self._input_names) >= 2:
-                feed_dict[self._input_names[1]] = dummy_lengths
+        # 音频段长度桶（LFR 帧数）：2s→34, 4s→67, 8s→134
+        bucket_seq_lens = [34, 67, 134]
+        # batch 大小
+        batch_sizes = [1, 2, 4, 8, 12]
 
-            self._session.run(self._output_names, feed_dict)
-            logger.info("ASR 模型预热完成")
-        except Exception as e:
-            logger.warning(f"ASR 模型预热失败（不影响服务启动）: {e}")
+        feat_dim = 560
+        warmup_count = 0
+
+        for seq_len in bucket_seq_lens:
+            for batch in batch_sizes:
+                try:
+                    dummy_feats = np.random.randn(batch, seq_len, feat_dim).astype(np.float32)
+                    dummy_lengths = np.full(batch, seq_len, dtype=np.int32)
+
+                    feed_dict = {}
+                    for name in self._input_names:
+                        if name == "speech":
+                            feed_dict[name] = dummy_feats
+                        elif name == "speech_lengths":
+                            feed_dict[name] = dummy_lengths
+                        elif "bias_embed" in name:
+                            inp = next(i for i in self._session.get_inputs() if i.name == name)
+                            embed_dim = inp.shape[-1] if isinstance(inp.shape[-1], int) else 512
+                            feed_dict[name] = np.zeros((batch, 1, embed_dim), dtype=np.float32)
+
+                    self._session.run(self._output_names, feed_dict)
+                    warmup_count += 1
+                except Exception as e:
+                    logger.warning(f"  预热失败 batch={batch}, seq={seq_len}: {e}")
+
+        logger.info(f"ASR 模型预热完成（{warmup_count} 个 shape 已缓存）")
 
     def encode_hotwords(self, hotword_token_ids: np.ndarray) -> np.ndarray | None:
         """
@@ -143,7 +172,7 @@ class ASREngine:
             hotword_token_ids: 热词 token ID 矩阵, shape=(num_hotwords, max_len)
 
         返回:
-            bias embeddings 或 None（无 bias 模型时）
+            bias embeddings, shape=(1, num_hotwords, embed_dim)，或 None（无 bias 模型时）
         """
         if self._bias_session is None:
             return None
@@ -158,7 +187,16 @@ class ASREngine:
                 feed[self._bias_input_names[1]] = lengths
 
             outputs = self._bias_session.run(self._bias_output_names, feed)
-            return outputs[0]  # bias embeddings
+            hw_embed = outputs[0]  # bias embeddings
+
+            # 确保输出为 3D: (1, num_hotwords, embed_dim)
+            if hw_embed.ndim == 2:
+                hw_embed = hw_embed[np.newaxis, :, :]  # (num_hw, dim) → (1, num_hw, dim)
+
+            if settings.VERBOSE:
+                logger.debug(f"[Hotwords] bias_embed shape={hw_embed.shape}")
+
+            return hw_embed
         except Exception as e:
             logger.warning(f"Bias encoder 推理失败: {e}")
             return None
@@ -184,12 +222,13 @@ class ASREngine:
             raise ASRException(ErrorCode.ASR_INFER_FAILED, "ASR 模型未加载")
 
         try:
-            # Padding 到同一长度
+            # Padding 到最近 bucket 边界（命中 shape cache，避免 kernel 重编译）
             max_len = max(f.shape[0] for f in features_list)
+            bucket_len = self._get_bucket_seq_len(max_len)
             feat_dim = features_list[0].shape[1]
             batch_size = len(features_list)
 
-            padded = np.zeros((batch_size, max_len, feat_dim), dtype=np.float32)
+            padded = np.zeros((batch_size, bucket_len, feat_dim), dtype=np.float32)
             for i, feat in enumerate(features_list):
                 padded[i, :feat.shape[0], :] = feat
 
@@ -212,11 +251,8 @@ class ASREngine:
                         embed_dim = inp.shape[-1] if isinstance(inp.shape[-1], int) else 512
                         feed_dict[name] = np.zeros((batch_size, 1, embed_dim), dtype=np.float32)
 
-            # 推理
-            if self._device == "cuda":
-                outputs = self._infer_with_io_binding(feed_dict)
-            else:
-                outputs = self._session.run(self._output_names, feed_dict)
+            # 推理（禁用 IO Binding，动态 shape 下不稳定）
+            outputs = self._session.run(self._output_names, feed_dict)
 
             # 拆分 batch 结果
             logits = outputs[0]  # shape: (batch, time, vocab)
@@ -249,9 +285,67 @@ class ASREngine:
     def infer_single(
         self, features: np.ndarray, bias_embeddings: np.ndarray | None = None
     ) -> np.ndarray:
-        """单条推理。"""
+        """单条推理（pad 到最近 bucket seq_len）。"""
         results = self.infer_batch([features], [features.shape[0]], bias_embeddings)
         return results[0]
+
+    def infer_batch_raw(
+        self,
+        padded_feats: np.ndarray,
+        lengths: np.ndarray,
+        bias_embeddings: np.ndarray | None = None,
+    ) -> list[np.ndarray]:
+        """
+        直接推理已 pad 好的固定 shape 输入（跳过内部 padding 逻辑）。
+        用于严格 bucket 推理，输入已 pad 到桶边界。
+
+        参数:
+            padded_feats: shape=(batch, bucket_seq_len, feat_dim) 已 pad
+            lengths: shape=(batch,) 每条的有效长度
+            bias_embeddings: 热词 bias（可选）
+
+        返回:
+            logits 列表（按有效长度截断）
+        """
+        if self._session is None:
+            raise ASRException(ErrorCode.ASR_INFER_FAILED, "ASR 模型未加载")
+
+        try:
+            batch_size = padded_feats.shape[0]
+
+            feed_dict = {}
+            for name in self._input_names:
+                if name == "speech":
+                    feed_dict[name] = padded_feats
+                elif name == "speech_lengths":
+                    feed_dict[name] = lengths
+                elif "bias_embed" in name:
+                    if bias_embeddings is not None:
+                        feed_dict[name] = np.tile(bias_embeddings, (batch_size, 1, 1)).astype(np.float32)
+                    else:
+                        inp = next(i for i in self._session.get_inputs() if i.name == name)
+                        embed_dim = inp.shape[-1] if isinstance(inp.shape[-1], int) else 512
+                        feed_dict[name] = np.zeros((batch_size, 1, embed_dim), dtype=np.float32)
+
+            outputs = self._session.run(self._output_names, feed_dict)
+
+            logits = outputs[0]
+            results = []
+            for i in range(batch_size):
+                results.append(logits[i])
+            return results
+
+        except Exception as e:
+            raise ASRException(ErrorCode.ASR_INFER_FAILED, f"ASR 推理失败: {e}")
+
+    @staticmethod
+    def _get_bucket_seq_len(seq_len: int) -> int:
+        """将 seq_len pad 到最近的 bucket 边界。"""
+        bucket_seq_lens = [34, 67, 134]
+        for b in bucket_seq_lens:
+            if seq_len <= b:
+                return b
+        return seq_len
 
 
 # 全局单例

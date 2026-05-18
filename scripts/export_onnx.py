@@ -131,11 +131,62 @@ def convert_to_fp16(
             )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 修复 Range 算子输入类型：Range 不支持 fp16 输入，需将其输入常量从 fp16 转回 fp32
+    model_fp16 = _fix_range_inputs(model_fp16)
+
     onnx.save(model_fp16, str(output_path))
 
     fp32_mb = fp32_onnx_path.stat().st_size / (1024 * 1024)
     fp16_mb = output_path.stat().st_size / (1024 * 1024)
     print(f"   {fp32_mb:.1f}MB → {fp16_mb:.1f}MB ({fp16_mb/fp32_mb*100:.0f}%)")
+
+
+def _fix_range_inputs(model):
+    """
+    修复 fp16 模型中 Range 算子的输入类型。
+    Range 算子只接受 int32/int64/float32，但 fp16 转换可能将其输入常量转为 fp16。
+    解决方案：找到所有 Range 节点，将其 fp16 输入的 initializer 转回 float32。
+    """
+    import onnx
+    from onnx import numpy_helper, TensorProto
+
+    graph = model.graph
+
+    # 收集所有 Range 节点的输入名称
+    range_input_names = set()
+    for node in graph.node:
+        if node.op_type == "Range":
+            for inp in node.input:
+                range_input_names.add(inp)
+
+    if not range_input_names:
+        return model
+
+    # 修复 initializer 中的 fp16 → fp32
+    for i, init in enumerate(graph.initializer):
+        if init.name in range_input_names and init.data_type == TensorProto.FLOAT16:
+            arr = numpy_helper.to_array(init).astype("float32")
+            new_init = numpy_helper.from_array(arr, name=init.name)
+            graph.initializer[i].CopyFrom(new_init)
+
+    # 修复 graph input 中的类型声明
+    for inp in graph.input:
+        if inp.name in range_input_names:
+            if inp.type.tensor_type.elem_type == TensorProto.FLOAT16:
+                inp.type.tensor_type.elem_type = TensorProto.FLOAT
+
+    # 修复 Constant 节点输出的类型（如果 Range 输入来自 Constant 节点）
+    for node in graph.node:
+        if node.op_type == "Constant" and len(node.output) > 0 and node.output[0] in range_input_names:
+            for attr in node.attribute:
+                if attr.name == "value" and attr.t.data_type == TensorProto.FLOAT16:
+                    arr = numpy_helper.to_array(attr.t).astype("float32")
+                    new_tensor = numpy_helper.from_array(arr)
+                    attr.t.CopyFrom(new_tensor)
+
+    print(f"   修复 Range 输入: {len(range_input_names)} 个输入已转回 float32")
+    return model
 
 
 def main():
@@ -145,10 +196,7 @@ def main():
     parser.add_argument("--opset-version", type=int, default=16)
     parser.add_argument("--skip-fp16", action="store_true")
     parser.add_argument("--op-block-list", nargs="+",
-                        default=["LayerNormalization", "Softmax", "ReduceMean", "BatchNormalization",
-                                 "Range", "Where", "Gather", "Loop", "SequenceInsert",
-                                 "SequenceAt", "SequenceConstruct", "ConcatFromSequence", "SplitToSequence",
-                                 "Slice", "Unsqueeze", "Squeeze", "Shape", "NonZero", "ConstantOfShape"])
+                        default=["Range"])
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)

@@ -29,7 +29,7 @@ Dockerfile 采用多阶段构建：
 ## Docker Compose 部署
 
 ```bash
-# 启动服务
+# 启动服务（宿主机 8099 → 容器 8080）
 docker-compose up -d
 
 # 停止服务
@@ -42,17 +42,33 @@ docker-compose ps
 docker-compose logs -f seaco-asr
 ```
 
-### 自定义配置
+### 环境变量配置
 
 通过 `.env` 文件或环境变量覆盖默认配置：
 
 ```bash
-# .env
-WORKS=4
-BATCH=16
-DEVICE=cuda
-MAX_BATCH_DURATION=30
+# .env 示例
+HOST_PORT=8099
+WORKS=1
+BATCH=12
+BATCH_TIMEOUT=10
+LOG_LEVEL=INFO
+MAX_CONCURRENT_REQUESTS=2000
+VERBOSE=0
 ```
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| HOST_PORT | 8099 | 宿主机映射端口 |
+| WORKS | 1 | uvicorn workers（GPU 服务必须为 1） |
+| BATCH | 12 | 最大 batch size（合法值：1,2,4,8,12） |
+| BATCH_TIMEOUT | 10 | batch 等待超时（毫秒） |
+| LOG_LEVEL | INFO | 日志级别（DEBUG/INFO/WARNING/ERROR） |
+| MAX_CONCURRENT_REQUESTS | 2000 | 最大并发请求数 |
+| VERBOSE | 0 | 详细日志输出（1=开启，输出各阶段耗时） |
+
+> **重要**：GPU 推理服务 WORKS 必须为 1（单进程模式），靠 asyncio + CPU 线程池实现并发。
+> 多 worker 会导致多进程 fork，空闲时 CPU 占用异常。
 
 ---
 
@@ -68,7 +84,7 @@ metadata:
   labels:
     app: seaco-asr
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: seaco-asr
@@ -81,14 +97,18 @@ spec:
         - name: seaco-asr
           image: seaco-asr:latest
           ports:
-            - containerPort: 30960
+            - containerPort: 8080
           env:
             - name: WORKS
-              value: "4"
+              value: "1"
             - name: BATCH
-              value: "16"
-            - name: DEVICE
-              value: "cuda"
+              value: "12"
+            - name: BATCH_TIMEOUT
+              value: "10"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: MAX_CONCURRENT_REQUESTS
+              value: "2000"
           resources:
             requests:
               memory: "2Gi"
@@ -104,19 +124,21 @@ spec:
           livenessProbe:
             httpGet:
               path: /health
-              port: 30960
-            initialDelaySeconds: 60
+              port: 8080
+            initialDelaySeconds: 420
             periodSeconds: 30
           readinessProbe:
             httpGet:
               path: /health
-              port: 30960
-            initialDelaySeconds: 30
+              port: 8080
+            initialDelaySeconds: 420
             periodSeconds: 10
       volumes:
         - name: logs
           emptyDir: {}
 ```
+
+> **注意**：`initialDelaySeconds` 设为 420s（7分钟），因为服务启动时需要预热所有 bucket × batch 组合（约 6 分钟）。
 
 ### Service
 
@@ -129,8 +151,8 @@ spec:
   selector:
     app: seaco-asr
   ports:
-    - port: 30960
-      targetPort: 30960
+    - port: 8080
+      targetPort: 8080
   type: ClusterIP
 ```
 
@@ -171,13 +193,84 @@ spec:
 | 场景 | WORKS | BATCH | 副本数 | GPU |
 |------|-------|-------|--------|-----|
 | 开发测试 | 1 | 1 | 1 | 0-1 |
-| 小规模（QPS<10） | 2 | 8 | 1 | 1 |
-| 中规模（QPS 10-50） | 4 | 16 | 2 | 2 |
-| 大规模（QPS>50） | 4 | 32 | 4+ | 4+ |
+| 小规模（QPS<10） | 1 | 8 | 1 | 1 |
+| 中规模（QPS 10-50） | 1 | 12 | 2 | 2 |
+| 大规模（QPS>50） | 1 | 12 | 4+ | 4+ |
+
+> GPU 推理服务每个 Pod 固定 WORKS=1，通过增加副本数（Pod 数量）水平扩展。
+> 每个 Pod 绑定一张 GPU，不共享。
 
 ### 关键调优参数
 
-- **BATCH**：增大可提高 GPU 利用率，但增加单请求延迟
-- **BATCH_TIMEOUT**：减小可降低延迟，但降低 batch 填充率
-- **WORKS**：CPU 核数的 1-2 倍，过多会增加 GPU 竞争
-- **MAX_BATCH_DURATION**：限制单次推理的总音频时长，防止 OOM
+| 参数 | 调优建议 |
+|------|----------|
+| BATCH | 增大可提高 GPU 利用率，但增加单请求延迟。合法值：1,2,4,8,12 |
+| BATCH_TIMEOUT | 减小可降低延迟，但降低 batch 填充率。默认 10ms |
+| MAX_CONCURRENT_REQUESTS | 控制最大并发，防止内存溢出。默认 2000 |
+| VERBOSE | 开启后输出各阶段详细耗时，便于性能分析 |
+
+---
+
+## 配置热更新
+
+支持通过 SIGHUP 信号动态调整部分参数，无需重启服务：
+
+```bash
+# 修改环境变量后发送信号
+export BATCH_TIMEOUT=20
+export LOG_LEVEL=DEBUG
+kill -HUP $(pgrep -f "uvicorn src.main:app")
+```
+
+可热更新参数：
+- `BATCH_TIMEOUT`：batch 等待超时
+- `LOG_LEVEL`：日志级别
+
+> 仅在单进程模式（WORKS=1）下有效。
+
+---
+
+## 启动时间说明
+
+服务启动时会执行模型预热（bucket × batch 全组合），确保线上首次请求不会因 CUDA kernel 编译而变慢：
+
+| 阶段 | 耗时 |
+|------|------|
+| 模型加载 | ~10s |
+| ASR 预热（3 bucket × 5 batch = 15 组合） | ~5-6min |
+| 特征提取预热 | <1s |
+| 端到端预热 | <1s |
+| **总计** | **~6min** |
+
+K8s 部署时需确保 `initialDelaySeconds` 大于预热时间，避免 Pod 被误判为不健康而重启。
+
+---
+
+## 日志管理
+
+### 日志输出
+
+- **stdout**：JSON 格式，供 Docker/ELK 采集
+- **本地文件**：`logs/asr_{date}.log`，按天轮转，保留 7 天
+
+### 日志字段
+
+```json
+{
+  "timestamp": "2026-05-15 10:30:42,310",
+  "level": "INFO",
+  "logger": "seaco_asr",
+  "message": "服务启动完成",
+  "request_id": "abc123"
+}
+```
+
+### VERBOSE 模式
+
+设置 `VERBOSE=1` 后，输出各阶段详细耗时：
+
+```
+[Stage1] 解码=5ms, VAD=120ms(6段), 切段=1ms(8chunks)
+[Stage2] 特征提取=45ms, chunks=8, shapes=[(34,560),(67,560),...]
+[Stage3] bucket=67, batch=4, 推理=85ms
+```

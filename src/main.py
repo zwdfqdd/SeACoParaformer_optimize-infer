@@ -80,6 +80,10 @@ def _init_gpu_metrics():
 # ============================================================
 _concurrent_semaphore: asyncio.Semaphore | None = None
 
+# 独立线程池：CPU 任务和 GPU 任务分离，避免互相阻塞
+import concurrent.futures
+_cpu_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
 
 # ============================================================
 # 应用生命周期
@@ -88,6 +92,7 @@ _concurrent_semaphore: asyncio.Semaphore | None = None
 async def lifespan(app: FastAPI):
     """应用启动和关闭逻辑。"""
     global _concurrent_semaphore
+    global _cpu_executor
 
     # 启动：加载模型
     logger.info("服务启动中...")
@@ -96,8 +101,29 @@ async def lifespan(app: FastAPI):
     asr_engine.load()
     await gpu_scheduler.start()
     _concurrent_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_REQUESTS)
+    # CPU 线程池
+    import os
+    _cpu_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=os.cpu_count() or 4,
+        thread_name_prefix="cpu_worker",
+    )
     _init_gpu_metrics()
-    logger.info("服务启动完成")
+
+    # 预热特征提取（torch/torchaudio 首次调用有 lazy init）
+    logger.info("特征提取预热中...")
+    dummy_pcm = np.zeros(16000, dtype=np.float32)  # 1秒静音
+    extract_features(dummy_pcm, cmvn_mean=_cmvn_mean, cmvn_istd=_cmvn_istd)
+    logger.info("特征提取预热完成")
+
+    # 端到端预热（完整走一遍 VAD + 特征 + 推理，触发所有 lazy init）
+    logger.info("端到端预热中...")
+    try:
+        dummy_segments = vad_engine.detect(dummy_pcm, 16000)
+    except Exception:
+        pass  # 静音可能无 VAD 段，忽略
+    logger.info("端到端预热完成")
+
+    logger.info(f"服务启动完成, CPU 线程池: {_cpu_executor._max_workers} workers")
 
     # 注册 SIGHUP 信号处理（配置热更新）
     try:
@@ -211,41 +237,93 @@ async def metrics():
 @app.post("/asr", response_model=ASRResponse)
 async def asr_recognize(req: ASRRequest):
     """
-    语音识别接口。
+    语音识别接口 — 三级流水线架构。
 
-    输入: {"b64": "wav_16k_1channel_base64", "hotwords": ["张三", "李四"]}
-    输出: {"code": 0, "text": "全文", "detail": {"0": {"text": "...", "start_ms": 0, "end_ms": 5200}}}
+    Stage 1 (CPU): 音频解码 + VAD 切段 + 长音频切分
+    Stage 2 (CPU): 特征提取（线程池并行）
+    Stage 3 (GPU): ASR 推理（Scheduler batch 调度）
+
+    多请求间各 Stage 独立并行，CPU/GPU 同时满载。
     """
-    # 并发控制
-    try:
-        await asyncio.wait_for(
-            _concurrent_semaphore.acquire(), timeout=0
-        )
-    except asyncio.TimeoutError:
-        raise ASRException(ErrorCode.SERVICE_BUSY)
+    # 并发控制：排队等待，超过 MAX_CONCURRENT_REQUESTS 时自然阻塞
+    await _concurrent_semaphore.acquire()
 
     try:
-        # 设置请求 ID
         rid = generate_request_id()
         request_id_var.set(rid)
         start_time = time.time()
 
-        # Step 1: 音频解码
-        pcm, sample_rate, audio_duration_ms = _decode_audio(req.b64)
+        loop = asyncio.get_event_loop()
 
-        # Step 2: VAD 切段
-        vad_segments = vad_engine.detect(pcm, sample_rate)
+        # ====== Stage 1: 音频解码 + VAD + 切段（CPU 线程池） ======
+        def _stage1_cpu():
+            t0 = time.time()
+            pcm, sample_rate, audio_duration_ms = _decode_audio(req.b64)
+            t1 = time.time()
+            vad_segments = vad_engine.detect(pcm, sample_rate)
+            t2 = time.time()
+            chunks = segment_to_chunks(vad_segments, audio_duration_ms)
+            t3 = time.time()
+            if settings.VERBOSE:
+                logger.debug(
+                    f"[Stage1] 解码={int((t1-t0)*1000)}ms, "
+                    f"VAD={int((t2-t1)*1000)}ms({len(vad_segments)}段), "
+                    f"切段={int((t3-t2)*1000)}ms({len(chunks)}chunks)"
+                )
+            return pcm, sample_rate, audio_duration_ms, vad_segments, chunks
 
-        # Step 3: 长音频切段
-        chunks = segment_to_chunks(vad_segments, audio_duration_ms)
+        pcm, sample_rate, audio_duration_ms, vad_segments, chunks = (
+            await loop.run_in_executor(_cpu_executor, _stage1_cpu)
+        )
 
-        # Step 4: ASR 推理（通过 GPU Scheduler）
+        # ====== Stage 2: 特征提取（CPU 线程池） ======
+        # 热词编码（如有）
+        bias_embeddings = None
+        if req.hotwords and asr_engine.has_bias_model:
+            bias_embeddings = _encode_hotwords(req.hotwords)
+
+        def _stage2_extract_features():
+            t0 = time.time()
+            features_list = []
+            for chunk in chunks:
+                chunk_audio = extract_chunk_audio(pcm, chunk, sample_rate)
+                features = extract_features(
+                    chunk_audio,
+                    sample_rate=sample_rate,
+                    cmvn_mean=_cmvn_mean,
+                    cmvn_istd=_cmvn_istd,
+                )
+                features_list.append(features)
+            if settings.VERBOSE:
+                shapes = [f.shape for f in features_list]
+                logger.debug(
+                    f"[Stage2] 特征提取={int((time.time()-t0)*1000)}ms, "
+                    f"chunks={len(features_list)}, shapes={shapes}"
+                )
+            return features_list
+
+        features_list = await loop.run_in_executor(_cpu_executor, _stage2_extract_features)
+
+        # ====== Stage 3: GPU 推理（Scheduler: 固定 shape bucket + batch_timeout） ======
         with asr_inference_duration.time():
-            chunk_results = await _infer_chunks(
-                pcm, chunks, sample_rate, hotwords=req.hotwords
-            )
+            tasks = []
+            for features in features_list:
+                task = gpu_scheduler.submit(features, bias_embeddings)
+                tasks.append(task)
 
-        # Step 5: 结果拼接
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 检查异常
+        chunk_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                raise ASRException(
+                    ErrorCode.ASR_INFER_FAILED,
+                    f"Chunk {i} 推理失败: {result}",
+                )
+            chunk_results.append(result)
+
+        # ====== 结果合并 ======
         response = _build_response(chunks, chunk_results, hotwords=req.hotwords)
 
         # 记录日志
@@ -307,64 +385,6 @@ def _decode_audio(b64_str: str) -> tuple[np.ndarray, int, int]:
     return pcm, sample_rate, duration_ms
 
 
-async def _infer_chunks(
-    pcm: np.ndarray,
-    chunks: list[ChunkMeta],
-    sample_rate: int,
-    hotwords: list[str] | None = None,
-) -> list[np.ndarray]:
-    """
-    对所有 chunk 进行 ASR 推理。
-
-    流程：
-    1. 热词编码（如有 hotwords 且 bias encoder 可用）
-    2. 并行特征提取（CPU 密集，使用线程池）
-    3. 通过 GPU Scheduler 统一调度 batch 推理
-    """
-    loop = asyncio.get_event_loop()
-
-    # Step 1: 热词编码（通过 bias encoder）
-    bias_embeddings = None
-    if hotwords and asr_engine.has_bias_model:
-        bias_embeddings = _encode_hotwords(hotwords)
-
-    # Step 2: 并行特征提取
-    def _extract_all_features():
-        features_list = []
-        for chunk in chunks:
-            chunk_audio = extract_chunk_audio(pcm, chunk, sample_rate)
-            features = extract_features(
-                chunk_audio,
-                sample_rate=sample_rate,
-                cmvn_mean=_cmvn_mean,
-                cmvn_istd=_cmvn_istd,
-            )
-            features_list.append(features)
-        return features_list
-
-    features_list = await loop.run_in_executor(None, _extract_all_features)
-
-    # Step 3: 提交 GPU Scheduler 推理
-    tasks = []
-    for chunk, features in zip(chunks, features_list):
-        task = gpu_scheduler.submit(features, chunk.duration_ms, bias_embeddings)
-        tasks.append(task)
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # 检查异常
-    final_results = []
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            raise ASRException(
-                ErrorCode.ASR_INFER_FAILED,
-                f"Chunk {i} 推理失败: {result}",
-            )
-        final_results.append(result)
-
-    return final_results
-
-
 def _encode_hotwords(hotwords: list[str]) -> np.ndarray | None:
     """
     将热词列表编码为 bias embeddings。
@@ -384,20 +404,6 @@ def _encode_hotwords(hotwords: list[str]) -> np.ndarray | None:
 
     # 通过 bias encoder 获取 embeddings
     return asr_engine.encode_hotwords(padded)
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # 检查异常
-    final_results = []
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            raise ASRException(
-                ErrorCode.ASR_INFER_FAILED,
-                f"Chunk {i} 推理失败: {result}",
-            )
-        final_results.append(result)
-
-    return final_results
 
 
 def _build_response(

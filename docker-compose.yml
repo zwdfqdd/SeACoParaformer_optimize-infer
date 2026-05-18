@@ -1,22 +1,18 @@
-version: "3.8"
-
 services:
   seaco-asr:
+    image: seaco-asr:latest
     build:
       context: .
       dockerfile: Dockerfile
       target: inference
     container_name: seaco-asr
     ports:
-      - "${PORT:-30960}:${PORT:-30960}"
+      - "${HOST_PORT:-8099}:8080"
     environment:
       - WORKS=${WORKS:-1}
-      - BATCH=${BATCH:-1}
-      - PORT=${PORT:-30960}
-      - DEVICE=${DEVICE:-auto}
+      - BATCH=${BATCH:-12}
       - BATCH_TIMEOUT=${BATCH_TIMEOUT:-10}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - MAX_BATCH_DURATION=${MAX_BATCH_DURATION:-30}
       - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-2000}
     restart: unless-stopped
     deploy:
@@ -24,10 +20,11 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              # count: all
+              device_ids: ['0']
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-30960}/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
