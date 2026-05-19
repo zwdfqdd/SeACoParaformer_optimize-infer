@@ -20,7 +20,6 @@ from src.logger import logger
 
 try:
     import tensorrt as trt
-    from cuda import cudart
 
     TRT_AVAILABLE = True
 except ImportError:
@@ -71,11 +70,6 @@ class TRTEngine:
 
         self._context = self._engine.create_execution_context()
 
-        # 创建 CUDA stream
-        err, self._stream = cudart.cudaStreamCreate()
-        if err != cudart.cudaError_t.cudaSuccess:
-            raise RuntimeError(f"CUDA stream 创建失败: {err}")
-
         # 解析输入输出
         for i in range(self._engine.num_io_tensors):
             name = self._engine.get_tensor_name(i)
@@ -103,6 +97,8 @@ class TRTEngine:
         """
         TRT 推理（接口对齐 ASREngine.infer_batch_raw）。
 
+        使用 torch tensor 管理 GPU 内存（简洁且与现有依赖兼容）。
+
         参数：
             padded_feats: (batch, seq_len, 560) float32
             lengths: (batch,) int32
@@ -114,91 +110,50 @@ class TRTEngine:
         if self._engine is None:
             raise RuntimeError("TRT engine 未加载")
 
+        import torch
+
         batch_size = padded_feats.shape[0]
         seq_len = padded_feats.shape[1]
         feat_dim = padded_feats.shape[2]
 
-        # 设置 input shapes（dynamic batch）
+        # 准备输入 tensor（GPU）
+        d_inputs = {}
         for name in self._input_names:
             if name == "speech":
+                data = torch.from_numpy(padded_feats).cuda().contiguous()
                 self._context.set_input_shape(name, (batch_size, seq_len, feat_dim))
             elif name == "speech_lengths":
+                data = torch.from_numpy(lengths.astype(np.int32)).cuda().contiguous()
                 self._context.set_input_shape(name, (batch_size,))
             elif "bias_embed" in name:
                 if bias_embeddings is not None:
-                    bias_batch = np.tile(bias_embeddings, (batch_size, 1, 1)).astype(np.float32)
-                    self._context.set_input_shape(name, bias_batch.shape)
+                    bias_data = np.tile(bias_embeddings, (batch_size, 1, 1)).astype(np.float32)
+                    data = torch.from_numpy(bias_data).cuda().contiguous()
+                    self._context.set_input_shape(name, bias_data.shape)
                 else:
-                    # 无热词：传 (batch, 1, 512) 零向量占位
+                    data = torch.zeros((batch_size, 1, 512), dtype=torch.float32, device="cuda")
                     self._context.set_input_shape(name, (batch_size, 1, 512))
+            else:
+                continue
+            d_inputs[name] = data
+            self._context.set_tensor_address(name, data.data_ptr())
 
-        # 准备输入数据（contiguous）
-        inputs = {}
-        for name in self._input_names:
-            if name == "speech":
-                inputs[name] = np.ascontiguousarray(padded_feats.astype(np.float32))
-            elif name == "speech_lengths":
-                inputs[name] = np.ascontiguousarray(lengths.astype(np.int32))
-            elif "bias_embed" in name:
-                if bias_embeddings is not None:
-                    inputs[name] = np.ascontiguousarray(
-                        np.tile(bias_embeddings, (batch_size, 1, 1)).astype(np.float32)
-                    )
-                else:
-                    inputs[name] = np.ascontiguousarray(
-                        np.zeros((batch_size, 1, 512), dtype=np.float32)
-                    )
-
-        # 分配 GPU 内存并拷贝输入
-        d_inputs = {}
-        for name, data in inputs.items():
-            err, d_ptr = cudart.cudaMallocAsync(data.nbytes, self._stream)
-            if err != cudart.cudaError_t.cudaSuccess:
-                raise RuntimeError(f"cudaMalloc 失败: {err}")
-            d_inputs[name] = d_ptr
-            cudart.cudaMemcpyAsync(
-                d_ptr, data.ctypes.data, data.nbytes,
-                cudart.cudaMemcpyKind.cudaMemcpyHostToDevice, self._stream
-            )
-
-        # 分配输出内存
+        # 分配输出 tensor（GPU）
         d_outputs = {}
-        h_outputs = {}
         for name in self._output_names:
-            output_shape = self._context.get_tensor_shape(name)
-            h_outputs[name] = np.empty(output_shape, dtype=np.float32)
-            err, d_ptr = cudart.cudaMallocAsync(h_outputs[name].nbytes, self._stream)
-            if err != cudart.cudaError_t.cudaSuccess:
-                raise RuntimeError(f"cudaMalloc 输出失败: {err}")
-            d_outputs[name] = d_ptr
-
-        # 绑定地址
-        for name in self._input_names:
-            self._context.set_tensor_address(name, d_inputs[name])
-        for name in self._output_names:
-            self._context.set_tensor_address(name, d_outputs[name])
+            output_shape = tuple(self._context.get_tensor_shape(name))
+            d_outputs[name] = torch.empty(output_shape, dtype=torch.float32, device="cuda")
+            self._context.set_tensor_address(name, d_outputs[name].data_ptr())
 
         # 执行推理
-        self._context.execute_async_v3(stream_handle=self._stream)
+        stream = torch.cuda.current_stream()
+        self._context.execute_async_v3(stream_handle=stream.cuda_stream)
+        stream.synchronize()
 
-        # 拷贝输出到 host
-        for name in self._output_names:
-            cudart.cudaMemcpyAsync(
-                h_outputs[name].ctypes.data, d_outputs[name], h_outputs[name].nbytes,
-                cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost, self._stream
-            )
-
-        # 同步
-        cudart.cudaStreamSynchronize(self._stream)
-
-        # 释放 GPU 内存
-        for d_ptr in d_inputs.values():
-            cudart.cudaFreeAsync(d_ptr, self._stream)
-        for d_ptr in d_outputs.values():
-            cudart.cudaFreeAsync(d_ptr, self._stream)
+        # 拷贝输出到 CPU
+        logits = d_outputs[self._output_names[0]].cpu().numpy()
 
         # 拆分 batch 结果
-        logits = h_outputs[self._output_names[0]]  # (batch, seq, vocab)
         results = []
         for i in range(batch_size):
             results.append(logits[i])

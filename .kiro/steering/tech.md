@@ -9,8 +9,8 @@
 - **FunASR**: 阿里达摩院开源的端到端语音识别工具包，提供 Paraformer 模型基础架构（仅转换环境）
 - **PyTorch + torchaudio**: 特征提取（kaldi fbank），不用于模型推理
 - **ONNX Runtime GPU**: 模型推理引擎（v1 线上，fp32/int8）
-- **TensorRT 8.6.1**: 高性能 GPU 推理引擎（v2 线上，fp16/INT8）
-- **CUDA 12.1 + cuDNN 9**: GPU 计算基础
+- **TensorRT 10.6**: 高性能 GPU 推理引擎（v2 线上，fp16/INT8）
+- **CUDA 12.6 + cuDNN 9**: GPU 计算基础
 - **NumPy**: 数值计算
 - **SoundFile**: 音频文件读取
 - **FastAPI + Uvicorn**: HTTP 服务框架

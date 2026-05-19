@@ -1,4 +1,4 @@
-# v2 TensorRT 推理服务部署
+# v2 TensorRT 推理服务部署（TRT 10.6 + CUDA 12.6）
 # 用法：docker-compose -f docker-compose.trt.yml up -d
 services:
   seaco-asr-trt:

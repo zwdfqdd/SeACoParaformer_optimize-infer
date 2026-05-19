@@ -247,9 +247,10 @@
             - 单请求延迟 = max(VAD, 特征提取, ASR)，而非三者之和
     v2（TensorRT 量化优化）：
         环境：
-            TensorRT 8.6.1 + CUDA 12.1
+            TensorRT 10.6 + CUDA 12.6（镜像 nvcr.io/nvidia/tensorrt:24.11-py3）
             目标 GPU：A10、2080 Ti
             校准数据：现有测试音频集
+            TRT 10.x 支持 NonZero 算子，可直接转换完整模型（无需拆分 encoder/decoder）
         目标：
             1. TensorRT fp16 替代 ORT fp32，提升推理速度 2-3x，显存减半
             2. TensorRT INT8 量化，进一步压缩模型，提升吞吐

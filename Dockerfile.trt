@@ -1,8 +1,9 @@
 # ============================================================
 # v2 TensorRT 推理镜像
-# 基础镜像已内置：TRT 8.6.1 + CUDA 12.1 + cuDNN 8.9 + Python 3.10 + PyTorch
+# 基础镜像：TRT 10.6 + CUDA 12.6 + cuDNN 9 + Python 3.10 + PyTorch 2.5
+# TRT 10.x 支持 NonZero 算子，可直接转换完整模型（无需拆分）
 # ============================================================
-FROM nvcr.io/nvidia/tensorrt:23.08-py3 AS inference-trt
+FROM nvcr.io/nvidia/tensorrt:24.11-py3 AS inference-trt
 
 WORKDIR /app
 
