@@ -245,11 +245,68 @@
             - CPU 和 GPU 同时满载（VAD/特征提取占 CPU，ASR 占 GPU）
             - 请求间不互相阻塞（流水线各级独立）
             - 单请求延迟 = max(VAD, 特征提取, ASR)，而非三者之和
-    v2（量化优化）：
+    v2（TensorRT 量化优化）：
+        环境：
+            TensorRT 8.6.1 + CUDA 12.1
+            目标 GPU：A10、2080 Ti
+            校准数据：现有测试音频集
         目标：
-            1. 在不同 GPU 硬件上优化模型（TensorRT fp16/INT8）
-            2. 解决 ONNX fp16 GPU 精度问题（TensorRT 选择性量化）
-            3. 模型优化（TensorRT 转换、量化校准、精度对比）
+            1. TensorRT fp16 替代 ORT fp32，提升推理速度 2-3x，显存减半
+            2. TensorRT INT8 量化，进一步压缩模型，提升吞吐
+            3. 多 GPU 适配，按目标硬件生成专用 engine
+            4. 完善精度验证和性能对比工具链
+        技术要点：
+            TRT engine 硬件绑定：不同 GPU 需分别构建 engine（2080 Ti 的 engine 不能在 A10 上跑）
+            Dynamic shape profile：min=(1,34,560) opt=(4,67,560) max=(12,134,560)，与 bucket 策略对齐
+            TRT fp16 vs ONNX fp16：TRT 自动逐层决定 fp16/fp32，比 ONNX 全局 fp16 精度更好
+            INT8 校准：需要代表性音频数据（200-500 条，覆盖 2s/4s/8s 各桶、不同说话人/噪声）
+            engine 缓存：首次构建耗时 5-10min，序列化到文件后续直接加载
+            回退机制：TRT engine 加载失败 → 自动回退 ORT fp32
+        精度验证标准：
+            TRT fp16：CER ≤ 1%（相对 ORT fp32 基线）
+            TRT INT8：CER ≤ 3%（相对 ORT fp32 基线）
+            超过阈值则调整量化策略（逐层 fallback fp16/fp32）
+        执行阶段：
+            阶段 1 — TRT fp16 基线（最高优先级）：
+                交付物：
+                    scripts/convert_trt.py — ONNX → TRT engine 转换（指定 GPU、precision、shape profile）
+                    src/trt_engine.py — TensorRT 推理引擎（替代 ORT session，支持 dynamic batch）
+                    src/config.py 新增 MODEL_PRECISION=trt_fp16 / trt_int8
+                    engine 缓存机制：models/asr/trt/{gpu}_{precision}.engine
+                    精度对比：ORT fp32 vs TRT fp16 CER 报告
+                技术实现：
+                    trtexec 或 Python TRT API 构建 engine
+                    dynamic shape：3 个 optimization profile 对应 3 个 bucket
+                    推理接口对齐 asr_engine.py（infer_batch_raw 兼容）
+                    scheduler.py 无需修改（只替换底层推理引擎）
+            阶段 2 — INT8 量化：
+                交付物：
+                    data/calibration/ — 校准数据集（200-500 条音频）
+                    scripts/calibrate_int8.py — INT8 校准脚本（生成 calibration cache）
+                    scripts/compare_accuracy.py — 批量精度对比工具
+                    精度报告：ORT fp32 vs TRT fp16 vs TRT INT8
+                技术实现：
+                    IInt8EntropyCalibrator2 校准器
+                    校准数据覆盖：短音频(2s) + 中音频(4s) + 长音频(8s)
+                    逐层精度分析：标记精度敏感层 fallback fp16
+            阶段 3 — 多 GPU 适配 + 工程化：
+                交付物：
+                    scripts/build_engine.py — 多 GPU 构建脚本（自动检测当前 GPU 构建）
+                    Dockerfile 更新：构建阶段生成 TRT engine 或首次启动时构建 + 缓存
+                    MODEL_PRECISION=auto 策略更新：TRT engine 存在 → 用 TRT，否则回退 ORT
+                    部署文档更新
+                engine 存放结构：
+                    models/asr/trt/
+                    ├── a10_fp16.engine
+                    ├── a10_int8.engine
+                    ├── 2080ti_fp16.engine
+                    └── 2080ti_int8.engine
+            阶段 4 — 性能调优 + 生产验证：
+                交付物：
+                    性能基线报告：各方案 RTX/QPS/显存/延迟对比
+                    长时间稳定性测试（连续 24h，监控内存泄漏/精度漂移）
+                    最终推荐配置文档
+                    scripts/benchmark_trt.py — TRT 专项性能测试
 文档与交付物:
     README.md：环境准备、启动命令、API 示例（curl/Python）
     API.md：请求/响应 schema、错误码字典、热词格式说明

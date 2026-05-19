@@ -2,36 +2,53 @@
 
 ## 编程语言
 
-- Python 3.8+
+- Python >= 3.12
 
 ## 核心框架与库
 
-- **FunASR**: 阿里达摩院开源的端到端语音识别工具包，提供 Paraformer 模型基础架构
-- **PyTorch**: 深度学习框架
-- **ModelScope**: 模型管理与推理平台
+- **FunASR**: 阿里达摩院开源的端到端语音识别工具包，提供 Paraformer 模型基础架构（仅转换环境）
+- **PyTorch + torchaudio**: 特征提取（kaldi fbank），不用于模型推理
+- **ONNX Runtime GPU**: 模型推理引擎（v1 线上，fp32/int8）
+- **TensorRT 8.6.1**: 高性能 GPU 推理引擎（v2 线上，fp16/INT8）
+- **CUDA 12.1 + cuDNN 9**: GPU 计算基础
 - **NumPy**: 数值计算
-- **SoundFile / librosa**: 音频文件读取与处理
-- **ONNX / ONNX Runtime**: 模型导出与高性能推理（可选）
+- **SoundFile**: 音频文件读取
+- **FastAPI + Uvicorn**: HTTP 服务框架
+- **Prometheus + OpenTelemetry**: 可观测性
+
+## 推理引擎选择
+
+| 场景 | 引擎 | 模型精度 | 说明 |
+|------|------|----------|------|
+| GPU 线上（v1） | ONNX Runtime | fp32 | 精度稳定，通用性好 |
+| CPU 线上（v1） | ONNX Runtime | int8 | 动态量化，模型缩小 75% |
+| GPU 线上（v2） | TensorRT | fp16/INT8 | 速度提升 2-3x，显存减半 |
 
 ## 构建与依赖管理
 
 - `pip` + `requirements.txt` 管理 Python 依赖
-- 建议使用虚拟环境（venv 或 conda）
+- requirements-convert.txt：模型转换环境（含 FunASR/ModelScope）
+- requirements-infer.txt：推理服务环境（轻量化）
+- Docker 多阶段构建分离转换和推理环境
 
 ## 常用命令
 
 ```bash
-# 安装依赖
-pip install -r requirements.txt
+# 安装推理依赖
+pip install -r requirements-infer.txt
 
-# 运行推理
-python inference.py --audio <音频路径> --hotwords <热词列表>
+# 启动服务
+python -m uvicorn src.main:app --host 0.0.0.0 --port 8080
 
 # 运行测试
-pytest tests/
+python tests/test_single.py --audio test_data/audio_16000_30s.wav
 
-# 代码格式检查
-flake8 src/
+# 模型转换（转换环境）
+python scripts/export_onnx.py --skip-fp16 --output-dir ./models/asr
+python scripts/convert_int8.py --input-dir ./models/asr/fp32 --output-dir ./models/asr/int8
+
+# TRT 转换（v2）
+python scripts/convert_trt.py --input ./models/asr/fp32/model.onnx --precision fp16
 ```
 
 ## 开发规范
