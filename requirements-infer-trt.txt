@@ -1,17 +1,17 @@
-# v2 TensorRT 推理服务环境依赖
-# 基础镜像：nvcr.io/nvidia/tensorrt:23.08-py3（含 TRT 8.6.1 + CUDA 12.1）
-tensorrt==8.6.1
-cuda-python>=12.1.0
-numpy>=1.26.0
-torch==2.3.1
-torchaudio==2.3.1
+# v2 TensorRT 推理服务额外依赖
+# 基础镜像 nvcr.io/nvidia/tensorrt:23.08-py3 已内置：
+#   TensorRT 8.6.1, CUDA 12.1, cuDNN 8.9, Python 3.10, PyTorch, numpy
+# 以下仅安装镜像中缺少的业务依赖
+
+torchaudio==2.1.0
+soundfile==0.12.1
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 pydantic==2.7.4
-soundfile==0.12.1
 prometheus-client==0.20.0
 python-multipart==0.0.9
 opentelemetry-api==1.25.0
 opentelemetry-sdk==1.25.0
 opentelemetry-instrumentation-fastapi==0.46b0
 onnxruntime-gpu==1.19.2
+cuda-python>=12.1.0
