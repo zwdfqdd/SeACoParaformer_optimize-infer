@@ -20,8 +20,7 @@ from src.logger import logger
 
 try:
     import tensorrt as trt
-    import pycuda.driver as cuda
-    import pycuda.autoinit  # noqa: F401 — 初始化 CUDA context
+    from cuda import cudart
 
     TRT_AVAILABLE = True
 except ImportError:
@@ -71,7 +70,11 @@ class TRTEngine:
             raise RuntimeError(f"Engine 反序列化失败: {engine_path}")
 
         self._context = self._engine.create_execution_context()
-        self._stream = cuda.Stream()
+
+        # 创建 CUDA stream
+        err, self._stream = cudart.cudaStreamCreate()
+        if err != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"CUDA stream 创建失败: {err}")
 
         # 解析输入输出
         for i in range(self._engine.num_io_tensors):
@@ -128,7 +131,7 @@ class TRTEngine:
                 else:
                     self._context.set_input_shape(name, (batch_size, 1, 512))
 
-        # 准备输入数据
+        # 准备输入数据（contiguous）
         inputs = {}
         for name in self._input_names:
             if name == "speech":
@@ -145,42 +148,53 @@ class TRTEngine:
                         np.zeros((batch_size, 1, 512), dtype=np.float32)
                     )
 
-        # 分配 GPU 内存
+        # 分配 GPU 内存并拷贝输入
         d_inputs = {}
         for name, data in inputs.items():
-            d_inputs[name] = cuda.mem_alloc(data.nbytes)
-            cuda.memcpy_htod_async(d_inputs[name], data, self._stream)
+            err, d_ptr = cudart.cudaMallocAsync(data.nbytes, self._stream)
+            if err != cudart.cudaError_t.cudaSuccess:
+                raise RuntimeError(f"cudaMalloc 失败: {err}")
+            d_inputs[name] = d_ptr
+            cudart.cudaMemcpyAsync(
+                d_ptr, data.ctypes.data, data.nbytes,
+                cudart.cudaMemcpyKind.cudaMemcpyHostToDevice, self._stream
+            )
 
         # 分配输出内存
         d_outputs = {}
         h_outputs = {}
         for name in self._output_names:
-            # 获取输出 shape（在设置 input shape 后可以推断）
             output_shape = self._context.get_tensor_shape(name)
-            output_size = int(np.prod(output_shape))
             h_outputs[name] = np.empty(output_shape, dtype=np.float32)
-            d_outputs[name] = cuda.mem_alloc(h_outputs[name].nbytes)
+            err, d_ptr = cudart.cudaMallocAsync(h_outputs[name].nbytes, self._stream)
+            if err != cudart.cudaError_t.cudaSuccess:
+                raise RuntimeError(f"cudaMalloc 输出失败: {err}")
+            d_outputs[name] = d_ptr
 
         # 绑定地址
         for name in self._input_names:
-            self._context.set_tensor_address(name, int(d_inputs[name]))
+            self._context.set_tensor_address(name, d_inputs[name])
         for name in self._output_names:
-            self._context.set_tensor_address(name, int(d_outputs[name]))
+            self._context.set_tensor_address(name, d_outputs[name])
 
         # 执行推理
-        self._context.execute_async_v3(stream_handle=self._stream.handle)
+        self._context.execute_async_v3(stream_handle=self._stream)
 
-        # 拷贝输出
+        # 拷贝输出到 host
         for name in self._output_names:
-            cuda.memcpy_dtoh_async(h_outputs[name], d_outputs[name], self._stream)
+            cudart.cudaMemcpyAsync(
+                h_outputs[name].ctypes.data, d_outputs[name], h_outputs[name].nbytes,
+                cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost, self._stream
+            )
 
-        self._stream.synchronize()
+        # 同步
+        cudart.cudaStreamSynchronize(self._stream)
 
         # 释放 GPU 内存
-        for d in d_inputs.values():
-            d.free()
-        for d in d_outputs.values():
-            d.free()
+        for d_ptr in d_inputs.values():
+            cudart.cudaFreeAsync(d_ptr, self._stream)
+        for d_ptr in d_outputs.values():
+            cudart.cudaFreeAsync(d_ptr, self._stream)
 
         # 拆分 batch 结果
         logits = h_outputs[self._output_names[0]]  # (batch, seq, vocab)

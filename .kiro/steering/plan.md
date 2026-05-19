@@ -307,6 +307,28 @@
                     长时间稳定性测试（连续 24h，监控内存泄漏/精度漂移）
                     最终推荐配置文档
                     scripts/benchmark_trt.py — TRT 专项性能测试
+        工程架构（双镜像方案）：
+            设计原则：
+                - 代码统一：同一份 src/，通过 MODEL_PRECISION 环境变量决定走 ORT 还是 TRT
+                - 依赖隔离：trt_engine.py 顶部 try import，v1 镜像没装 TRT 不报错
+                - 镜像独立：不同 Dockerfile 安装不同依赖
+                - 部署独立：不同 docker-compose 文件启动不同镜像
+            文件结构：
+                Dockerfile              — v1 推理镜像（ORT + CUDA 12.1）
+                Dockerfile.trt          — v2 推理镜像（TRT 8.6.1 + CUDA 12.1）
+                docker-compose.yml      — v1 部署
+                docker-compose.trt.yml  — v2 部署（含 engine 缓存 volume）
+                requirements-infer.txt      — v1 依赖
+                requirements-infer-trt.txt  — v2 依赖（含 tensorrt + cuda-python）
+            TRT engine 缓存策略：
+                - 镜像内只打包 ONNX fp32 模型
+                - 首次启动时 entrypoint_trt.sh 自动检测并构建 engine
+                - engine 缓存到 Docker volume（trt_engine_cache）
+                - 重启不重新构建，volume 持久化
+                - 不同 GPU 自动生成不同文件名（{gpu}_{model}_{precision}.engine）
+            回退机制：
+                - TRT engine 构建失败 → 服务仍可启动（回退 ORT fp32）
+                - TRT 推理异常 → 日志告警，返回错误码
 文档与交付物:
     README.md：环境准备、启动命令、API 示例（curl/Python）
     API.md：请求/响应 schema、错误码字典、热词格式说明
