@@ -129,6 +129,7 @@ class TRTEngine:
                     bias_batch = np.tile(bias_embeddings, (batch_size, 1, 1)).astype(np.float32)
                     self._context.set_input_shape(name, bias_batch.shape)
                 else:
+                    # 无热词：传 (batch, 1, 512) 零向量占位
                     self._context.set_input_shape(name, (batch_size, 1, 512))
 
         # 准备输入数据（contiguous）

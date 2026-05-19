@@ -11,7 +11,7 @@ TRT engine 与 GPU 硬件绑定，不同 GPU 需分别构建。
 Dynamic Shape Profile（对齐 bucket 策略）：
     speech:         min=(1,34,560)   opt=(4,67,560)   max=(12,134,560)
     speech_lengths: min=(1,)         opt=(4,)         max=(12,)
-    bias_embed:     min=(1,1,512)    opt=(4,1,512)    max=(12,1,512)
+    bias_embed:     min=(1,1,512)    opt=(4,4,512)    max=(12,50,512)
 
 用法：
     # fp16 转换（推荐）
@@ -62,9 +62,9 @@ ASR_PROFILES = {
         "max": (12,),
     },
     "bias_embed": {
-        "min": (1, 1, 512),
-        "opt": (4, 1, 512),
-        "max": (12, 1, 512),
+        "min": (1, 1, 512),     # 无热词时传 1 个零向量占位
+        "opt": (4, 4, 512),     # 常见：4 个热词
+        "max": (12, 50, 512),   # 最大：50 个热词
     },
 }
 
@@ -109,6 +109,44 @@ def get_gpu_name() -> str:
         pass
 
     return "unknown_gpu"
+
+
+def _force_fp32_layers(network):
+    """
+    强制特定层使用 fp32 精度，解决：
+    1. LayerNorm fp16 溢出（TRT 警告：Running layernorm after self-attention in FP16 may cause overflow）
+    2. FSMN Conv fp16 Cask 错误（Assertion isOpConsistent failed）
+
+    策略：遍历所有层，将 LayerNorm 和 FSMN 相关 Conv 标记为 fp32。
+    """
+    fp32_count = 0
+    for i in range(network.num_layers):
+        layer = network.get_layer(i)
+        layer_name = layer.name.lower() if layer.name else ""
+
+        # 强制 fp32 的条件：
+        # 1. LayerNormalization 相关层（含 ReduceMean/Sub/Pow/Sqrt/Div 等 LN 子图）
+        # 2. FSMN block 中的 Conv（名称含 fsmn）
+        # 3. CIF predictor 相关（cumsum/threshold）
+        force_fp32 = False
+
+        if layer.type == trt.LayerType.NORMALIZATION:
+            force_fp32 = True
+        elif "layernorm" in layer_name or "layer_norm" in layer_name:
+            force_fp32 = True
+        elif "fsmn" in layer_name and ("conv" in layer_name or layer.type == trt.LayerType.CONVOLUTION):
+            force_fp32 = True
+        elif "cif" in layer_name:
+            force_fp32 = True
+
+        if force_fp32:
+            layer.precision = trt.float32
+            # 同时设置输出精度
+            for j in range(layer.num_outputs):
+                layer.set_output_type(j, trt.float32)
+            fp32_count += 1
+
+    print(f"    强制 fp32 层数: {fp32_count}")
 
 
 def build_engine(
@@ -164,16 +202,20 @@ def build_engine(
         if not builder.platform_has_fast_fp16:
             print("    警告：当前 GPU 不支持快速 fp16，性能可能不佳")
         config.set_flag(trt.BuilderFlag.FP16)
-        print("    启用 FP16")
+        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+        # 强制 LayerNorm 和 FSMN Conv 层使用 fp32（避免精度溢出和 Cask 错误）
+        _force_fp32_layers(network)
+        print("    启用 FP16（LayerNorm/FSMN Conv 强制 fp32）")
     elif precision == "int8":
         if not builder.platform_has_fast_int8:
             print("    警告：当前 GPU 不支持快速 int8")
         config.set_flag(trt.BuilderFlag.INT8)
         config.set_flag(trt.BuilderFlag.FP16)  # INT8 回退到 FP16
-        print("    启用 INT8 + FP16 fallback")
+        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+        _force_fp32_layers(network)
+        print("    启用 INT8 + FP16 fallback（LayerNorm/FSMN Conv 强制 fp32）")
 
         if calib_cache and os.path.exists(calib_cache):
-            # 使用已有校准缓存
             config.int8_calibrator = CacheCalibrator(calib_cache)
             print(f"    校准缓存: {calib_cache}")
         else:
