@@ -1,17 +1,17 @@
 """
-ASR ONNX 推理引擎
+ASR 推理引擎（支持 ORT 和 TensorRT 双后端）
 
 SeACo-Paraformer 双模型架构：
-- model.onnx: 主模型（encoder + predictor + decoder），输入 speech features，输出 logits
-- model_eb.onnx: bias encoder（热词编码器），输入 hotword token IDs，输出 bias embeddings
+- model.onnx / model.engine: 主模型（encoder + predictor + decoder）
+- model_eb.onnx / model_eb.engine: bias encoder（热词编码器）
 
-推理流程：
-1. [可选] model_eb.onnx: hotwords → token IDs → bias embeddings
-2. model.onnx: speech features [+ bias embeddings] → logits
+推理后端选择（由 MODEL_PRECISION 决定）：
+- fp32 / int8 → ONNX Runtime
+- trt_fp16 / trt_int8 → TensorRT（回退 ORT fp32）
 
 优化：
-- graph_optimization_level=ORT_ENABLE_ALL
-- enable_mem_pattern=False（避免动态 shape 缓存冲突）
+- ORT: graph_optimization_level=ORT_ENABLE_ALL, enable_mem_pattern=False
+- TRT: dynamic shape profile, engine 缓存, CUDA stream 异步
 - 服务启动时模型预热（dummy inference）
 """
 
@@ -27,17 +27,22 @@ from src.logger import logger
 
 class ASREngine:
     """
-    ASR ONNX Runtime 推理引擎。
+    ASR 推理引擎（ORT + TRT 双后端）。
 
     双模型：
-    - _session: 主模型 (model.onnx)
+    - _session: ORT 主模型 (model.onnx)
+    - _trt_engine: TRT 主模型 (model.engine)
     - _bias_session: 热词 bias encoder (model_eb.onnx)
+
+    推理优先级：TRT > ORT（TRT 加载失败自动回退 ORT）
     """
 
     def __init__(self):
         self._session: ort.InferenceSession | None = None
+        self._trt_engine = None  # TRTEngine 实例
         self._bias_session: ort.InferenceSession | None = None
         self._device: str = "cpu"
+        self._backend: str = "ort"  # "ort" 或 "trt"
         self._input_names: list[str] = []
         self._output_names: list[str] = []
         self._bias_input_names: list[str] = []
@@ -47,17 +52,51 @@ class ASREngine:
         """加载 ASR 主模型和 bias encoder。"""
         self._device = settings.get_device()
         precision = settings.get_model_precision()
-        logger.info(f"模型精度策略: {precision} (设备: {self._device})")
-        self._load_main_model()
+        backend = settings.get_inference_backend()
+        logger.info(f"模型精度策略: {precision} (设备: {self._device}, 后端: {backend})")
+
+        if backend == "trt":
+            # 尝试加载 TRT engine
+            if self._load_trt_engine():
+                self._backend = "trt"
+            else:
+                # TRT 加载失败，回退 ORT fp32
+                logger.warning("TRT engine 加载失败，回退到 ORT fp32")
+                self._backend = "ort"
+                self._load_main_model()
+        else:
+            self._backend = "ort"
+            self._load_main_model()
+
         self._load_bias_model()
         self._warmup()
 
     @property
     def is_loaded(self) -> bool:
+        if self._backend == "trt":
+            return self._trt_engine is not None and self._trt_engine.is_loaded
         return self._session is not None
 
     @property
     def has_bias_model(self) -> bool:
+        return self._bias_session is not None
+
+    def _load_trt_engine(self) -> bool:
+        """尝试加载 TRT engine，成功返回 True。"""
+        engine_path = settings.get_asr_trt_engine_path()
+        if not engine_path:
+            logger.info("未找到匹配的 TRT engine 文件")
+            return False
+
+        try:
+            from src.trt_engine import TRTEngine
+            self._trt_engine = TRTEngine()
+            self._trt_engine.load(engine_path)
+            return True
+        except Exception as e:
+            logger.warning(f"TRT engine 加载异常: {e}")
+            self._trt_engine = None
+            return False
         return self._bias_session is not None
 
     def _load_main_model(self):
@@ -124,21 +163,26 @@ class ASREngine:
     def _warmup(self):
         """
         模型预热：对所有 bucket(音频段长度) × batch 组合执行一次推理。
-        
+
         plan.md 3.11 要求：
         - 音频段长度桶：2s/4s/8s → LFR 帧数约 34/67/134
         - batch：1, 2, 4, 8, 12
         - 在不同音频段、不同 batch 下都预热一次
-        
-        预热后所有 shape 命中 ORT kernel cache，推理延迟稳定。
-        """
-        logger.info("ASR 模型预热中（bucket × batch 全组合）...")
 
-        # 音频段长度桶（LFR 帧数）：2s→34, 4s→67, 8s→134
+        预热后所有 shape 命中 kernel cache，推理延迟稳定。
+        """
         bucket_seq_lens = [34, 67, 134]
-        # batch 大小
         batch_sizes = [1, 2, 4, 8, 12]
 
+        if self._backend == "trt" and self._trt_engine is not None:
+            self._trt_engine.warmup(bucket_seq_lens, batch_sizes)
+            return
+
+        # ORT 预热
+        if self._session is None:
+            return
+
+        logger.info("ASR 模型预热中（bucket × batch 全组合）...")
         feat_dim = 560
         warmup_count = 0
 
@@ -292,6 +336,30 @@ class ASREngine:
         return results[0]
 
     def infer_batch_raw(
+        self,
+        padded_feats: np.ndarray,
+        lengths: np.ndarray,
+        bias_embeddings: np.ndarray | None = None,
+    ) -> list[np.ndarray]:
+        """
+        直接推理已 pad 好的固定 shape 输入（跳过内部 padding 逻辑）。
+        用于严格 bucket 推理，输入已 pad 到桶边界。
+
+        自动路由到 TRT 或 ORT 后端。
+
+        参数:
+            padded_feats: shape=(batch, bucket_seq_len, feat_dim) 已 pad
+            lengths: shape=(batch,) 桶长度
+            bias_embeddings: 热词 bias（可选）
+
+        返回:
+            logits 列表
+        """
+        if self._backend == "trt" and self._trt_engine is not None:
+            return self._trt_engine.infer_batch_raw(padded_feats, lengths, bias_embeddings)
+        return self._infer_batch_raw_ort(padded_feats, lengths, bias_embeddings)
+
+    def _infer_batch_raw_ort(
         self,
         padded_feats: np.ndarray,
         lengths: np.ndarray,
