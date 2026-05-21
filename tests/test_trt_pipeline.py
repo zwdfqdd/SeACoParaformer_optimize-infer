@@ -140,29 +140,32 @@ def main():
     print("\n[4/5] 加载 TRT engines...")
     engine_dir = Path(args.engine_dir)
 
-    def find_engine(keyword):
+    def find_engine(keyword, precision_override=None):
+        p = precision_override or args.precision
         for f in engine_dir.glob("*.engine"):
-            if keyword in f.name and args.precision in f.name:
+            if keyword in f.name and p in f.name:
                 return str(f)
         for f in engine_dir.glob("*.engine"):
             if keyword in f.name:
                 return str(f)
         return None
 
-    encoder_path = find_engine("encoder")
+    # encoder 强制 fp32（fp16 精度偏差会导致 CIF cumsum 崩溃）
+    # CIF 和 decoder 跟随 --precision 参数
+    encoder_path = find_engine("encoder", "fp32")
     cif_path = find_engine("cif")
     decoder_path = find_engine("decoder")
 
     if not all([encoder_path, cif_path, decoder_path]):
-        sys.exit(f"未找到所有 engine 文件: encoder={encoder_path}, cif={cif_path}, decoder={decoder_path}")
+        sys.exit(f"未找到 engine 文件: encoder={encoder_path}, cif={cif_path}, decoder={decoder_path}")
 
     encoder = TRTInferencer(encoder_path)
     cif = TRTInferencer(cif_path)
     decoder = TRTInferencer(decoder_path)
 
-    print(f"  encoder: {encoder_path}")
-    print(f"  cif: {cif_path}")
-    print(f"  decoder: {decoder_path}")
+    print(f"  encoder (TRT fp32): {encoder_path}")
+    print(f"  cif (TRT {args.precision}): {cif_path}")
+    print(f"  decoder (TRT {args.precision}): {decoder_path}")
 
     # ====== 推理 ======
     print("\n[5/5] 推理...")
