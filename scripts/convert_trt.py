@@ -2,28 +2,46 @@
 ONNX → TensorRT Engine 转换脚本
 
 使用 trtexec 命令行工具构建 TRT engine。
-基于 TRT 10.6（nvcr.io/nvidia/tensorrt:24.11-py3），支持 NonZero 等算子，可直接转换完整模型。
+基于 TRT 10.6（nvcr.io/nvidia/tensorrt:24.11-py3）。
 
-Dynamic Shape Profile（对齐 bucket 策略）：
-    speech:         min=(1,34,560)   opt=(4,67,560)   max=(12,134,560)
-    speech_lengths: min=(1,)         opt=(4,)         max=(12,)
-    bias_embed:     min=(1,1,512)    opt=(4,4,512)    max=(12,50,512)
+分段模型转换命令（推荐）：
+    # fp32
+    # 1. Encoder（604MB → ~317MB，计算量最大，加速收益最高）
+    python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --profile encoder
 
-用法：
-    # fp16 转换（推荐）
-    python scripts/convert_trt.py --input ./models/asr/fp32/model.onnx --precision fp16
+    # 2. CIF Predictor（23MB → ~13MB，含 NonZero/CumSum）
+    python scripts/convert_trt.py --input ./models/asr/split/cif.onnx --profile cif
 
-    # 指定输出路径
-    python scripts/convert_trt.py --input ./models/asr/fp32/model.onnx --precision fp16 --output ./models/asr/trt/a10_fp16.engine
+    # 3. Decoder（254MB，含 SANM Conv + SeACo Decoder）
+    python scripts/convert_trt.py --input ./models/asr/split/decoder.onnx --profile decoder
 
-    # 转换 bias encoder
-    python scripts/convert_trt.py --input ./models/asr/fp32/model_eb.onnx --precision fp16 --profile bias
+    # 4. Bias Encoder（33MB → ~17MB，热词编码 LSTM）
+    python scripts/convert_trt.py --input ./models/asr/split/model_eb.onnx --profile bias
 
-    # encoder 子图（拆分模型场景）
+    # fp16
+    # 1. Encoder（604MB → ~317MB，计算量最大，加速收益最高）
     python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp16 --profile encoder
 
+    # 2. CIF Predictor（23MB → ~13MB，含 NonZero/CumSum）
+    python scripts/convert_trt.py --input ./models/asr/split/cif.onnx --precision fp16 --profile cif
+
+    # 3. Decoder（254MB，含 SANM Conv + SeACo Decoder）
+    python scripts/convert_trt.py --input ./models/asr/split/decoder.onnx --precision fp16 --profile decoder
+
+    # 4. Bias Encoder（33MB → ~17MB，热词编码 LSTM）
+    python scripts/convert_trt.py --input ./models/asr/split/model_eb.onnx --precision fp16 --profile bias
+
+完整模型转换（不拆分，可能遇到 Cask/NonZero 问题）：
+
+    python scripts/convert_trt.py --input ./models/asr/fp32/model.onnx --precision fp16 --profile asr
+
+其他选项：
+
+    # 指定输出路径
+    python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp16 --output ./models/asr/trt/a10_encoder_fp16.engine
+
     # 增大 workspace（大显存 GPU）
-    python scripts/convert_trt.py --input ./models/asr/fp32/model.onnx --precision fp16 --workspace 4096
+    python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp16 --workspace 4096
 """
 
 import argparse
@@ -42,44 +60,87 @@ except ImportError:
 
 # ============================================================
 # Dynamic Shape Profiles
+# 维度按数据流推导：speech → encoder → cif → decoder
+# 输入规格：speech min=(1,8,560) opt=(4,128,560) max=(8,289,560)
 # ============================================================
+
+# 完整模型 profile（不拆分时使用）
 ASR_PROFILES = {
     "speech": {
-        "min": (1, 34, 560),
-        "opt": (4, 67, 560),
-        "max": (12, 134, 560),
+        "min": (1, 8, 560),
+        "opt": (1, 128, 560),
+        "max": (8, 289, 560),
     },
     "speech_lengths": {
         "min": (1,),
-        "opt": (4,),
-        "max": (12,),
+        "opt": (1,),
+        "max": (8,),
     },
     "bias_embed": {
         "min": (1, 1, 512),
-        "opt": (4, 4, 512),
-        "max": (12, 50, 512),
+        "opt": (1, 4, 512),
+        "max": (8, 8, 512),
     },
 }
 
-# Encoder 子图 profile（拆分后）
+# Encoder：speech(B,T,560) + speech_lengths(B,) → encoder_out(B,T',512)
+# min seq_len=16（encoder 内部 reshape 要求最小值）
+# opt batch=1（避免 batch*seq_len 与 hidden_dim 冲突）
 ENCODER_PROFILES = {
     "speech": {
-        "min": (1, 34, 560),
-        "opt": (4, 67, 560),
-        "max": (12, 134, 560),
+        "min": (1, 8, 560),
+        "opt": (1, 128, 560),
+        "max": (8, 289, 560),
     },
     "speech_lengths": {
         "min": (1,),
-        "opt": (4,),
-        "max": (12,),
+        "opt": (1,),
+        "max": (8,),
     },
 }
 
+# CIF：encoder_out(B,T,512) → acoustic_embeds(B,N,512)
+# T 与 encoder 输出一致
+CIF_PROFILES = {
+    "encoder_out": {
+        "min": (1, 8, 512),
+        "opt": (1, 128, 512),
+        "max": (8, 289, 512),
+    },
+}
+
+# Decoder：acoustic_embeds(B,N,512) + encoder_out(B,T,512) + bias_embed(B,H,512) → logits
+# Decoder：acoustic_embeds(B,N,512) + encoder_out(B,T,512) → logits
+# N(token数) ≈ T/5（CIF 压缩比），min 需 ≥ SANM conv kernel_size(~11)
+DECODER_PROFILES = {
+    "acoustic_embeds": {
+        "min": (1, 2, 512),
+        "opt": (1, 128, 512),
+        "max": (8, 289, 512),
+    },
+    "acoustic_embeds_lens": {
+        "min": (1,),
+        "opt": (1,),
+        "max": (8,),
+    },
+    "encoder_out": {
+        "min": (1, 8, 512),
+        "opt": (1, 128, 512),
+        "max": (8, 289, 512),
+    },
+    "encoder_out_lens": {
+        "min": (1,),
+        "opt": (1,),
+        "max": (8,),
+    },
+}
+
+# Bias Encoder：hotword(H,L) → hw_embed(H,1,512)
 BIAS_PROFILES = {
     "hotword": {
         "min": (1, 1),
-        "opt": (10, 5),
-        "max": (50, 20),
+        "opt": (1, 4),
+        "max": (8, 8),
     },
 }
 
@@ -115,7 +176,6 @@ def build_engine(
     output_path: str,
     precision: str = "fp16",
     profile_type: str = "asr",
-    workspace_mb: int = 2048,
 ):
     """
     使用 trtexec 构建 TensorRT engine。
@@ -131,7 +191,6 @@ def build_engine(
     print(f"  精度: {precision}")
     print(f"  GPU: {get_gpu_name()}")
     print(f"  TensorRT: {TRT_VERSION}")
-    print(f"  Workspace: {workspace_mb}MB")
     print()
 
     # 构建 trtexec 命令
@@ -139,7 +198,8 @@ def build_engine(
         "trtexec",
         f"--onnx={onnx_path}",
         f"--saveEngine={output_path}",
-        f"--workspace={workspace_mb}",
+        # 跳过构建后的推理验证
+        "--skipInference",
     ]
 
     # 精度
@@ -147,10 +207,15 @@ def build_engine(
         cmd.append("--fp16")
     elif precision == "int8":
         cmd.extend(["--int8", "--fp16"])
+    # fp32: 不加任何精度 flag
 
     # Dynamic shape profiles
     if profile_type == "encoder":
         profiles = ENCODER_PROFILES
+    elif profile_type == "cif":
+        profiles = CIF_PROFILES
+    elif profile_type == "decoder":
+        profiles = DECODER_PROFILES
     elif profile_type == "bias":
         profiles = BIAS_PROFILES
     else:
@@ -226,9 +291,8 @@ def main():
     parser = argparse.ArgumentParser(description="ONNX → TensorRT Engine 转换")
     parser.add_argument("--input", required=True, help="ONNX 模型路径")
     parser.add_argument("--output", default=None, help="输出 engine 路径（默认自动命名）")
-    parser.add_argument("--precision", default="fp16", choices=["fp16", "int8"], help="推理精度")
-    parser.add_argument("--profile", default="asr", choices=["asr", "encoder", "bias"], help="shape profile 类型")
-    parser.add_argument("--workspace", type=int, default=2048, help="工作空间大小（MB）")
+    parser.add_argument("--precision", default="fp32", choices=["fp32", "fp16", "int8"], help="推理精度（默认 fp32）")
+    parser.add_argument("--profile", default="asr", choices=["asr", "encoder", "cif", "decoder", "bias"], help="shape profile 类型")
     args = parser.parse_args()
 
     if not Path(args.input).exists():
@@ -253,8 +317,7 @@ def main():
         onnx_path=args.input,
         output_path=output_path,
         precision=args.precision,
-        profile_type=args.profile,
-        workspace_mb=args.workspace,
+        profile_type=args.profile
     )
 
 
