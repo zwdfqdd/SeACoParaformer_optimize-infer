@@ -336,3 +336,62 @@
     DEPLOY.md：Docker 构建、K8s 部署 YAML 示例、扩缩容建议
     CONTRIBUTING.md：模型更新、ONNX 重导出流程（便于后续迭代）
 
+######################### 进展记录 ########################################
+
+v1 — 已完成 ✓
+    - ONNX fp32 + int8 模型导出
+    - FastAPI 三级流水线推理服务
+    - GPU Scheduler（bucket 分桶 + dynamic batch）
+    - Docker 双镜像方案（转换 + 推理）
+    - 可观测性（Prometheus + 结构化日志）
+    - 文档完善（README/API/DEPLOY/CONTRIBUTING）
+
+v2 阶段 1 — 进行中
+    已完成：
+        ✓ 分段 ONNX 导出（scripts/export_onnx_split.py）
+            - encoder.onnx（~604MB）
+            - cif.onnx（~23MB）
+            - decoder.onnx（~254MB）
+        ✓ TRT engine 转换脚本（scripts/convert_trt.py）
+            - 支持 encoder/cif/decoder/bias 各自的 dynamic shape profile
+            - 支持 fp32/fp16/int8 精度选择
+        ✓ TRT 推理引擎（src/trt_engine.py）
+        ✓ TRT 部署方案
+            - Dockerfile.trt（基于 nvcr.io/nvidia/tensorrt:24.11-py3）
+            - docker-compose.trt.yml（含 engine 缓存 volume）
+            - scripts/entrypoint_trt.sh（首次构建 + 缓存）
+            - requirements-infer-trt.txt
+        ✓ 测试验证
+            - tests/test_split_onnx_pipeline.py（ORT 分段串联验证）
+            - tests/test_trt_pipeline.py（TRT 分段串联验证）
+        ✓ 推理成功验证（2080 Ti）：
+            - encoder_fp32 + cif_fp16 + decoder_fp16 → 识别正确
+            - encoder_fp16 + cif_fp16 + decoder_fp16 → 识别失败（encoder fp16 精度崩溃）
+        ✓ 精度分析工具（scripts/analyze_encoder_precision.py）
+            - 基于 Polygraphy 逐层对比 ONNX fp32 vs TRT fp16
+            - 支持选择性标记关键层输出（避免 mark all 导致 TRT 构建失败）
+            - 支持迭代 fallback：指定问题层 fp32 后继续分析后续层
+            - 分析结果：Add（残差）层出现 inf 溢出，MatMul 最大误差 69.7
+
+    当前精度方案（临时版本）：
+        encoder: fp32（TRT）
+        cif:     fp16（TRT）
+        decoder: fp16（TRT）
+        性能：RTF=0.0297, RTX=33.7x（10s 音频，2080 Ti）
+
+    下一阶段任务 — Encoder 混合精度优化：
+        目标：将 encoder 也降到 fp16 可用（混合精度：大部分 fp16 + 敏感层 fp32）
+        方案：
+            1. 用 analyze_encoder_precision.py 定位精度崩溃的源头层
+               - 已知：Add（残差）层 inf 溢出是根因
+               - 需要确定：是哪些 encoder block 的哪些子层最先溢出
+            2. 逐步 fallback：
+               - 先按类别 fallback（如所有 LayerNorm/ReduceMean）
+               - 再精确到具体 block（如 encoders.0-3 的残差 Add）
+            3. 用 TRT Python API 构建混合精度 engine
+               - BuilderFlag.OBEY_PRECISION_CONSTRAINTS
+               - 逐层设置 layer.precision = trt.float32
+            4. 验证混合精度 engine 的最终输出精度（CER ≤ 1%）
+            5. 目标：fp32 层数最少化，最大化 fp16 加速收益
+
+

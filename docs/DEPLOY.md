@@ -256,6 +256,68 @@ K8s 部署时需确保 `initialDelaySeconds` 大于预热时间，避免 Pod 被
 
 ---
 
+## v2 TensorRT 部署
+
+### 概述
+
+v2 使用 TensorRT 10.6 替代 ORT 进行 GPU 推理，分段模型架构：
+- **encoder**（fp32）+ **cif**（fp16）+ **decoder**（fp16）
+- 相比 v1 ORT fp32，推理速度提升约 2-3x，显存减半
+
+### 构建 TRT 推理镜像
+
+```bash
+docker build -f Dockerfile.trt -t seaco-asr:trt .
+```
+
+基础镜像：`nvcr.io/nvidia/tensorrt:24.11-py3`（TRT 10.6 + CUDA 12.6 + PyTorch 2.5）
+
+### 启动服务
+
+```bash
+# 使用 TRT 专用 docker-compose
+docker-compose -f docker-compose.trt.yml up -d
+
+# 查看日志
+docker-compose -f docker-compose.trt.yml logs -f seaco-asr-trt
+```
+
+### 首次启动流程
+
+1. `entrypoint_trt.sh` 检测 TRT engine 是否存在
+2. 不存在则自动构建（约 5-10 分钟）
+3. Engine 缓存到 Docker volume（`trt_engine_cache`），重启不重新构建
+4. 启动 uvicorn 服务 + 模型预热
+
+> 首次启动总耗时约 15-20 分钟（engine 构建 + 预热）。
+> K8s 部署时 `start_period` 需设为 900s。
+
+### Engine 缓存策略
+
+- 镜像内只打包 ONNX fp32 分段模型
+- 首次启动时自动检测 GPU 并构建对应 engine
+- Engine 缓存到 Docker volume，持久化
+- 不同 GPU 自动生成不同文件名（`{gpu}_{model}_{precision}.engine`）
+
+### 回退机制
+
+- TRT engine 构建失败 → 服务仍可启动（回退 ORT fp32）
+- TRT 推理异常 → 日志告警，返回错误码
+
+### v1 vs v2 对比
+
+| 维度 | v1（ORT） | v2（TRT） |
+|------|-----------|-----------|
+| 推理引擎 | ONNX Runtime | TensorRT 10.6 |
+| 模型精度 | fp32 | encoder fp32 + cif/decoder fp16 |
+| 推理速度 | 基线 | ~2-3x 提升 |
+| 显存占用 | 基线 | ~50% 减少 |
+| 部署复杂度 | 低 | 中（需 engine 构建） |
+| Dockerfile | Dockerfile | Dockerfile.trt |
+| docker-compose | docker-compose.yml | docker-compose.trt.yml |
+
+---
+
 ## 日志管理
 
 ### 日志输出

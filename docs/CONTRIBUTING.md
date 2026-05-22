@@ -122,6 +122,94 @@ Silero VAD 更新频率较低，通常无需频繁更新。
 
 ---
 
+---
+
+## v2 TRT 分段模型导出与转换
+
+### 概述
+
+v2 使用 TensorRT 替代 ORT 进行 GPU 推理，将模型拆分为三个子模型独立转换：
+
+| 子模型 | 功能 | 精度 | 说明 |
+|--------|------|------|------|
+| encoder.onnx | 语音编码 | fp32 | fp16 精度崩溃，需混合精度优化 |
+| cif.onnx | CIF 预测器 | fp16 | 含 cumsum，fp16 可用 |
+| decoder.onnx | 解码器 | fp16 | 含 SANM Conv，fp16 可用 |
+
+### 分段导出流程
+
+```bash
+# 在转换容器内执行
+docker run -it --gpus all \
+  -v ./models:/app/models \
+  seaco-asr-converter bash
+
+# 导出分段 ONNX（不含热词）
+python scripts/export_onnx_split.py --output-dir ./models/asr/split
+```
+
+导出产物：
+```
+models/asr/split/
+├── encoder.onnx    # Encoder（~604MB）
+├── cif.onnx        # CIF Predictor（~23MB）
+└── decoder.onnx    # Decoder（~254MB）
+```
+
+### TRT Engine 转换
+
+```bash
+# 在 TRT 容器内执行（nvcr.io/nvidia/tensorrt:24.11-py3）
+
+# Encoder — fp32（fp16 精度不可用，待混合精度优化）
+python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp32 --profile encoder
+
+# CIF — fp16
+python scripts/convert_trt.py --input ./models/asr/split/cif.onnx --precision fp16 --profile cif
+
+# Decoder — fp16
+python scripts/convert_trt.py --input ./models/asr/split/decoder.onnx --precision fp16 --profile decoder
+```
+
+Engine 产物（按 GPU 命名）：
+```
+models/asr/trt/
+├── 2080_ti_encoder_fp32.engine
+├── 2080_ti_cif_fp16.engine
+└── 2080_ti_decoder_fp16.engine
+```
+
+> **注意**：TRT engine 与 GPU 硬件绑定，不同 GPU 需分别构建。
+
+### 验证分段模型
+
+```bash
+# ORT 验证（分段 ONNX）
+python tests/test_split_onnx_pipeline.py --audio test_data/audio_16000_10s.wav --device cuda
+
+# TRT 验证（encoder fp32 + cif/decoder fp16）
+python tests/test_trt_pipeline.py --audio test_data/audio_16000_10s.wav --precision fp16
+```
+
+### Encoder 精度分析（混合精度优化）
+
+Encoder 全 fp16 会导致精度崩溃（残差连接溢出 inf），需要逐层分析定位敏感层：
+
+```bash
+# 第一轮：全 fp16 分析，定位问题层
+python scripts/analyze_encoder_precision.py --audio test_data/audio_16000_10s.wav
+
+# 第二轮：指定问题层 fallback fp32，继续分析
+python scripts/analyze_encoder_precision.py --audio test_data/audio_16000_10s.wav \
+    --fp32-layers-from report_encoder_precision.json
+
+# 按类别批量 fallback
+python scripts/analyze_encoder_precision.py --audio test_data/audio_16000_10s.wav \
+    --fp32-pattern "norm" "Softmax"
+```
+
+---
+
 ## 代码规范
 
 - Python 文件名：英文小写，下划线分隔
@@ -134,7 +222,7 @@ Silero VAD 更新频率较低，通常无需频繁更新。
 | 目录 | 用途 |
 |------|------|
 | src/ | 服务源代码 |
-| scripts/ | 工具脚本（导出、下载、验证） |
+| scripts/ | 工具脚本（导出、转换、验证、分析） |
 | models/ | 模型文件（不纳入 Git） |
 | configs/ | 配置文件 |
 | docs/ | 文档 |

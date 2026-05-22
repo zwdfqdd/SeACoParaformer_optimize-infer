@@ -162,32 +162,47 @@ SeACoParaformer/
 │   ├── tokenizer.py        # Token 解码（vocab8404）
 │   ├── vad.py              # VAD 语音检测（Silero VAD ONNX）
 │   ├── audio_segment.py    # 音频切段（固定桶边界切分 2s/4s/8s）
-│   ├── asr_engine.py       # ONNX 推理引擎（双模型：model + model_eb）
+│   ├── asr_engine.py       # ONNX 推理引擎（v1，双模型：model + model_eb）
+│   ├── trt_engine.py       # TensorRT 推理引擎（v2，分段模型）
 │   └── scheduler.py        # GPU Scheduler（bucket 分桶 + dynamic batch）
-├── scripts/                # 导出环境工具脚本
-│   ├── export_onnx.py      # ONNX 导出（CIF 向量化 + fp16 转换）
+├── scripts/                # 工具脚本
+│   ├── export_onnx.py      # v1 ONNX 导出（完整模型，CIF 向量化）
+│   ├── export_onnx_split.py # v2 分段 ONNX 导出（encoder/cif/decoder）
+│   ├── convert_trt.py      # ONNX → TRT engine 转换
 │   ├── convert_int8.py     # fp32 → int8 动态量化（CPU 部署用）
 │   ├── convert_fp16.py     # fp32 → fp16 混合精度转换
+│   ├── analyze_encoder_precision.py # Encoder fp16 逐层精度分析
 │   ├── download_vad.py     # VAD 模型下载
-│   ├── verify_onnx.py      # 精度验证（PT vs ONNX，支持指定设备）
-│   └── benchmark.py        # 性能基准测试（VAD/PT/fp32/fp16）
+│   ├── verify_onnx.py      # 精度验证（PT vs ONNX）
+│   ├── inspect_onnx.py     # ONNX 模型结构检查
+│   ├── split_onnx.py       # ONNX 模型拆分工具
+│   ├── entrypoint_trt.sh   # TRT 镜像启动脚本
+│   └── benchmark.py        # 性能基准测试
 ├── tests/                  # 测试脚本
 │   ├── test_service.py     # 服务压测（并发/RTF/QPS）
 │   ├── test_single.py      # 单次请求测试
 │   ├── test_model.py       # 模型直接推理测试
+│   ├── test_split_onnx_pipeline.py # 分段 ONNX 串联推理测试
+│   ├── test_trt_pipeline.py # TRT 分段模型推理测试
 │   └── test_vad.py         # VAD 单独测试
 ├── models/                 # 模型文件（不纳入版本控制）
 │   ├── asr/                # ASR 配置 + 模型
 │   │   ├── am.mvn, tokens.json, config.yaml  # 配置文件
-│   │   ├── fp32/model.onnx, model_eb.onnx    # fp32 模型（GPU 线上部署）
-│   │   └── int8/model.onnx, model_eb.onnx    # int8 模型（CPU 线上部署）
+│   │   ├── fp32/model.onnx, model_eb.onnx    # v1 完整模型（ORT）
+│   │   ├── int8/model.onnx, model_eb.onnx    # v1 int8 模型（CPU）
+│   │   ├── split/encoder.onnx, cif.onnx, decoder.onnx  # v2 分段模型
+│   │   └── trt/*.engine                      # v2 TRT engine（GPU 绑定）
 │   └── vad/silero_vad.onnx # VAD 模型
 ├── docs/                   # 文档
 ├── logs/                   # 日志（按天轮转，保留7天）
-├── Dockerfile              # 多阶段构建（CUDA 12.1 + cuDNN 9）
-├── docker-compose.yml      # 服务编排
+├── Dockerfile              # v1 推理镜像（ORT + CUDA 12.1）
+├── Dockerfile.trt          # v2 推理镜像（TRT 10.6 + CUDA 12.6）
+├── docker-compose.yml      # v1 服务编排
+├── docker-compose.trt.yml  # v2 服务编排（含 engine 缓存 volume）
 ├── .env                    # 环境变量配置
-└── requirements-*.txt      # 依赖文件
+├── requirements-infer.txt  # v1 推理依赖
+├── requirements-infer-trt.txt # v2 TRT 推理依赖
+└── requirements-convert.txt   # 模型转换依赖
 ```
 
 ## 架构说明
