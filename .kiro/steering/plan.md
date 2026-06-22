@@ -346,52 +346,294 @@ v1 — 已完成 ✓
     - 可观测性（Prometheus + 结构化日志）
     - 文档完善（README/API/DEPLOY/CONTRIBUTING）
 
-v2 阶段 1 — 进行中
+v2 阶段 1 — 已完成 ✓
     已完成：
-        ✓ 分段 ONNX 导出（scripts/export_onnx_split.py）
-            - encoder.onnx（~604MB）
-            - cif.onnx（~23MB）
-            - decoder.onnx（~254MB）
+        ✓ 分段 ONNX 导出（scripts/export_onnx_split.py，含热词支持）
+            - encoder.onnx（~604MB）— SANMEncoderExport
+            - cif.onnx（~22MB）— 向量化 CIF（无 Loop/ScatterElements，TRT 兼容）
+            - decoder.onnx（~287MB）— Decoder + SeACo + ASF + 热词合并
+            - bias_encoder.onnx（~32MB）— 热词 LSTM 编码器
+        ✓ seaco_paraformer/ 模型代码框架
+            - load_model.py：FunASR Export 模式加载（转换环境）
+            - predictor.py：向量化 cif_v1_export（cumsum + one-hot + bmm，TRT 兼容）
+            - 其他文件：encoder.py, decoder.py, attention.py, layers.py, utils.py, model.py
         ✓ TRT engine 转换脚本（scripts/convert_trt.py）
             - 支持 encoder/cif/decoder/bias 各自的 dynamic shape profile
             - 支持 fp32/fp16/int8 精度选择
-        ✓ TRT 推理引擎（src/trt_engine.py）
         ✓ TRT 部署方案
             - Dockerfile.trt（基于 nvcr.io/nvidia/tensorrt:24.11-py3）
             - docker-compose.trt.yml（含 engine 缓存 volume）
             - scripts/entrypoint_trt.sh（首次构建 + 缓存）
             - requirements-infer-trt.txt
         ✓ 测试验证
-            - tests/test_split_onnx_pipeline.py（ORT 分段串联验证）
-            - tests/test_trt_pipeline.py（TRT 分段串联验证）
+            - tests/test_pt_export_inference.py（PT Export 模式推理验证，含热词）
+            - tests/test_split_onnx_pipeline.py（ORT 分段串联验证，含热词）
+            - tests/test_trt_pipeline.py（TRT 分段串联验证，含热词）
         ✓ 推理成功验证（2080 Ti）：
-            - encoder_fp32 + cif_fp16 + decoder_fp16 → 识别正确
-            - encoder_fp16 + cif_fp16 + decoder_fp16 → 识别失败（encoder fp16 精度崩溃）
-        ✓ 精度分析工具（scripts/analyze_encoder_precision.py）
-            - 基于 Polygraphy 逐层对比 ONNX fp32 vs TRT fp16
-            - 支持选择性标记关键层输出（避免 mark all 导致 TRT 构建失败）
-            - 支持迭代 fallback：指定问题层 fp32 后继续分析后续层
-            - 分析结果：Add（残差）层出现 inf 溢出，MatMul 最大误差 69.7
+            - PT Export 无热词 → 识别正确
+            - PT Export 有热词 → 热词修正生效（"艾文"→"埃文"）
+            - ORT 分段无热词 → 识别正确
+            - ORT 分段有热词 → 热词修正生效
+            - TRT fp32（encoder_fp32 + cif_fp16 + decoder_fp32 + bias_fp16）→ 识别正确 + 热词生效
+            - TRT fp16 decoder → 精度崩溃（全输出"的"）
+            - TRT fp16 encoder → 精度崩溃（残差 Add 溢出 inf）
 
-    当前精度方案（临时版本）：
-        encoder: fp32（TRT）
-        cif:     fp16（TRT）
-        decoder: fp16（TRT）
-        性能：RTF=0.0297, RTX=33.7x（10s 音频，2080 Ti）
+    当前可用精度方案：
+        encoder:      fp32（TRT）
+        cif:          fp16（TRT）
+        decoder+seaco: fp32（TRT）
+        bias_encoder: fp16（TRT）
+        性能：RTF=0.0119, RTX=84.2x（10s 音频，2080 Ti，含热词）
 
-    下一阶段任务 — Encoder 混合精度优化：
-        目标：将 encoder 也降到 fp16 可用（混合精度：大部分 fp16 + 敏感层 fp32）
+    热词推理流程（已验证）：
+        1. bias_encoder(hotword_ids) → hw_embed (max_len, num_hotwords, 512)
+        2. 按各热词长度取最后有效时间步 → bias_embed (1, num_hotwords, 512)
+        3. decoder 内部：
+           - 主 decoder → logits + hidden
+           - ASF 注意力分数过滤 → top-51 热词
+           - SeACo decoder × 2（query=acoustic_embeds / query=hidden）
+           - merged → hotword_output_layer → dha_logits
+           - NO_BIAS mask 合并：logits * mask + dha_logits * (1-mask)
+
+    下一阶段任务 — Encoder + Decoder 混合精度优化：
+        目标：将 encoder 和 decoder 降到 fp16（混合精度：大部分 fp16 + 敏感层 fp32）
         方案：
-            1. 用 analyze_encoder_precision.py 定位精度崩溃的源头层
-               - 已知：Add（残差）层 inf 溢出是根因
-               - 需要确定：是哪些 encoder block 的哪些子层最先溢出
-            2. 逐步 fallback：
-               - 先按类别 fallback（如所有 LayerNorm/ReduceMean）
-               - 再精确到具体 block（如 encoders.0-3 的残差 Add）
-            3. 用 TRT Python API 构建混合精度 engine
-               - BuilderFlag.OBEY_PRECISION_CONSTRAINTS
-               - 逐层设置 layer.precision = trt.float32
-            4. 验证混合精度 engine 的最终输出精度（CER ≤ 1%）
-            5. 目标：fp32 层数最少化，最大化 fp16 加速收益
+            Encoder fp16 优化：
+                1. 用 analyze_encoder_precision.py 定位精度崩溃的源头层
+                   - 已知：Add（残差）层 inf 溢出是根因
+                   - 需要确定：是哪些 encoder block 的哪些子层最先溢出
+                2. 逐步 fallback：
+                   - 先按类别 fallback（如所有 LayerNorm/ReduceMean）
+                   - 再精确到具体 block（如 encoders.0-3 的残差 Add）
+                3. 用 TRT Python API 构建混合精度 engine
+                   - BuilderFlag.OBEY_PRECISION_CONSTRAINTS
+                   - 逐层设置 layer.precision = trt.float32
+                4. 验证混合精度 engine 的最终输出精度（CER ≤ 1%）
+                5. 目标：fp32 层数最少化，最大化 fp16 加速收益
+            Decoder fp16 优化：
+                1. 分析 decoder fp16 崩溃的原因（SeACo 部分 or 主 decoder）
+                2. 尝试主 decoder fp16 + SeACo fp32 混合方案
+                3. 或拆分 decoder 和 SeACo 为独立 engine（各自精度独立控制）
 
 
+v2 阶段 1（更新）— 全 fp16 已完成 ✓✓
+    已完成：
+        ✓ seaco_paraformer/ 包代码清理
+            - 不依赖 funasr 运行时，完全独立
+            - 删除流式参数、训练分支、未使用的 concat_after/normalize_before 等死代码
+            - 保留 cif（PT 用）+ cif_v1_export（ONNX 导出 TRT 兼容）
+            - PT 推理与 FunASR 重装版本字符级一致
+        ✓ TRT fp16 全模块通过（2080 Ti）
+            方案：fp16 + 敏感节点 fp32 fallback（OBEY_PRECISION_CONSTRAINTS）
+            脚本：scripts/convert_trt_fp16_with_norm_fp32.py
+            关键字：norm,Pow,ReduceMean,Sqrt（命中即层级 fp32）
+            背景：opset=16 LayerNorm 被分解，Pow(x,2) 在 fp16 下溢出
+            解决：把 LayerNorm 分解后的核心算子（Pow/ReduceMean/Sqrt 及 norm 路径上算子）
+                  强制 fp32，其余算子保留 fp16
+
+    当前精度方案（生产级）：
+        encoder:       fp16 + LN fp32 fallback（engine 327MB，原 fp32 619MB）
+        cif:           fp16（trtexec --fp16 直接通过）
+        decoder+seaco: fp16 + LN fp32 fallback（engine 159MB，原 fp32 299MB）
+        bias_encoder:  fp16（trtexec --fp16 直接通过）
+
+    精度验证（2080 Ti，含热词 ['埃文', '账号']）：
+        - 10s 含热词：token_num=61，识别正确，热词生效
+        - 12s 含热词：token_num=73，识别正确，热词生效
+        - 10s 无热词：token_num=61，识别正确
+        - encoder 输出 max=0.3716（与 fp32 PT baseline 数值量级一致）
+        - 全程 nan/inf=False
+
+    构建命令：
+        # encoder fp16 + LN fp32 fallback
+        python scripts/convert_trt_fp16_with_norm_fp32.py \
+            --input ./models/asr/split/encoder.onnx --profile encoder
+
+        # decoder fp16 + LN fp32 fallback
+        python scripts/convert_trt_fp16_with_norm_fp32.py \
+            --input ./models/asr/split/decoder.onnx --profile decoder
+
+        # cif/bias 直接 trtexec fp16
+        python scripts/convert_trt.py --input ./models/asr/split/cif.onnx --precision fp16 --profile cif
+        python scripts/convert_trt.py --input ./models/asr/split/bias_encoder.onnx --precision fp16 --profile bias
+
+    端到端测试：
+        python tests/test_trt_pipeline.py --audio test_data/audio_16000_10s.wav \
+            --encoder-precision fp16 --cif-precision fp16 \
+            --decoder-precision fp16 --bias-precision fp16 \
+            --hotwords 埃文 账号
+
+    下一阶段任务 — v2 阶段 2 INT8 量化：
+        1. 准备校准数据集（200-500 条音频）
+        2. 实现 IInt8EntropyCalibrator2 校准器
+        3. 转换 encoder/decoder INT8 engine（保留 LN fp32 fallback）
+        4. 精度对比：fp32 vs fp16 vs INT8 CER 报告
+
+
+v2 阶段 1（最终）— opset 17 + clamp + 全 fp16 ✓✓✓
+    三大关键技术：
+        1. opset 17：导出原生 LayerNormalization 单节点（替代 opset 16 的 9 算子分解）
+        2. encoder 残差 Add clamp 60000：避免 fp16 上限 65504 溢出，对 PT 真实激活峰值 ~7554 无影响
+        3. layer.type == NORMALIZATION 自动识别 + OBEY_PRECISION_CONSTRAINTS：
+           仅 LN 节点 fp32，其余全 fp16，cast 链最短化
+
+    实施代码：
+        - seaco_paraformer/encoder.py：EncoderLayerSANM 增加 clamp_value 构造参数
+        - scripts/export_onnx_split.py：默认 opset=17，新增 --clamp-value 选项
+        - scripts/convert_trt_fp16_with_norm_fp32.py：layer.type == NORMALIZATION 自动 fp32
+
+    导出命令：
+        python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 60000
+
+    转换命令：
+        python scripts/convert_trt_fp16_with_norm_fp32.py \
+            --input ./models/asr/split/encoder.onnx --profile encoder
+        python scripts/convert_trt_fp16_with_norm_fp32.py \
+            --input ./models/asr/split/decoder.onnx --profile decoder
+        python scripts/convert_trt.py --input ./models/asr/split/cif.onnx --precision fp16 --profile cif
+        python scripts/convert_trt.py --input ./models/asr/split/bias_encoder.onnx --precision fp16 --profile bias
+
+    精度验证（2080 Ti，10s 音频，含热词 ['埃文', '账号']）：
+        - token_num=62（baseline=61，差 1，末尾边缘 token 微抖动）
+        - encoder max=0.3699（baseline=0.3716，量级一致）
+        - 主要识别正确："埃文有麻烦了埃文凯尔...埃文的前小助理带着账号带着钱跑了"
+        - nan/inf=False
+        - 性能：RTX=101x（10s）
+
+    备选方案（追求最高 RTX）：
+        encoder fp16 + 其余 fp32 → RTX=124x（10s）/ 157x（12s）
+        识别 100% 与 baseline 一致
+
+    下一阶段任务 — v2 阶段 2 INT8 量化：
+        基于 opset 17 ONNX 模型 + fp16 fallback 模板做 INT8 校准
+
+
+v2 阶段 1（最终突破）— opset 17 + clamp + 纯 fp16 ✓✓✓✓
+    重大发现：
+        TRT 10.6 对 opset 17 的 LayerNormalization 算子内部自动用 fp32 累加，
+        所以只要保证进入 LN 的 fp16 输入不溢出（|x| < 65504），LN 自己内部就安全。
+        clamp=60000 在 encoder 残差 Add 后限值，正好满足这个条件。
+        不需要任何 fp32 fallback。
+
+    精简后的两大关键技术：
+        1. opset 17：导出原生 LayerNormalization 单节点（替代 9 算子分解）
+           TRT 10.6 对该算子内部 fp32 累加，无需外部 fallback
+        2. encoder 残差 Add 后 clamp 60000（在 seaco_paraformer/encoder.py 注入）
+           阈值 >> PT 真实激活峰值 ~7554，对 PT 数学无影响
+
+    转换流程（极简化）：
+        # 导出（注入 clamp）
+        python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 60000
+
+        # 转 fp16（纯 trtexec，无任何 fp32 fallback）
+        python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp16 --profile encoder
+        python scripts/convert_trt.py --input ./models/asr/split/cif.onnx --precision fp16 --profile cif
+        python scripts/convert_trt.py --input ./models/asr/split/decoder.onnx --precision fp16 --profile decoder
+        python scripts/convert_trt.py --input ./models/asr/split/bias_encoder.onnx --precision fp16 --profile bias
+
+    精度验证（2080 Ti，10s 音频，含热词 ['埃文', '账号']）：
+        - token_num=61（与 PT baseline 一致）
+        - encoder max=0.3865（baseline 0.3716，量级一致）
+        - 识别结果：字符级与 PT baseline 100% 一致
+          "埃文有麻烦了埃文凯尔有麻烦了重要的是说三遍...埃文的前小助理带着账号带着钱跑了"
+        - nan/inf=False
+        - 性能：RTX=96.2x（10s）
+
+    备选方案（追求最高 RTX）：
+        encoder fp16 + 其余 fp32 → RTX=124x（10s）/ 157x（12s）
+
+    工程文件状态：
+        - convert_trt_fp16_with_norm_fp32.py：保留作为 opset 16 兼容方案（备选）
+        - convert_trt_encoder_fp16.py：可删除（已被通用版替代）
+
+    下一阶段任务 — v2 阶段 2 INT8 量化：
+        基于 opset 17 ONNX + clamp 60000 模型做 INT8 校准
+
+
+# ============================================================
+# v2 阶段 1 — 最终锁定方案（2026-06-22）
+# ============================================================
+
+## 最终技术路径
+
+### 核心原理
+
+通过 3 个独立的技术点叠加，实现纯 fp16 推理（无任何 fp32 fallback）：
+
+1. **opset 17 LayerNormalization 单节点**
+   - PyTorch 2.5 trace 自动识别 nn.LayerNorm，导出为单个 `LayerNormalization` 算子
+   - 替代 opset 16 下的 9 算子分解（ReduceMean/Sub/Pow/ReduceMean/Add/Sqrt/Div/Mul/Add）
+   - **关键**：TRT 10.6 对此单节点内部自动 fp32 累加，无 LN 内部溢出风险
+
+2. **encoder 残差 Add 后 clamp 30000**
+   - 通过 `EncoderLayerSANM(clamp_value=30000)` 构造参数注入
+   - 30000 ≫ PT 真实激活峰值 ~7554（对 PT 推理数学无任何影响）
+   - 30000 ≪ fp16 上限 65504（fp16 残差 Add 不会溢出 inf）
+   - PT 推理时不传 clamp_value（保持数学等价）
+
+3. **纯 trtexec --fp16 转换**
+   - 无需 Python TRT API
+   - 无需 OBEY_PRECISION_CONSTRAINTS
+   - 无需任何手动 fp32 fallback 节点设置
+   - 命令简单：`python scripts/convert_trt.py --precision fp16`
+
+## 完整执行命令（按顺序）
+
+```bash
+# Step 1：PT baseline（转换容器内，验证模型能正确加载）
+python tests/test_pt_inference_v2.py --audio test_data/audio_16000_10s.wav --hotwords 埃文 账号
+
+# Step 2：分段 ONNX 导出（注入 clamp=30000）
+python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 30000
+
+# Step 3：ORT 验证 ONNX 等价性
+python tests/test_split_onnx_pipeline.py --audio test_data/audio_16000_10s.wav --device cuda --hotwords 埃文 账号
+
+# Step 4：TRT fp32 baseline（可选）
+python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp32 --profile encoder
+python scripts/convert_trt.py --input ./models/asr/split/cif.onnx --precision fp32 --profile cif
+python scripts/convert_trt.py --input ./models/asr/split/decoder.onnx --precision fp32 --profile decoder
+python scripts/convert_trt.py --input ./models/asr/split/bias_encoder.onnx --precision fp32 --profile bias
+
+# Step 5：TRT fp16（生产方案）
+python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp16 --profile encoder
+python scripts/convert_trt.py --input ./models/asr/split/cif.onnx --precision fp16 --profile cif
+python scripts/convert_trt.py --input ./models/asr/split/decoder.onnx --precision fp16 --profile decoder
+python scripts/convert_trt.py --input ./models/asr/split/bias_encoder.onnx --precision fp16 --profile bias
+
+# Step 6：端到端验证
+python tests/test_trt_pipeline.py --audio test_data/audio_16000_10s.wav \
+    --encoder-precision fp16 --cif-precision fp16 \
+    --decoder-precision fp16 --bias-precision fp16 \
+    --hotwords 埃文 账号
+```
+
+## 精度验证（2080 Ti）
+
+| 项 | 值 |
+|---|---|
+| token_num | 61（与 PT baseline 一致） |
+| encoder max | 0.3865（PT baseline 0.3716，量级一致） |
+| nan/inf | False |
+| 识别结果 | 字符级与 PT baseline 一致 |
+| RTX | 96-100x（10s 音频） |
+
+## 备选方案（追求最高速度）
+
+如果不要求字符级一致，encoder fp16 + 其余 fp32 → RTX=124x（10s）/ 157x（12s）。
+
+## 文件清单
+
+代码文件（保留）：
+- `seaco_paraformer/encoder.py` — 含 clamp_value 构造参数
+- `seaco_paraformer/{layers,attention,predictor,decoder,model,utils,load_model,__init__}.py`
+- `scripts/export_onnx_split.py` — 默认 opset=17, --clamp-value=30000
+- `scripts/convert_trt.py` — TRT 通用转换
+- `scripts/export_encoder_truncated.py` / `scripts/export_decoder_truncated.py` — 截断版实验代码（保留供后续优化使用）
+- `tests/test_pt_inference_v2.py` — PT baseline
+- `tests/test_split_onnx_pipeline.py` — ORT 验证
+- `tests/test_trt_pipeline.py` — TRT 验证
+- `step_run.sh` — 完整流程
+- `docs/README.md` — 完整技术文档
+
+# ============================================================

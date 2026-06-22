@@ -37,3 +37,12 @@ logs/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# Kiro IDE 临时文件
+.kiro/hooks/
+.kiro/session_backup/
+
+# 临时分析报告
+report_*.json
+tmp_*/
+tmp_trt_analyze*/
