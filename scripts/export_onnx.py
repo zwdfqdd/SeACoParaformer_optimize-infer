@@ -15,45 +15,38 @@ from pathlib import Path
 
 
 def export_fp32_onnx(model_id: str, output_dir: Path, opset_version: int = 16):
-    """使用 FunASR AutoModel.export() 导出 fp32 ONNX 模型。"""
-    from funasr import AutoModel
+    """使用 seaco_paraformer 加载模型并导出 fp32 ONNX（v1 整体导出）。"""
+    from seaco_paraformer.load_model import load_model
 
     export_dir = output_dir / "fp32"
     export_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[1/2] 加载模型: {model_id}")
-
-    # 确保所有 Export 类被注册
-    try:
-        import funasr.models.bicif_paraformer.cif_predictor  # noqa: F401
-        import funasr.models.contextual_paraformer.export_meta  # noqa: F401
-    except ImportError:
-        pass
-
-    # 手动注册 CifPredictorV3Export
-    from funasr.register import tables
-    from funasr.models.bicif_paraformer.cif_predictor import CifPredictorV3Export
-    tables.predictor_classes["CifPredictorV3Export"] = CifPredictorV3Export
-
-    # Monkey-patch: 将带 Loop 的 cif_export 替换为向量化的 cif_v1_export
-    from funasr.models.paraformer.cif_predictor import cif_v1_export, cif_wo_hidden_v1
-    import funasr.models.bicif_paraformer.cif_predictor as bicif_module
-    bicif_module.cif_export = cif_v1_export
-    bicif_module.cif_wo_hidden_export = cif_wo_hidden_v1
-
-    model = AutoModel(
-        model=model_id,
-        model_revision="v2.0.4",
-        device="cpu",
-        disable_update=True,
-    )
+    pt_model = load_model(model_id)
 
     print(f"[2/2] 导出 fp32 ONNX (opset_version={opset_version})...")
-    model.export(
-        type="onnx",
-        quantize=False,
+
+    import torch
+
+    # 导出完整模型（encoder + predictor + decoder 一体）
+    batch, seq_len, feat_dim = 1, 289, 560
+    speech = torch.randn(batch, seq_len, feat_dim)
+    speech_lengths = torch.tensor([seq_len], dtype=torch.long)
+
+    output_path = export_dir / "model.onnx"
+    torch.onnx.export(
+        pt_model,
+        (speech, speech_lengths),
+        str(output_path),
         opset_version=opset_version,
-        output_dir=str(export_dir),
+        input_names=["speech", "speech_lengths"],
+        output_names=["logits", "token_num"],
+        dynamic_axes={
+            "speech": {0: "batch", 1: "seq_len"},
+            "speech_lengths": {0: "batch"},
+            "logits": {0: "batch", 1: "token_len"},
+            "token_num": {0: "batch"},
+        },
     )
 
     onnx_files = list(export_dir.rglob("*.onnx"))

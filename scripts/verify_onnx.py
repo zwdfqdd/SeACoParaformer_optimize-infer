@@ -181,13 +181,35 @@ def load_audio(audio_path):
 
 
 def infer_pytorch(model_id, audio_data):
-    from funasr import AutoModel
-    print("\n[PT 推理] (FunASR AutoModel)")
-    model = AutoModel(model=model_id, model_revision="v2.0.4", device="cpu", disable_update=True)
-    result = model.generate(input=audio_data, batch_size_s=300)
-    text = result[0]["text"] if result else ""
-    # 去空格，与 ONNX 解码结果格式对齐
-    text = text.replace(" ", "")
+    import torch
+    import numpy as np
+    from seaco_paraformer.load_model import load_model
+    from src.feature_extractor import extract_features, load_cmvn
+    from src.tokenizer import Tokenizer
+    import os
+
+    print("\n[PT 推理] (SeACo-Paraformer)")
+
+    pt_model = load_model(model_id)
+
+    # 特征提取
+    cmvn_path = os.path.join("./models/asr", "am.mvn")
+    cmvn_mean, cmvn_istd = load_cmvn(cmvn_path)
+    features = extract_features(audio_data, sample_rate=16000, cmvn_mean=cmvn_mean, cmvn_istd=cmvn_istd)
+
+    # 推理
+    speech = torch.from_numpy(features).unsqueeze(0).float()
+    speech_lengths = torch.tensor([features.shape[0]], dtype=torch.long)
+
+    with torch.no_grad():
+        logits, token_num = pt_model(speech, speech_lengths)
+
+    # 解码
+    tokenizer = Tokenizer()
+    tokenizer.load(os.path.join("./models/asr", "tokens.json"))
+    token_ids = np.argmax(logits[0].numpy(), axis=-1)
+    text = tokenizer.decode(token_ids)
+
     print(f"  结果: {text}")
     return text
 

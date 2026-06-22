@@ -108,17 +108,23 @@ def load_cmvn(cmvn_path):
 # ============================================================
 # 推理函数
 # ============================================================
-def infer_pt(model, audio_data, warmup=3, runs=10):
+def infer_pt(model, features, speech_lengths, warmup=3, runs=10):
     """PyTorch 推理性能测试。"""
+    import torch
+
+    speech = torch.from_numpy(features).unsqueeze(0).float()
+
     # warmup
-    for _ in range(warmup):
-        model.generate(input=audio_data, batch_size_s=300)
+    with torch.no_grad():
+        for _ in range(warmup):
+            model(speech, speech_lengths)
 
     times = []
-    for _ in range(runs):
-        t0 = time.perf_counter()
-        model.generate(input=audio_data, batch_size_s=300)
-        times.append(time.perf_counter() - t0)
+    with torch.no_grad():
+        for _ in range(runs):
+            t0 = time.perf_counter()
+            model(speech, speech_lengths)
+            times.append(time.perf_counter() - t0)
 
     return times
 
@@ -261,14 +267,20 @@ def main():
     print("[1/3] PyTorch 推理")
     print("-" * 40)
     try:
-        from funasr import AutoModel
-        pt_model = AutoModel(
-            model=args.model_id,
-            model_revision="v2.0.4",
-            device="cpu",
-            disable_update=True,
-        )
-        pt_times = infer_pt(pt_model, pcm, warmup=args.warmup, runs=args.runs)
+        from seaco_paraformer.load_model import load_model
+        from src.feature_extractor import extract_features, load_cmvn
+        import os
+        import torch
+
+        pt_model = load_model(args.model_id)
+
+        # 特征提取
+        cmvn_path = os.path.join("./models/asr", "am.mvn")
+        cmvn_mean, cmvn_istd = load_cmvn(cmvn_path)
+        features = extract_features(pcm, sample_rate=16000, cmvn_mean=cmvn_mean, cmvn_istd=cmvn_istd)
+        speech_lengths = torch.tensor([features.shape[0]], dtype=torch.long)
+
+        pt_times = infer_pt(pt_model, features, speech_lengths, warmup=args.warmup, runs=args.runs)
         pt_avg = np.mean(pt_times)
         pt_std = np.std(pt_times)
         pt_rtf = pt_avg / audio_duration

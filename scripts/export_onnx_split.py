@@ -1,15 +1,11 @@
 """
-SeACo-Paraformer 分段 ONNX 导出脚本（v2 TRT 版本，不含热词）
+SeACo-Paraformer 分段 ONNX 导出脚本
 
-从 PyTorch 模型分别导出三个子模型：
-1. encoder.onnx — Encoder（speech → encoder_output）
-2. cif.onnx — CIF Predictor（encoder_output → acoustic_embeds, token_num）
-3. decoder.onnx — Decoder（acoustic_embeds + encoder_output → logits）
-
-v2 TRT 版本不支持热词（seaco_decoder / model_eb 不导出）。
-热词功能使用 v1 ORT 完整模型。
-
-环境要求：转换容器（含 FunASR + PyTorch + onnx）
+基于独立的 seaco_paraformer 包（不依赖 FunASR 运行时），导出 4 个子模型：
+1. encoder.onnx       — Encoder（speech → encoder_out）
+2. cif.onnx           — CIF Predictor（encoder_out + mask → acoustic_embeds, token_num）
+3. decoder.onnx       — Decoder + SeACo（acoustic_embeds + encoder_out + bias_embed → logits）
+4. bias_encoder.onnx  — Bias Encoder（hotword_ids → hw_embed）
 
 用法：
     python scripts/export_onnx_split.py --output-dir ./models/asr/split
@@ -19,290 +15,379 @@ import argparse
 import sys
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-def load_model(model_id: str, revision: str = "v2.0.4"):
-    """加载 FunASR SeACo-Paraformer 模型。"""
-    from funasr import AutoModel
-
-    # Patch CIF（消除 Loop 算子）
-    try:
-        from funasr.models.paraformer.cif_predictor import cif_v1_export, cif_wo_hidden_v1
-        import funasr.models.bicif_paraformer.cif_predictor as bicif_module
-        bicif_module.cif_export = cif_v1_export
-        bicif_module.cif_wo_hidden_export = cif_wo_hidden_v1
-    except Exception as e:
-        print(f"  警告：CIF patch 失败: {e}")
-
-    try:
-        from funasr.register import tables
-        from funasr.models.bicif_paraformer.cif_predictor import CifPredictorV3Export
-        tables.predictor_classes["CifPredictorV3Export"] = CifPredictorV3Export
-    except Exception:
-        pass
-
-    model = AutoModel(
-        model=model_id,
-        model_revision=revision,
-        device="cpu",
-        disable_update=True,
-    )
-
-    pt_model = model.model
-    pt_model.eval()
-    return pt_model
+from seaco_paraformer.load_model import load_model
+from seaco_paraformer.predictor import cif_v1_export
 
 
+# ============================================================
+# Encoder Wrapper
+# ============================================================
 class EncoderWrapper(nn.Module):
-    """Encoder：使用 FunASR SANMEncoderExport 处理动态 mask。"""
+    """Encoder 导出 wrapper（去掉 speech_lengths，推理时无需 mask）。"""
 
     def __init__(self, encoder):
         super().__init__()
-        from funasr.models.sanm.encoder import SANMEncoderExport
-        self.encoder_export = SANMEncoderExport(encoder)
+        self.encoder = encoder
 
-    def forward(self, speech: torch.Tensor, speech_lengths: torch.Tensor):
-        results = self.encoder_export(speech, speech_lengths)
-        if isinstance(results, (tuple, list)):
-            encoder_out = results[0]
-            encoder_out_lens = results[1] if len(results) > 1 else speech_lengths
-        else:
-            encoder_out = results
-            encoder_out_lens = speech_lengths
-        return encoder_out, encoder_out_lens
+    def forward(self, speech: torch.Tensor):
+        # 内部 dummy lengths（不影响计算，因为 encoder 已改为 None mask）
+        b = speech.shape[0]
+        dummy_lengths = torch.tensor([speech.shape[1]] * b, dtype=torch.long, device=speech.device)
+        encoder_out, encoder_out_lens, _ = self.encoder(speech, dummy_lengths)
+        return encoder_out
 
 
+# ============================================================
+# CIF Predictor Wrapper（使用向量化 CIF，TRT 兼容）
+# ============================================================
 class CIFWrapper(nn.Module):
-    """CIF Predictor：encoder_output → acoustic_embeds, token_num, us_alphas, cif_peak"""
+    """CIF Predictor 导出 wrapper。
+
+    替换原始 cif（含 for 循环）为 cif_v1_export（向量化），保持 TRT 兼容。
+    输入：encoder_out (B, T, D) + mask (B, 1, T)
+    输出：acoustic_embeds, token_num, alphas, cif_peak
+    """
 
     def __init__(self, predictor):
         super().__init__()
         self.predictor = predictor
 
-    def forward(self, encoder_out: torch.Tensor, encoder_out_lens: torch.Tensor):
-        hidden = encoder_out
-        b = hidden.shape[0]
-        t = hidden.shape[1]
-        d = hidden.shape[2]
+    def forward(self, encoder_out: torch.Tensor, mask: torch.Tensor):
+        pred = self.predictor
+        h = encoder_out
+        b, t, d = h.shape
 
-        # Conv1D + Relu
-        context = hidden.transpose(1, 2)
-        queries = self.predictor.pad(context)
-        output = torch.relu(self.predictor.cif_conv1d(queries))
-        output = output.transpose(1, 2)
+        # 1. CIF conv → relu → cif_output → sigmoid → relu(smooth)
+        context = h.transpose(1, 2)
+        queries = pred.pad(context)
+        output = torch.relu(pred.cif_conv1d(queries))
+        output_t = output.transpose(1, 2)
+        cif_logit = pred.cif_output(output_t)  # (B, T, 1)
+        alphas = torch.sigmoid(cif_logit)
+        alphas = torch.nn.functional.relu(
+            alphas * pred.smooth_factor - pred.noise_threshold
+        )
 
-        # alphas
-        alphas = torch.sigmoid(self.predictor.cif_output(output))
-        alphas = alphas.squeeze(-1)
+        # 2. mask
+        mask_t = mask.transpose(-1, -2).float()  # (B, T, 1)
+        alphas = alphas * mask_t
+        alphas = alphas.squeeze(-1)  # (B, T)
+        mask_squeezed = mask_t.squeeze(-1)  # (B, T)
 
-        # upsample: ConvTranspose1d → BLSTM → cif_output2
-        _output = context
-        if self.predictor.use_cif1_cnn:
-            _output = output.transpose(1, 2)
-        output2 = self.predictor.upsample_cnn(_output)
-        output2 = output2.transpose(1, 2)
-        output2, (_, _) = self.predictor.blstm(output2)
-        us_alphas = torch.sigmoid(self.predictor.cif_output2(output2))
-        us_alphas = us_alphas.squeeze(-1)
-
-        # tail_process（内联）
-        mask = torch.ones(b, t, dtype=torch.float32, device=hidden.device)
-        zeros_t = torch.zeros((b, 1), dtype=torch.float32, device=hidden.device)
+        # 3. tail_process（与 predictor.tail_process_fn 一致）
+        zeros_t = torch.zeros((b, 1), dtype=torch.float32, device=alphas.device)
         ones_t = torch.ones_like(zeros_t)
-        mask_1 = torch.cat([mask, zeros_t], dim=1)
-        mask_2 = torch.cat([ones_t, mask], dim=1)
+        mask_1 = torch.cat([mask_squeezed, zeros_t], dim=1)
+        mask_2 = torch.cat([ones_t, mask_squeezed], dim=1)
         tail_mask = mask_2 - mask_1
-        tail_threshold = tail_mask * self.predictor.tail_threshold
+        tail_threshold = tail_mask * pred.tail_threshold
         alphas = torch.cat([alphas, zeros_t], dim=1)
         alphas = alphas + tail_threshold
 
-        zeros_hidden = torch.zeros((b, 1, d), dtype=hidden.dtype, device=hidden.device)
-        hidden = torch.cat([hidden, zeros_hidden], dim=1)
-
+        zeros_hidden = torch.zeros((b, 1, d), dtype=h.dtype, device=h.device)
+        hidden = torch.cat([h, zeros_hidden], dim=1)
         token_num = alphas.sum(dim=-1)
 
-        # CIF 核心（向量化版本）
-        from funasr.models.paraformer.cif_predictor import cif_v1_export
-        acoustic_embeds, cif_peak = cif_v1_export(hidden, alphas, self.predictor.threshold)
+        # 4. CIF 核心（向量化）
+        acoustic_embeds, cif_peak = cif_v1_export(hidden, alphas, pred.threshold)
 
-        return acoustic_embeds, token_num, us_alphas, cif_peak
+        return acoustic_embeds, token_num, alphas, cif_peak
 
 
-class DecoderWrapper(nn.Module):
-    """Decoder：acoustic_embeds + encoder_out → logits（不含热词增强）"""
+# ============================================================
+# Decoder + SeACo Wrapper
+# ============================================================
+class DecoderWithSeACoWrapper(nn.Module):
+    """Decoder + SeACo 完整推理 wrapper。
 
-    def __init__(self, decoder_export):
+    输入：
+        acoustic_embeds (B, N, D)
+        token_num (B,)
+        encoder_out (B, T, D)
+        encoder_out_lens (B,)
+        bias_embed (B, H, D)
+
+    输出：
+        logits (B, N, vocab) — log_softmax 合并后
+    """
+
+    def __init__(self, model):
         super().__init__()
-        self.decoder = decoder_export
+        self.decoder = model.decoder
+        self.seaco_decoder = model.seaco_decoder
+        self.hotword_output_layer = model.hotword_output_layer
+        self.NO_BIAS = model.NO_BIAS
+        self.seaco_weight = model.seaco_weight
 
     def forward(
         self,
         acoustic_embeds: torch.Tensor,
-        acoustic_embeds_lens: torch.Tensor,
+        token_num: torch.Tensor,
         encoder_out: torch.Tensor,
         encoder_out_lens: torch.Tensor,
+        bias_embed: torch.Tensor,
     ):
-        dec_result = self.decoder(
-            encoder_out,
-            encoder_out_lens,
-            acoustic_embeds,
-            acoustic_embeds_lens,
-            return_hidden=True,
+        # 主 decoder（return logits + hidden）
+        decoder_out, decoder_hidden, _ = self.decoder(
+            encoder_out, encoder_out_lens,
+            acoustic_embeds, token_num,
+            return_hidden=True, return_both=True,
         )
-        if isinstance(dec_result, tuple):
-            decoder_hidden = dec_result[0]
-        else:
-            decoder_hidden = dec_result
+        decoder_pred = torch.log_softmax(decoder_out, dim=-1)
 
-        logits = self.decoder.output_layer(decoder_hidden)
-        return logits
+        # SeACo decoder：bias_embed 作为 memory，分别用 acoustic_embeds 和 decoder_hidden 作为 query
+        B, H, D = bias_embed.shape
+        contextual_length = torch.full(
+            (B,), H, dtype=torch.long, device=bias_embed.device
+        )
+
+        cif_attended, _ = self.seaco_decoder(
+            bias_embed, contextual_length,
+            acoustic_embeds, token_num,
+        )
+        dec_attended, _ = self.seaco_decoder(
+            bias_embed, contextual_length,
+            decoder_hidden, token_num,
+        )
+
+        merged = cif_attended + dec_attended
+        dha_output = self.hotword_output_layer(merged)
+        dha_pred = torch.log_softmax(dha_output, dim=-1)
+
+        # NO_BIAS mask 合并
+        lmbd = self.seaco_weight
+        a = (1.0 - lmbd) / lmbd
+        b = 1.0 / lmbd
+
+        dha_ids = dha_pred.max(-1)[1]
+        dha_mask = (dha_ids == self.NO_BIAS).int().unsqueeze(-1).float()
+        dha_mask_scaled = (dha_mask + a) / b
+
+        final_logits = decoder_pred * dha_mask_scaled + dha_pred * (1.0 - dha_mask_scaled)
+        return final_logits
 
 
-def export_encoder(pt_model, output_path: str, opset: int = 16):
-    """导出 Encoder。"""
-    print("\n[1/3] 导出 Encoder...")
+# ============================================================
+# Bias Encoder Wrapper
+# ============================================================
+class BiasEncoderWrapper(nn.Module):
+    """Bias Encoder 导出 wrapper。
 
-    encoder = EncoderWrapper(pt_model.encoder)
+    输入：hotword (H, L) — H 个热词的 token IDs（已 pad）
+    输出：hw_embed (L, H, D) — LSTM 全序列输出（外部按热词长度取最后时间步）
+
+    简化：使用全序列 LSTM（不用 pack_padded_sequence，便于 ONNX 导出）。
+    外部代码需按 hotword_lengths 取每个热词的最后有效时间步。
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.embed = model.decoder.embed  # 共享 decoder 的 embedding
+        self.bias_encoder = model.bias_encoder
+        self.lstm_proj = model.lstm_proj
+
+    def forward(self, hotword: torch.Tensor):
+        # embed: (H, L) → (H, L, D)
+        hw_embed = self.embed(hotword)
+
+        # LSTM 全序列：batch_first=True
+        rnn_output, _ = self.bias_encoder(hw_embed)  # (H, L, D) or (H, L, 2D) if bid
+
+        if self.lstm_proj is not None:
+            rnn_output = self.lstm_proj(rnn_output)
+
+        # 转为 (L, H, D)（与 FunASR ContextualEmbedderExport 输出格式一致）
+        return rnn_output.transpose(0, 1)
+
+
+# ============================================================
+# 导出函数
+# ============================================================
+def export_encoder(model, output_path: str, opset: int = 17, clamp_value: float = None):
+    """导出 Encoder（仅 speech 输入）。
+
+    Args:
+        clamp_value: 残差 Add 后的 clamp 阈值。None 或 0 = 不 clamp（PT/fp32 模式）。
+                     fp16 ONNX 推荐 30000（远大于 PT 真实峰值 ~7554，且远小于 fp16 上限 65504）。
+    """
+    print("\n[1/4] 导出 Encoder...")
+    if clamp_value is not None and clamp_value > 0:
+        print(f"  注入 clamp_value={clamp_value} 到所有 EncoderLayerSANM")
+        # 注入到所有 encoder layer（encoders0 + encoders）
+        for layer in model.encoder.encoders0:
+            layer.clamp_value = clamp_value
+        for layer in model.encoder.encoders:
+            layer.clamp_value = clamp_value
+        model.encoder.clamp_value = clamp_value
+
+    encoder = EncoderWrapper(model.encoder)
     encoder.eval()
 
-    batch, seq_len, feat_dim = 1, 289, 560
+    batch, seq_len, feat_dim = 1, 167, 560
     speech = torch.randn(batch, seq_len, feat_dim)
-    speech_lengths = torch.tensor([seq_len], dtype=torch.long)
 
     torch.onnx.export(
         encoder,
-        (speech, speech_lengths),
+        (speech,),
         output_path,
         opset_version=opset,
-        input_names=["speech", "speech_lengths"],
-        output_names=["encoder_out", "encoder_out_lens"],
+        input_names=["speech"],
+        output_names=["encoder_out"],
         dynamic_axes={
             "speech": {0: "batch", 1: "seq_len"},
-            "speech_lengths": {0: "batch"},
             "encoder_out": {0: "batch", 1: "enc_len"},
-            "encoder_out_lens": {0: "batch"},
         },
     )
-
     size_mb = Path(output_path).stat().st_size / (1024 * 1024)
     print(f"  输出: {output_path} ({size_mb:.1f}MB)")
 
 
-def export_cif(pt_model, output_path: str, opset: int = 16):
-    """导出 CIF Predictor。"""
-    print("\n[2/3] 导出 CIF Predictor...")
+def export_cif(model, output_path: str, opset: int = 17):
+    """导出 CIF Predictor（向量化版本，TRT 兼容）。"""
+    print("\n[2/4] 导出 CIF Predictor...")
+    cif_wrapper = CIFWrapper(model.predictor)
+    cif_wrapper.eval()
 
-    cif = CIFWrapper(pt_model.predictor)
-    cif.eval()
+    # 用真实 encoder 输出作为 dummy input
+    with torch.no_grad():
+        dummy_speech = torch.randn(1, 167, 560)
+        dummy_lengths = torch.tensor([167], dtype=torch.long)
+        enc_out, _, _ = model.encoder(dummy_speech, dummy_lengths)
 
-    batch, enc_len, hidden_dim = 2, 67, 512
-    encoder_out = torch.randn(batch, enc_len, hidden_dim)
-    encoder_out_lens = torch.tensor([enc_len, enc_len], dtype=torch.long)
+    mask = torch.ones(1, 1, enc_out.shape[1])
 
     torch.onnx.export(
-        cif,
-        (encoder_out, encoder_out_lens),
+        cif_wrapper,
+        (enc_out, mask),
         output_path,
         opset_version=opset,
-        input_names=["encoder_out", "encoder_out_lens"],
+        input_names=["encoder_out", "mask"],
         output_names=["acoustic_embeds", "token_num", "alphas", "cif_peak"],
         dynamic_axes={
             "encoder_out": {0: "batch", 1: "enc_len"},
-            "encoder_out_lens": {0: "batch"},
+            "mask": {0: "batch", 2: "enc_len"},
             "acoustic_embeds": {0: "batch", 1: "token_len"},
             "token_num": {0: "batch"},
-            "alphas": {0: "batch", 1: "enc_len"},
-            "cif_peak": {0: "batch", 1: "enc_len"},
+            "alphas": {0: "batch", 1: "enc_len_p1"},
+            "cif_peak": {0: "batch", 1: "enc_len_p1"},
         },
     )
-
     size_mb = Path(output_path).stat().st_size / (1024 * 1024)
     print(f"  输出: {output_path} ({size_mb:.1f}MB)")
 
 
-def export_decoder(pt_model, output_path: str, opset: int = 16):
-    """导出 Decoder（不含 seaco_decoder 热词增强）。"""
-    print("\n[3/3] 导出 Decoder...")
-
-    from funasr.models.e_paraformer.decoder import ParaformerSANMDecoderExport
-
-    decoder_export = ParaformerSANMDecoderExport(pt_model.decoder)
-    decoder_export.eval()
-
-    dec_wrapper = DecoderWrapper(decoder_export)
+def export_decoder(model, output_path: str, opset: int = 17):
+    """导出 Decoder + SeACo。"""
+    print("\n[3/4] 导出 Decoder + SeACo...")
+    dec_wrapper = DecoderWithSeACoWrapper(model)
     dec_wrapper.eval()
 
-    batch = 1
-    token_len = 20
-    enc_len = 67
-    hidden_dim = 512
+    batch, token_len, enc_len, hidden_dim = 1, 61, 167, 512
+    num_hotwords = 3
 
     acoustic_embeds = torch.randn(batch, token_len, hidden_dim)
-    acoustic_embeds_lens = torch.tensor([token_len], dtype=torch.long)
+    token_num = torch.tensor([token_len], dtype=torch.long)
     encoder_out = torch.randn(batch, enc_len, hidden_dim)
     encoder_out_lens = torch.tensor([enc_len], dtype=torch.long)
+    bias_embed = torch.randn(batch, num_hotwords, hidden_dim)
 
     torch.onnx.export(
         dec_wrapper,
-        (acoustic_embeds, acoustic_embeds_lens, encoder_out, encoder_out_lens),
+        (acoustic_embeds, token_num, encoder_out, encoder_out_lens, bias_embed),
         output_path,
         opset_version=opset,
-        input_names=["acoustic_embeds", "acoustic_embeds_lens", "encoder_out", "encoder_out_lens"],
+        input_names=["acoustic_embeds", "token_num", "encoder_out", "encoder_out_lens", "bias_embed"],
         output_names=["logits"],
         dynamic_axes={
             "acoustic_embeds": {0: "batch", 1: "token_len"},
-            "acoustic_embeds_lens": {0: "batch"},
+            "token_num": {0: "batch"},
             "encoder_out": {0: "batch", 1: "enc_len"},
             "encoder_out_lens": {0: "batch"},
+            "bias_embed": {0: "batch", 1: "num_hotwords"},
             "logits": {0: "batch", 1: "logits_len"},
         },
     )
-
     size_mb = Path(output_path).stat().st_size / (1024 * 1024)
     print(f"  输出: {output_path} ({size_mb:.1f}MB)")
 
 
+def export_bias_encoder(model, output_path: str, opset: int = 17):
+    """导出 Bias Encoder（热词编码器）。"""
+    print("\n[4/4] 导出 Bias Encoder...")
+    bias_wrapper = BiasEncoderWrapper(model)
+    bias_wrapper.eval()
+
+    num_hotwords, max_len = 3, 4
+    hotword = torch.randint(0, 8404, (num_hotwords, max_len), dtype=torch.long)
+
+    torch.onnx.export(
+        bias_wrapper,
+        (hotword,),
+        output_path,
+        opset_version=opset,
+        input_names=["hotword"],
+        output_names=["hw_embed"],
+        dynamic_axes={
+            "hotword": {0: "num_hotwords", 1: "max_len"},
+            "hw_embed": {0: "seq_len", 1: "num_hotwords"},
+        },
+    )
+    size_mb = Path(output_path).stat().st_size / (1024 * 1024)
+    print(f"  输出: {output_path} ({size_mb:.1f}MB)")
+
+
+# ============================================================
+# Main
+# ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="SeACo-Paraformer 分段 ONNX 导出（v2，不含热词）")
+    parser = argparse.ArgumentParser(description="SeACo-Paraformer 分段 ONNX 导出")
     parser.add_argument("--model-id", default="iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
     parser.add_argument("--output-dir", default="./models/asr/split")
-    parser.add_argument("--opset", type=int, default=16)
+    parser.add_argument("--opset", type=int, default=17,
+                        help="ONNX opset 版本（默认 17，启用原生 LayerNormalization 算子，"
+                             "fp16 推理无需 fp32 fallback）")
+    parser.add_argument("--clamp-value", type=float, default=30000.0,
+                        help="encoder 残差 Add 后 clamp 阈值（默认 30000）。"
+                             "fp16 ONNX 推荐 ≥ PT 真实激活峰值（~7554）且 < fp16 上限 65504。"
+                             "30000 在两者之间，留有充足余量。"
+                             "传 None 或 0 会禁用 clamp（仅用于 fp32 baseline 实验）。")
+    parser.add_argument("--skip", nargs="*", default=[],
+                        choices=["encoder", "cif", "decoder", "bias_encoder"],
+                        help="跳过指定模块")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
-    print("SeACo-Paraformer 分段 ONNX 导出（v2，不含热词）")
+    print("SeACo-Paraformer 分段 ONNX 导出（基于独立包）")
     print("=" * 60)
-    print(f"模型: {args.model_id}")
-    print(f"输出: {output_dir}")
-    print(f"opset: {args.opset}")
 
-    print("\n加载 PyTorch 模型...")
-    pt_model = load_model(args.model_id)
-
+    print("\n加载模型...")
+    model = load_model(args.model_id)
     print("\n模型子模块:")
-    for name, module in pt_model.named_children():
-        param_count = sum(p.numel() for p in module.parameters())
-        print(f"  {name}: {param_count/1e6:.1f}M params")
+    for name, child in model.named_children():
+        param_count = sum(p.numel() for p in child.parameters())
+        print(f"  {name}: {type(child).__name__}, {param_count/1e6:.1f}M")
 
-    export_encoder(pt_model, str(output_dir / "encoder.onnx"), args.opset)
-    export_cif(pt_model, str(output_dir / "cif.onnx"), args.opset)
-    export_decoder(pt_model, str(output_dir / "decoder.onnx"), args.opset)
+    if "encoder" not in args.skip:
+        export_encoder(model, str(output_dir / "encoder.onnx"), args.opset, clamp_value=args.clamp_value)
+    if "cif" not in args.skip:
+        export_cif(model, str(output_dir / "cif.onnx"), args.opset)
+    if "decoder" not in args.skip:
+        export_decoder(model, str(output_dir / "decoder.onnx"), args.opset)
+    if "bias_encoder" not in args.skip:
+        export_bias_encoder(model, str(output_dir / "bias_encoder.onnx"), args.opset)
 
     print("\n" + "=" * 60)
     print("导出完成！")
     print("=" * 60)
-    print("\n下一步（TRT 转换）:")
-    print(f"  python scripts/convert_trt.py --input {output_dir}/encoder.onnx --precision fp16 --profile encoder")
-    print(f"  python scripts/convert_trt.py --input {output_dir}/cif.onnx --precision fp16 --profile cif")
-    print(f"  python scripts/convert_trt.py --input {output_dir}/decoder.onnx --precision fp16 --profile decoder")
 
 
 if __name__ == "__main__":
     main()
-

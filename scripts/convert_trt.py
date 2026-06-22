@@ -16,7 +16,7 @@ ONNX → TensorRT Engine 转换脚本
     python scripts/convert_trt.py --input ./models/asr/split/decoder.onnx --profile decoder
 
     # 4. Bias Encoder（33MB → ~17MB，热词编码 LSTM）
-    python scripts/convert_trt.py --input ./models/asr/split/model_eb.onnx --profile bias
+    python scripts/convert_trt.py --input ./models/asr/split/bias_encoder.onnx --profile bias
 
     # fp16
     # 1. Encoder（604MB → ~317MB，计算量最大，加速收益最高）
@@ -29,7 +29,7 @@ ONNX → TensorRT Engine 转换脚本
     python scripts/convert_trt.py --input ./models/asr/split/decoder.onnx --precision fp16 --profile decoder
 
     # 4. Bias Encoder（33MB → ~17MB，热词编码 LSTM）
-    python scripts/convert_trt.py --input ./models/asr/split/model_eb.onnx --precision fp16 --profile bias
+    python scripts/convert_trt.py --input ./models/asr/split/bias_encoder.onnx --precision fp16 --profile bias
 
 完整模型转换（不拆分，可能遇到 Cask/NonZero 问题）：
 
@@ -83,55 +83,47 @@ ASR_PROFILES = {
     },
 }
 
-# Encoder：speech(B,T,560) + speech_lengths(B,) → encoder_out(B,T',512)
-# min seq_len=16（encoder 内部 reshape 要求最小值）
-# opt batch=1（避免 batch*seq_len 与 hidden_dim 冲突）
+# Encoder：speech(B,T,560) → encoder_out(B,T,512)
+# 注意：speech_lengths 在 trace 时被优化掉了，不在 ONNX 输入中
 ENCODER_PROFILES = {
     "speech": {
         "min": (1, 8, 560),
         "opt": (1, 128, 560),
         "max": (8, 289, 560),
     },
-    "speech_lengths": {
-        "min": (1,),
-        "opt": (1,),
-        "max": (8,),
-    },
 }
 
-# CIF：encoder_out(B,T,512) → acoustic_embeds(B,N,512)
-# T 与 encoder 输出一致
+# CIF：encoder_out(B,T,512) + mask(B,1,T) → acoustic_embeds(B,N,512)
 CIF_PROFILES = {
     "encoder_out": {
         "min": (1, 8, 512),
         "opt": (1, 128, 512),
         "max": (8, 289, 512),
     },
+    "mask": {
+        "min": (1, 1, 8),
+        "opt": (1, 1, 128),
+        "max": (8, 1, 289),
+    },
 }
 
-# Decoder：acoustic_embeds(B,N,512) + encoder_out(B,T,512) + bias_embed(B,H,512) → logits
-# Decoder：acoustic_embeds(B,N,512) + encoder_out(B,T,512) → logits
-# N(token数) ≈ T/5（CIF 压缩比），min 需 ≥ SANM conv kernel_size(~11)
+# Decoder：acoustic_embeds + encoder_out + bias_embed → logits
+# 注意：token_num 和 encoder_out_lens 在 trace 时被优化掉了
 DECODER_PROFILES = {
     "acoustic_embeds": {
         "min": (1, 2, 512),
         "opt": (1, 128, 512),
         "max": (8, 289, 512),
     },
-    "acoustic_embeds_lens": {
-        "min": (1,),
-        "opt": (1,),
-        "max": (8,),
-    },
     "encoder_out": {
         "min": (1, 8, 512),
         "opt": (1, 128, 512),
         "max": (8, 289, 512),
     },
-    "encoder_out_lens": {
-        "min": (1,),
-        "opt": (1,),
-        "max": (8,),
+    "bias_embed": {
+        "min": (1, 1, 512),
+        "opt": (1, 4, 512),
+        "max": (8, 32, 512),
     },
 }
 
