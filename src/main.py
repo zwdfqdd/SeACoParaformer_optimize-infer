@@ -389,16 +389,22 @@ def _encode_hotwords(hotwords: list[str]) -> np.ndarray | None:
     """
     将热词列表编码为 bias embeddings。
 
-    流程：hotwords → tokenizer.encode → padding → bias encoder → embeddings
+    流程：hotwords → tokenizer.encode → 追加 [sos]=[1] 哨兵 → padding → bias encoder → embeddings
+
+    SeACo 架构要求 hotword 矩阵末尾必须有一行 [sos] 占位（NO_BIAS 标记），
+    由模型 SeACo decoder 内部用于"无热词修正"的回退路径。
     """
     # 将每个热词编码为 token ID 序列
     encoded = [tokenizer.encode(hw) for hw in hotwords if hw]
     if not encoded:
         return None
 
+    # 追加 [sos]=[1] 哨兵（SeACo NO_BIAS 占位）
+    encoded.append([1])
+
     # Padding 到相同长度
     max_len = max(len(ids) for ids in encoded)
-    padded = np.zeros((len(encoded), max_len), dtype=np.int32)
+    padded = np.zeros((len(encoded), max_len), dtype=np.int64)
     for i, ids in enumerate(encoded):
         padded[i, :len(ids)] = ids
 

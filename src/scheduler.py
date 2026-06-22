@@ -202,11 +202,11 @@ class GPUScheduler:
                     f"推理={infer_ms:.1f}ms"
                 )
 
-            # 只返回实际请求的结果（按实际有效长度截断）
+            # engine 内部已按 token_num 截断（TRT 4 段架构）或返回完整 logits（ORT）
+            # scheduler 不再做帧级截断
             for i, req in enumerate(batch):
                 if not req.future.done():
-                    logits = results[i]
-                    req.future.set_result(logits[:actual_lengths[i]])
+                    req.future.set_result(results[i])
 
         except Exception as e:
             error_msg = str(e).lower()
@@ -264,7 +264,7 @@ class GPUScheduler:
                 )
                 for i, req in enumerate(sub_batch):
                     if not req.future.done():
-                        req.future.set_result(results[i][:sub_lengths[i]])
+                        req.future.set_result(results[i])
             except Exception as e1:
                 error_msg = str(e1).lower()
                 if "out of memory" in error_msg or "oom" in error_msg:
@@ -282,7 +282,7 @@ class GPUScheduler:
                                 bias_embeddings,
                             )
                             if not req.future.done():
-                                req.future.set_result(result[0][:sub_lengths[i]])
+                                req.future.set_result(result[0])
                         except Exception as e2:
                             # Step 3: 返回错误
                             logger.error(f"OOM Fallback Step3: 逐条推理也失败: {e2}")

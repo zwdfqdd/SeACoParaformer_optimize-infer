@@ -1,17 +1,22 @@
 """
-TensorRT 推理引擎
+TensorRT 推理引擎（v2 阶段 1：4 段串联架构）
 
-替代 ORT 的高性能 GPU 推理引擎，支持：
-- Dynamic batch（对齐 scheduler bucket 策略）
-- fp16/INT8 精度
-- Engine 缓存（首次加载后序列化，后续直接反序列化）
-- 回退机制：TRT 加载失败 → 回退 ORT fp32
+模型组成：
+    encoder.engine       — speech → encoder_out
+    cif.engine           — encoder_out + mask → acoustic_embeds, token_num
+    decoder.engine       — acoustic_embeds + encoder_out + bias_embed → logits
+    bias_encoder.engine  — hotword_ids → hw_embed（外部按热词长度切片得到 bias_embed）
 
-接口对齐 asr_engine.py，scheduler.py 无需修改。
+精度方案（推荐：纯 fp16）：
+    opset 17 + clamp 30000 + trtexec --fp16
+    详见 docs/README.md 的 v2 推理路径。
+
+对外接口（与 src/asr_engine.py 一致）：
+    infer_batch_raw(padded_feats, lengths, bias_embeddings) → list[logits]
+    encode_hotwords(hotword_token_ids) → bias_embed (1, num_hw, 512)
 """
 
 import os
-from pathlib import Path
 
 import numpy as np
 
@@ -20,74 +25,177 @@ from src.logger import logger
 
 try:
     import tensorrt as trt
-
     TRT_AVAILABLE = True
 except ImportError:
     TRT_AVAILABLE = False
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
 
 
 if TRT_AVAILABLE:
     TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 
+# ============================================================
+# 单个 TRT engine 推理器
+# ============================================================
+class _TRTInferencer:
+    """单个 TRT engine 推理器（dynamic shape 支持）。"""
+
+    def __init__(self, engine_path: str):
+        self.engine_path = engine_path
+        runtime = trt.Runtime(TRT_LOGGER)
+        with open(engine_path, "rb") as f:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+        if self.engine is None:
+            raise RuntimeError(f"Engine 反序列化失败: {engine_path}")
+        self.context = self.engine.create_execution_context()
+
+        self.input_names: list[str] = []
+        self.output_names: list[str] = []
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            mode = self.engine.get_tensor_mode(name)
+            if mode == trt.TensorIOMode.INPUT:
+                self.input_names.append(name)
+            else:
+                self.output_names.append(name)
+
+    def infer(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """同步推理（输入 numpy → 输出 numpy）。"""
+        # 输入
+        d_inputs = {}
+        for name in self.input_names:
+            data = inputs[name]
+            self.context.set_input_shape(name, data.shape)
+            t = torch.from_numpy(data).cuda().contiguous()
+            d_inputs[name] = t
+            self.context.set_tensor_address(name, t.data_ptr())
+
+        # 输出（按 context 推断的真实 shape 分配）
+        d_outputs = {}
+        for name in self.output_names:
+            shape = list(self.context.get_tensor_shape(name))
+            for i, s in enumerate(shape):
+                if s <= 0:
+                    # dynamic 维度：用第一个输入的 batch 维兜底
+                    if i == 0:
+                        shape[i] = list(inputs.values())[0].shape[0]
+                    else:
+                        shape[i] = 300
+            t = torch.zeros(shape, dtype=torch.float32, device="cuda")
+            d_outputs[name] = t
+            self.context.set_tensor_address(name, t.data_ptr())
+
+        stream = torch.cuda.current_stream()
+        self.context.execute_async_v3(stream_handle=stream.cuda_stream)
+        stream.synchronize()
+
+        results = {}
+        for name, t in d_outputs.items():
+            actual_shape = tuple(self.context.get_tensor_shape(name))
+            if all(s > 0 for s in actual_shape):
+                slices = tuple(slice(0, s) for s in actual_shape)
+                results[name] = t[slices].cpu().numpy()
+            else:
+                results[name] = t.cpu().numpy()
+        return results
+
+
+# ============================================================
+# 4 段串联推理引擎
+# ============================================================
 class TRTEngine:
     """
-    TensorRT 推理引擎。
+    SeACo-Paraformer TRT 4 段串联推理引擎。
 
-    加载序列化 engine 文件，执行 dynamic batch 推理。
-    接口对齐 ASREngine.infer_batch_raw()。
+    内部维护 4 个 _TRTInferencer，对外暴露 ASREngine 兼容接口。
     """
 
     def __init__(self):
-        self._engine = None
-        self._context = None
-        self._stream = None
-        self._input_names: list[str] = []
-        self._output_names: list[str] = []
-        self._input_shapes: dict[str, tuple] = {}
-        self._output_shapes: dict[str, tuple] = {}
+        self._encoder: _TRTInferencer | None = None
+        self._cif: _TRTInferencer | None = None
+        self._decoder: _TRTInferencer | None = None
+        self._bias_encoder: _TRTInferencer | None = None
+        self._loaded = False
 
     @property
     def is_loaded(self) -> bool:
-        return self._engine is not None
+        return self._loaded
 
-    def load(self, engine_path: str):
-        """加载 TRT engine 文件。"""
+    @property
+    def has_bias_encoder(self) -> bool:
+        return self._bias_encoder is not None
+
+    def load(self, encoder_path: str, cif_path: str, decoder_path: str,
+             bias_encoder_path: str | None = None):
+        """加载 4 段 engine 文件。"""
         if not TRT_AVAILABLE:
-            raise RuntimeError("TensorRT 未安装，无法加载 engine")
+            raise RuntimeError("TensorRT 未安装")
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("torch 未安装（TRT 推理需要 torch 管理 GPU 内存）")
 
-        if not os.path.exists(engine_path):
-            raise FileNotFoundError(f"Engine 文件不存在: {engine_path}")
+        for label, path in [
+            ("encoder", encoder_path),
+            ("cif", cif_path),
+            ("decoder", decoder_path),
+        ]:
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"{label} engine 不存在: {path}")
 
-        logger.info(f"TRT engine 加载中: {engine_path}")
+        logger.info(f"TRT engines 加载中:")
+        logger.info(f"  encoder: {encoder_path}")
+        self._encoder = _TRTInferencer(encoder_path)
 
-        runtime = trt.Runtime(TRT_LOGGER)
-        with open(engine_path, "rb") as f:
-            self._engine = runtime.deserialize_cuda_engine(f.read())
+        logger.info(f"  cif:     {cif_path}")
+        self._cif = _TRTInferencer(cif_path)
 
-        if self._engine is None:
-            raise RuntimeError(f"Engine 反序列化失败: {engine_path}")
+        logger.info(f"  decoder: {decoder_path}")
+        self._decoder = _TRTInferencer(decoder_path)
 
-        self._context = self._engine.create_execution_context()
+        if bias_encoder_path and os.path.exists(bias_encoder_path):
+            logger.info(f"  bias_encoder: {bias_encoder_path}")
+            self._bias_encoder = _TRTInferencer(bias_encoder_path)
+        else:
+            logger.info("  bias_encoder: 未加载（热词功能不可用）")
 
-        # 解析输入输出
-        for i in range(self._engine.num_io_tensors):
-            name = self._engine.get_tensor_name(i)
-            mode = self._engine.get_tensor_mode(name)
-            shape = self._engine.get_tensor_shape(name)
+        self._loaded = True
 
-            if mode == trt.TensorIOMode.INPUT:
-                self._input_names.append(name)
-                self._input_shapes[name] = tuple(shape)
-            else:
-                self._output_names.append(name)
-                self._output_shapes[name] = tuple(shape)
+    # --------------------------------------------------------
+    # 热词编码：tokens (H, L) → bias_embed (1, H, 512)
+    # --------------------------------------------------------
+    def encode_hotwords(self, hotword_token_ids: np.ndarray) -> np.ndarray | None:
+        """
+        bias_encoder 推理 + 按热词长度切片得到 bias_embed。
 
-        logger.info(
-            f"TRT engine 加载成功: 输入={self._input_names}, "
-            f"输出={self._output_names}"
-        )
+        hotword_token_ids: (H, L) 已 pad（pad=0）。最后一项必须是 [sos]=[1] 占位。
+        返回: (1, H, 512) bias_embed（每个热词最后有效时间步的 LSTM 输出）。
+        """
+        if self._bias_encoder is None:
+            return None
 
+        # bias_encoder 输入：hotword (H, L) → 输出 hw_embed (L, H, 512)
+        out = self._bias_encoder.infer({"hotword": hotword_token_ids.astype(np.int64)})
+        hw_embed = out["hw_embed"]  # (L, H, 512)
+
+        # 取每个热词最后有效时间步
+        hotword_lengths = (hotword_token_ids != 0).sum(axis=1) - 1  # (H,)
+        # 最后一项是 [sos] 哨兵，固定取 0
+        hotword_lengths[-1] = 0
+        hotword_lengths = np.clip(hotword_lengths, 0, None)
+
+        hw_embed_t = hw_embed.transpose(1, 0, 2)  # (H, L, 512)
+        bias_list = [hw_embed_t[i, hotword_lengths[i], :] for i in range(hw_embed_t.shape[0])]
+        bias_embed = np.stack(bias_list, axis=0)[np.newaxis, :, :].astype(np.float32)
+        return bias_embed
+
+    # --------------------------------------------------------
+    # 主推理接口：兼容 ASREngine.infer_batch_raw
+    # --------------------------------------------------------
     def infer_batch_raw(
         self,
         padded_feats: np.ndarray,
@@ -95,79 +203,92 @@ class TRTEngine:
         bias_embeddings: np.ndarray | None = None,
     ) -> list[np.ndarray]:
         """
-        TRT 推理（接口对齐 ASREngine.infer_batch_raw）。
+        4 段串联推理。
 
-        使用 torch tensor 管理 GPU 内存（简洁且与现有依赖兼容）。
+        Args:
+            padded_feats: (batch, bucket_seq_len, 560) float32（已 pad 到桶边界）
+            lengths: (batch,) int32 桶长度
+            bias_embeddings: (1, H, 512) float32，无热词时传 None（内部用全零 1×1×512）
 
-        参数：
-            padded_feats: (batch, seq_len, 560) float32
-            lengths: (batch,) int32
-            bias_embeddings: (1, num_hw, 512) float32 或 None
-
-        返回：
-            logits 列表，每个元素 shape=(seq_len, vocab_size)
+        Returns:
+            logits 列表，每个元素 shape=(token_num, vocab_size)
+                - token_num 由 CIF 输出动态决定，每条音频可能不同
         """
-        if self._engine is None:
+        if not self._loaded:
             raise RuntimeError("TRT engine 未加载")
-
-        import torch
 
         batch_size = padded_feats.shape[0]
         seq_len = padded_feats.shape[1]
-        feat_dim = padded_feats.shape[2]
 
-        # 准备输入 tensor（GPU）
-        d_inputs = {}
-        for name in self._input_names:
-            if name == "speech":
-                data = torch.from_numpy(padded_feats).cuda().contiguous()
-                self._context.set_input_shape(name, (batch_size, seq_len, feat_dim))
-            elif name == "speech_lengths":
-                data = torch.from_numpy(lengths.astype(np.int32)).cuda().contiguous()
-                self._context.set_input_shape(name, (batch_size,))
-            elif "bias_embed" in name:
-                if bias_embeddings is not None:
-                    bias_data = np.tile(bias_embeddings, (batch_size, 1, 1)).astype(np.float32)
-                    data = torch.from_numpy(bias_data).cuda().contiguous()
-                    self._context.set_input_shape(name, bias_data.shape)
-                else:
-                    data = torch.zeros((batch_size, 1, 512), dtype=torch.float32, device="cuda")
-                    self._context.set_input_shape(name, (batch_size, 1, 512))
-            else:
-                continue
-            d_inputs[name] = data
-            self._context.set_tensor_address(name, data.data_ptr())
+        # ---- 1. Encoder: speech → encoder_out ----
+        enc_inputs = {"speech": padded_feats.astype(np.float32)}
+        if "speech_lengths" in self._encoder.input_names:
+            enc_inputs["speech_lengths"] = lengths.astype(np.int64)
+        enc_out = self._encoder.infer(enc_inputs)
+        encoder_out = enc_out["encoder_out"]  # (batch, seq_len, 512)
+        encoder_out_lens = enc_out.get(
+            "encoder_out_lens",
+            np.array([seq_len] * batch_size, dtype=np.int64),
+        )
 
-        # 分配输出 tensor（GPU）
-        d_outputs = {}
-        for name in self._output_names:
-            output_shape = tuple(self._context.get_tensor_shape(name))
-            d_outputs[name] = torch.empty(output_shape, dtype=torch.float32, device="cuda")
-            self._context.set_tensor_address(name, d_outputs[name].data_ptr())
+        # ---- 2. CIF: encoder_out + mask → acoustic_embeds, token_num ----
+        # 推理时 batch=1 走全 1 mask（与 test_trt_pipeline.py 一致）
+        # 多 batch 时按各自有效长度构造 mask
+        mask = np.zeros((batch_size, 1, seq_len), dtype=np.float32)
+        for i, L in enumerate(lengths):
+            mask[i, 0, :int(L)] = 1.0
+        cif_out = self._cif.infer({"encoder_out": encoder_out, "mask": mask})
+        acoustic_embeds = cif_out["acoustic_embeds"]  # (batch, max_token, 512)
+        token_num_arr = cif_out["token_num"].flatten()  # (batch,)
 
-        # 执行推理
-        stream = torch.cuda.current_stream()
-        self._context.execute_async_v3(stream_handle=stream.cuda_stream)
-        stream.synchronize()
+        # ---- 3. Decoder: 逐 batch 切到实际 token 数后传入 ----
+        # 由于 token_num 每条不同，需要按最大 token_num 重新 pad
+        token_nums = np.round(token_num_arr).astype(np.int64)
+        max_tok = int(token_nums.max())
+        if max_tok == 0:
+            # 全零 token：返回空 logits 占位
+            return [np.zeros((0, 8404), dtype=np.float32) for _ in range(batch_size)]
 
-        # 拷贝输出到 CPU
-        logits = d_outputs[self._output_names[0]].cpu().numpy()
+        # 截断 acoustic_embeds 到 max_tok
+        acoustic_trimmed = acoustic_embeds[:, :max_tok, :].astype(np.float32)
 
-        # 拆分 batch 结果
+        # bias_embed: 无热词用全零 1×1×512
+        if bias_embeddings is None:
+            bias_embed_input = np.zeros((1, 1, 512), dtype=np.float32)
+        else:
+            bias_embed_input = bias_embeddings.astype(np.float32)
+
+        dec_inputs = {}
+        if "acoustic_embeds" in self._decoder.input_names:
+            dec_inputs["acoustic_embeds"] = acoustic_trimmed
+        if "token_num" in self._decoder.input_names:
+            dec_inputs["token_num"] = token_nums
+        if "encoder_out" in self._decoder.input_names:
+            dec_inputs["encoder_out"] = encoder_out.astype(np.float32)
+        if "encoder_out_lens" in self._decoder.input_names:
+            dec_inputs["encoder_out_lens"] = encoder_out_lens.astype(np.int64)
+        if "bias_embed" in self._decoder.input_names:
+            dec_inputs["bias_embed"] = bias_embed_input
+
+        dec_out = self._decoder.infer(dec_inputs)
+        logits = dec_out["logits"]  # (batch, max_tok, vocab) 或 list
+
+        # ---- 4. 按各自 token_num 切片返回 ----
         results = []
         for i in range(batch_size):
-            results.append(logits[i])
-
+            n = int(token_nums[i])
+            results.append(logits[i, :n, :].copy())
         return results
 
+    # --------------------------------------------------------
+    # 预热
+    # --------------------------------------------------------
     def warmup(self, bucket_seq_lens: list[int], batch_sizes: list[int]):
-        """
-        预热：对所有 bucket × batch 组合执行一次推理。
-        """
-        if not self.is_loaded:
+        """对每个 (bucket_seq_len, batch_size) 组合执行一次推理。"""
+        if not self._loaded:
             return
 
-        logger.info("TRT engine 预热中...")
+        logger.info("TRT engine 预热中（4 段串联）...")
         feat_dim = 560
         count = 0
 
