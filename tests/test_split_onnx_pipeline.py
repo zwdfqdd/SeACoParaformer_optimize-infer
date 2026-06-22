@@ -1,12 +1,12 @@
 """
-分段 ONNX 模型端到端推理测试（ORT，不含热词）
+分段 ONNX 模型端到端推理测试（ORT，含热词支持）
 
-使用 encoder.onnx + cif.onnx + decoder.onnx 串联推理。
-用于验证分段导出的正确性，以及与 TRT 推理结果对比。
+使用 encoder.onnx + cif.onnx + decoder.onnx + bias_encoder.onnx 串联推理。
 
 用法：
-    python tests/test_split_onnx_pipeline.py --audio test_data/audio_16000_10s.wav
-    python tests/test_split_onnx_pipeline.py --audio test_data/audio_16000_10s.wav --device cuda
+    python tests/test_split_onnx_pipeline.py --audio test_data/audio_16000_30s.wav
+    python tests/test_split_onnx_pipeline.py --audio test_data/audio_16000_30s.wav --device cuda
+    python tests/test_split_onnx_pipeline.py --audio test_data/audio_16000_30s.wav --hotwords 埃文 账号
 """
 
 import argparse
@@ -48,11 +48,12 @@ class OnnxInferencer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="分段 ONNX 模型推理测试（不含热词）")
+    parser = argparse.ArgumentParser(description="分段 ONNX 模型推理测试（含热词支持）")
     parser.add_argument("--audio", required=True, help="WAV 16kHz 单声道音频")
     parser.add_argument("--split-dir", default="./models/asr/split", help="分段 ONNX 模型目录")
     parser.add_argument("--config-dir", default="./models/asr", help="配置文件目录")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="推理设备")
+    parser.add_argument("--hotwords", nargs="*", default=None, help="热词列表")
     args = parser.parse_args()
 
     if not Path(args.audio).exists():
@@ -97,6 +98,42 @@ def main():
     print(f"  cif: {cif.input_names} → {cif.output_names}")
     print(f"  decoder: {decoder.input_names} → {decoder.output_names}")
 
+    # Bias encoder（可选）
+    bias_encoder_path = split_dir / "bias_encoder.onnx"
+    bias_encoder = None
+    if bias_encoder_path.exists():
+        bias_encoder = OnnxInferencer(str(bias_encoder_path), args.device)
+        print(f"  bias_encoder: {bias_encoder.input_names} → {bias_encoder.output_names}")
+
+    # 编码热词
+    bias_embed = None
+    if args.hotwords and bias_encoder:
+        print(f"\n  编码热词: {args.hotwords}")
+        encoded = [tokenizer.encode(hw) for hw in args.hotwords if hw]
+        encoded.append([1])  # <sos> as NO_BIAS marker
+        max_len = max(len(ids) for ids in encoded)
+        hotword_ids = np.zeros((len(encoded), max_len), dtype=np.int64)
+        for i, ids in enumerate(encoded):
+            hotword_ids[i, :len(ids)] = ids
+
+        # Bias encoder 推理
+        bias_out = bias_encoder.infer({"hotword": hotword_ids})
+        hw_embed = bias_out["hw_embed"]  # (max_len, num_hotwords, 512)
+        print(f"  hw_embed shape: {hw_embed.shape}")
+
+        # 按热词长度取最后有效时间步
+        hotword_lengths = (hotword_ids != 0).sum(axis=1) - 1
+        hotword_lengths[-1] = 0  # <sos> 取位置 0
+        hotword_lengths = np.clip(hotword_lengths, 0, None)
+
+        # hw_embed: (max_len, num_hw, D) → transpose → (num_hw, max_len, D) → 取各自位置
+        hw_embed_t = hw_embed.transpose(1, 0, 2)  # (num_hw, max_len, D)
+        bias_list = []
+        for i in range(len(encoded)):
+            bias_list.append(hw_embed_t[i, hotword_lengths[i], :])
+        bias_embed = np.stack(bias_list, axis=0)[np.newaxis, :, :]  # (1, num_hw, 512)
+        print(f"  bias_embed shape: {bias_embed.shape}")
+
     # 推理
     print("\n[5/5] 串联推理...")
     speech_input = features[np.newaxis, :, :].astype(np.float32)
@@ -104,18 +141,24 @@ def main():
 
     t0 = time.perf_counter()
 
-    # Encoder
-    enc_out = encoder.infer({"speech": speech_input, "speech_lengths": speech_lengths})
+    # Encoder（兼容输入有/无 speech_lengths，输出有/无 encoder_out_lens）
+    enc_inputs = {"speech": speech_input}
+    if "speech_lengths" in encoder.input_names:
+        enc_inputs["speech_lengths"] = speech_lengths
+    enc_out = encoder.infer(enc_inputs)
     encoder_out = enc_out["encoder_out"]
+    encoder_out_lens = enc_out.get(
+        "encoder_out_lens",
+        np.array([encoder_out.shape[1]], dtype=np.int64),
+    )
     enc_ms = (time.perf_counter() - t0) * 1000
     print(f"  [Encoder] {speech_input.shape} → {encoder_out.shape}, {enc_ms:.1f}ms")
 
     # CIF
     t1 = time.perf_counter()
-    cif_inputs = {"encoder_out": encoder_out}
-    if "encoder_out_lens" in cif.input_names:
-        cif_inputs["encoder_out_lens"] = np.array([encoder_out.shape[1]], dtype=np.int64)
-    cif_out = cif.infer(cif_inputs)
+    # mask: (B, 1, T) — 全 True（推理时不 mask）
+    mask = np.ones((1, 1, encoder_out.shape[1]), dtype=np.float32)
+    cif_out = cif.infer({"encoder_out": encoder_out, "mask": mask})
     cif_ms = (time.perf_counter() - t1) * 1000
 
     acoustic_embeds = cif_out["acoustic_embeds"]
@@ -123,14 +166,32 @@ def main():
     acoustic_embeds = acoustic_embeds[:, :token_num, :]
     print(f"  [CIF] → {acoustic_embeds.shape} (token_num={token_num}), {cif_ms:.1f}ms")
 
+    if token_num == 0:
+        print("\n  警告：token_num=0，无法继续推理")
+        return
+
     # Decoder
     t2 = time.perf_counter()
-    dec_out = decoder.infer({
-        "acoustic_embeds": acoustic_embeds.astype(np.float32),
-        "acoustic_embeds_lens": np.array([token_num], dtype=np.int64),
-        "encoder_out": encoder_out.astype(np.float32),
-        "encoder_out_lens": np.array([encoder_out.shape[1]], dtype=np.int64),
-    })
+    # 准备 bias_embed（无热词时用全零）
+    if bias_embed is not None:
+        dec_bias = bias_embed.astype(np.float32)
+    else:
+        dec_bias = np.zeros((1, 1, 512), dtype=np.float32)
+
+    # 只传 decoder ONNX 实际接收的输入
+    dec_inputs = {}
+    if "acoustic_embeds" in decoder.input_names:
+        dec_inputs["acoustic_embeds"] = acoustic_embeds.astype(np.float32)
+    if "token_num" in decoder.input_names:
+        dec_inputs["token_num"] = np.array([token_num], dtype=np.int64)
+    if "encoder_out" in decoder.input_names:
+        dec_inputs["encoder_out"] = encoder_out.astype(np.float32)
+    if "encoder_out_lens" in decoder.input_names:
+        dec_inputs["encoder_out_lens"] = np.array([encoder_out.shape[1]], dtype=np.int64)
+    if "bias_embed" in decoder.input_names:
+        dec_inputs["bias_embed"] = dec_bias
+
+    dec_out = decoder.infer(dec_inputs)
     dec_ms = (time.perf_counter() - t2) * 1000
     logits = dec_out["logits"]
     print(f"  [Decoder] → {logits.shape}, {dec_ms:.1f}ms")
@@ -143,6 +204,8 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"识别结果: {text}")
+    if args.hotwords:
+        print(f"热词: {args.hotwords}")
     print(f"{'='*60}")
 
     print(f"\n性能汇总:")
