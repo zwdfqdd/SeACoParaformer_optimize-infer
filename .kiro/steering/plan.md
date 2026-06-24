@@ -637,3 +637,89 @@ python tests/test_trt_pipeline.py --audio test_data/audio_16000_10s.wav \
 - `docs/README.md` — 完整技术文档
 
 # ============================================================
+
+
+# ============================================================
+# v2 阶段 2 — INT8 量化（QDQ Explicit，已完成 ✓）
+# ============================================================
+
+## 核心结论：QDQ Explicit 有效，Calibrator Implicit 无效
+
+### 失败路径（方案 2：IInt8EntropyCalibrator2 Implicit）
+- 在 SeACo 架构上 INT8 完全不生效
+- 根因：encoder 主干 MatMul 被 TRT myelin 优化器融合进带 LayerNorm 的大 kernel
+  （层名如 __myl_ResTraResResTraAddAddMaxMinCasMeaSubMulMeaAddSqrDivMulCasMulAdd）
+  myelin 融合 kernel 不支持部分 INT8 → 全部 fall back fp16
+- 实证：engine 体积不降（340MB ≈ fp16），inspector 显示 INT8 层=0
+- 大量 "Missing scale and zero-point" 警告（LayerNorm weight/bias + Broadcast tensor）
+
+### 成功路径（方案 1：QDQ Explicit，nvidia-modelopt）
+- Q/DQ 节点显式标记量化边界，TRT 不敢融合掉 → INT8 真正生效
+- 工具：nvidia-modelopt 0.21.0（必须钉版本，0.44+ 顶 torch 到 2.12+cu130 破坏环境）
+
+## 量化方案
+
+| 模块 | 精度 | engine 体积 | 说明 |
+|---|---|---|---|
+| encoder | INT8 (QDQ) | 337MB → 187MB | 全量化，CER≈0 |
+| decoder | INT8 (QDQ) | 159MB → 112MB | 主 decoder 量化，SeACo 路径保持 fp16 |
+| cif | fp16 | — | 数值敏感（cumsum），不量化 |
+| bias_encoder | fp16 | — | LSTM，不量化 |
+
+## decoder 量化的关键：排除 SeACo 热词路径
+
+- 全量化 decoder → 热词修正失效（"埃文"→"艾文/艾问"），CER≈7-8%
+- 排除 seaco_decoder + hotword_output_layer（保持 fp16）→ 热词恢复，CER≈3%
+- 通过 export_decoder_qdq.py 的 --exclude-patterns 控制（默认已排除）
+
+## 工程交付物
+
+- scripts/export_encoder_qdq.py — encoder QDQ 量化导出
+- scripts/export_decoder_qdq.py — decoder QDQ 量化导出（含 --exclude-patterns）
+- scripts/convert_trt_int8.py — Calibrator 方案（已验证无效，保留作对照记录）
+- scripts/compare_accuracy.py — fp32/fp16/int8 精度对比
+- scripts/evaluate_cer.py — 数据集级 CER 批量评测（基准 fp16 vs 待测 int8）
+- scripts/inspect_engine_precision.py — engine 层精度诊断
+- requirements-infer-trt.txt — 新增 nvidia-modelopt==0.21.0 + torchprofile
+
+## 完整命令
+
+```bash
+# 1. encoder QDQ
+python scripts/export_encoder_qdq.py \
+    --calib-data ./int8/calib_data/audio_data \
+    --output ./models/asr/split/encoder_qdq.onnx
+python scripts/convert_trt.py --input ./models/asr/split/encoder_qdq.onnx \
+    --precision int8 --profile encoder \
+    --output ./models/asr/trt/2080_ti_encoder_int8_qdq.engine
+
+# 2. decoder QDQ（默认排除 SeACo 路径）
+python scripts/export_decoder_qdq.py \
+    --encoder-engine ./models/asr/trt/2080_ti_encoder_fp16.engine \
+    --cif-engine ./models/asr/trt/2080_ti_cif_fp16.engine \
+    --output ./models/asr/split/decoder_qdq.onnx
+python scripts/convert_trt.py --input ./models/asr/split/decoder_qdq.onnx \
+    --precision int8 --profile decoder \
+    --output ./models/asr/trt/2080_ti_decoder_int8_qdq.engine
+
+# 3. CER 评测
+python scripts/evaluate_cer.py --audio-dir int8/calib_data/audio_data --csv report_cer.csv
+```
+
+## 性能与精度（2080 Ti）
+
+- 体积：encoder+decoder 合计 496MB → 299MB（显存占用大幅下降）
+- 精度：encoder int8 CER≈0；encoder+decoder int8（SeACo fp16）单条 CER≈3%
+- 速度：2080 Ti（Turing）小 batch 下 INT8 因 Q/DQ 开销无明显提升
+  （INT8 价值在显存 + 大 batch 吞吐，A10/T4/Orin 上预期有速度收益）
+
+## 待完成任务（TODO）
+
+1. **真实标注测试集复核 CER**（当前以 fp16 输出为参考基准，偏乐观）
+2. **若 CER 超标**：decoder 额外排除 src_attn（cross-attention）保持 fp16：
+   --exclude-patterns seaco_decoder hotword_output_layer src_attn
+3. **多 GPU engine 构建**（A10/T4 各自 build，验证 INT8 在 Ampere/Turing 的速度收益）
+4. **服务集成**：src/config.py 增加 trt_int8 精度的 4 段 engine 路径解析
+   （engine 命名 {gpu}_{module}_int8_qdq.engine，需适配 find_engine）
+
+# ============================================================

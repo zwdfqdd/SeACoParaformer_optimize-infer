@@ -105,6 +105,83 @@ python tests/test_trt_pipeline.py \
 
 ---
 
+## v2 阶段 2：INT8 量化（QDQ Explicit）
+
+### 核心结论
+
+| 方案 | 在 SeACo 架构上的效果 |
+|---|---|
+| Calibrator Implicit（`IInt8EntropyCalibrator2`） | ❌ 无效。encoder MatMul 被 TRT myelin 融合进 LayerNorm 大 kernel，融合 kernel 不支持部分 INT8，全部 fall back fp16（engine 体积不降，INT8 层=0） |
+| **QDQ Explicit（`nvidia-modelopt`）** | ✅ 有效。Q/DQ 节点显式标记量化边界，TRT 不融合掉，INT8 真正生效 |
+
+### 环境依赖（仅 INT8 导出需要）
+
+```bash
+# 必须钉版本！0.44+ 会把 torch 顶到 2.12+cu130 破坏 torchaudio/TRT 环境
+pip install nvidia-modelopt==0.21.0 torchprofile --extra-index-url https://pypi.nvidia.com
+```
+
+### 量化范围
+
+| 模块 | 精度 | 体积 | 说明 |
+|---|---|---|---|
+| encoder | INT8 (QDQ) | 337MB → 187MB | 全量化，CER≈0 |
+| decoder | INT8 (QDQ) | 159MB → 112MB | 主 decoder 量化，**SeACo 热词路径保持 fp16** |
+| cif | fp16 | — | cumsum 数值敏感，不量化 |
+| bias_encoder | fp16 | — | LSTM，不量化 |
+
+> decoder 全量化会破坏热词修正（"埃文"→"艾文"）。
+> `export_decoder_qdq.py` 默认 `--exclude-patterns seaco_decoder hotword_output_layer`，
+> 将 SeACo 路径排除在 INT8 外保持 fp16。
+
+### 完整执行流程
+
+```bash
+# 校准数据：int8/calib_data/audio_data 下放 16kHz 单声道 WAV（300 条）
+
+# 1. encoder QDQ 量化导出 + 转 engine
+python scripts/export_encoder_qdq.py \
+    --calib-data ./int8/calib_data/audio_data \
+    --output ./models/asr/split/encoder_qdq.onnx
+python scripts/convert_trt.py --input ./models/asr/split/encoder_qdq.onnx \
+    --precision int8 --profile encoder \
+    --output ./models/asr/trt/2080_ti_encoder_int8_qdq.engine
+
+# 2. decoder QDQ 量化导出 + 转 engine（用 fp16 encoder+cif 生成校准输入）
+python scripts/export_decoder_qdq.py \
+    --encoder-engine ./models/asr/trt/2080_ti_encoder_fp16.engine \
+    --cif-engine ./models/asr/trt/2080_ti_cif_fp16.engine \
+    --output ./models/asr/split/decoder_qdq.onnx
+python scripts/convert_trt.py --input ./models/asr/split/decoder_qdq.onnx \
+    --precision int8 --profile decoder \
+    --output ./models/asr/trt/2080_ti_decoder_int8_qdq.engine
+
+# 3. 数据集级 CER 评测（基准 fp16 vs 待测 int8，阈值 3%）
+python scripts/evaluate_cer.py --audio-dir int8/calib_data/audio_data --csv report_cer.csv
+```
+
+### 诊断工具
+
+```bash
+# 查看 engine 各层精度分布（判断 INT8 是否真正生效）
+python scripts/inspect_engine_precision.py --engine models/asr/trt/2080_ti_encoder_int8_qdq.engine
+```
+
+### 性能说明
+
+- INT8 体积 encoder+decoder 合计 496MB → 299MB，显存占用大幅下降
+- **2080 Ti（Turing）小 batch 下 INT8 因 Q/DQ 开销速度无明显提升**
+- INT8 的速度价值在大 batch 吞吐 + Ampere/Hopper 架构（A10/T4/Orin），部署卡上预期有收益
+
+### 待完成（TODO）
+
+- 真实标注测试集复核 CER（当前以 fp16 输出为参考基准，偏乐观）
+- CER 超标时：decoder 额外排除 `src_attn`（`--exclude-patterns seaco_decoder hotword_output_layer src_attn`）
+- 多 GPU engine 构建（各目标卡分别 build）
+- 服务集成 `trt_int8` 精度（4 段 int8_qdq engine 路径解析）
+
+---
+
 ## v1 推理路径（ORT）
 
 ### 模型准备
@@ -218,11 +295,17 @@ SeACoParaformer/
 │   ├── export_onnx_split.py          # v2 分段 ONNX 导出（含 --clamp-value）
 │   ├── export_encoder_truncated.py   # encoder 截断实验（保留供后续优化）
 │   ├── export_decoder_truncated.py   # decoder 截断实验（保留供后续优化）
-│   ├── convert_trt.py                # ONNX → TRT engine 转换
-│   ├── convert_int8.py               # fp32 → int8 动态量化
+│   ├── export_encoder_qdq.py         # v2 阶段2 encoder QDQ INT8 量化导出
+│   ├── export_decoder_qdq.py         # v2 阶段2 decoder QDQ INT8 量化导出
+│   ├── convert_trt.py                # ONNX → TRT engine 转换（fp32/fp16/int8）
+│   ├── convert_trt_int8.py           # INT8 Calibrator 方案（已验证无效，保留对照）
+│   ├── convert_int8.py               # fp32 → int8 动态量化（v1 ORT CPU）
 │   ├── convert_fp16.py               # fp32 → fp16 转换（v1 备选）
 │   ├── verify_onnx.py                # ONNX vs PT 精度验证
 │   ├── inspect_onnx.py               # ONNX 模型结构检查
+│   ├── inspect_engine_precision.py   # TRT engine 层精度诊断
+│   ├── compare_accuracy.py           # fp32/fp16/int8 精度对比
+│   ├── evaluate_cer.py               # 数据集级 CER 批量评测
 │   ├── benchmark.py                  # 性能基准测试
 │   ├── download_vad.py               # VAD 模型下载
 │   └── entrypoint_trt.sh             # TRT 镜像启动脚本
