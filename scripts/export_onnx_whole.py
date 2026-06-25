@@ -13,6 +13,8 @@ import argparse
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 
 def export_fp32_onnx(model_id: str, output_dir: Path, opset_version: int = 16):
     """使用 seaco_paraformer 加载模型并导出 fp32 ONNX（v1 整体导出）。"""

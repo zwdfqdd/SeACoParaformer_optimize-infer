@@ -170,36 +170,46 @@ def _reload_config():
 
 
 def _load_resources():
-    """加载 CMVN 参数和 Tokenizer 词表。配置文件统一在 models/asr 下。"""
+    """加载 CMVN 参数和 Tokenizer 词表。
+
+    配置文件优先在 models/asr 下查找；若不存在则回退 models/asr/pt（ModelScope
+    PT 包自带 am.mvn / tokens.json 在该子目录）。
+    """
     global _cmvn_mean, _cmvn_istd
     import os
 
     config_dir = settings.get_asr_config_dir()  # models/asr
+    pt_dir = os.path.join(config_dir, "pt")      # models/asr/pt（PT 包内配置回退）
+
+    def _resolve(name: str) -> str | None:
+        """在 config_dir 与 pt_dir 依次查找文件，返回首个存在路径。"""
+        for d in (config_dir, pt_dir):
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                return p
+        return None
 
     # 加载 CMVN
-    cmvn_path = os.path.join(config_dir, "am.mvn")
-    if os.path.exists(cmvn_path):
+    cmvn_path = _resolve("am.mvn")
+    if cmvn_path:
         try:
             _cmvn_mean, _cmvn_istd = load_cmvn(cmvn_path)
             logger.info(f"CMVN 加载成功: {cmvn_path}, shape={_cmvn_mean.shape}")
         except Exception as e:
             logger.warning(f"CMVN 加载失败: {e}，将跳过归一化")
     else:
-        logger.warning(f"CMVN 文件不存在: {cmvn_path}，将跳过归一化")
+        logger.warning(f"CMVN 文件不存在（{config_dir} / {pt_dir}），将跳过归一化")
 
     # 加载 Tokenizer
-    vocab_path = os.path.join(config_dir, "tokens.json")
-    if not os.path.exists(vocab_path):
-        vocab_path = os.path.join(config_dir, "tokens.txt")
-
-    if os.path.exists(vocab_path):
+    vocab_path = _resolve("tokens.json") or _resolve("tokens.txt")
+    if vocab_path:
         try:
             tokenizer.load(vocab_path)
             logger.info(f"Tokenizer 加载成功: {vocab_path}, vocab_size={tokenizer.vocab_size}")
         except Exception as e:
             logger.warning(f"Tokenizer 加载失败: {e}")
     else:
-        logger.warning(f"词表文件不存在，Tokenizer 未加载")
+        logger.warning(f"词表文件不存在（{config_dir} / {pt_dir}），Tokenizer 未加载")
 
 
 # ============================================================

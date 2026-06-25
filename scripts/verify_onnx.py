@@ -23,6 +23,8 @@ import numpy as np
 import onnxruntime as ort
 import soundfile as sf
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 
 # ============================================================
 # 内联特征提取（使用 torchaudio，对齐官方 WavFrontend）

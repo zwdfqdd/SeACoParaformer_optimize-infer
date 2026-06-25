@@ -46,6 +46,8 @@ SPLIT_DIR = os.path.join(ASR_DIR, "split")
 FP32_DIR = os.path.join(ASR_DIR, "fp32")
 INT8_DIR = os.path.join(ASR_DIR, "int8")
 TRT_DIR = os.path.join(ASR_DIR, "trt")
+VAD_DIR = os.path.join(MODEL_DIR, "vad")
+VAD_MODEL = os.path.join(VAD_DIR, "silero_vad.onnx")
 
 CALIB_DATA = os.getenv("CALIB_DATA", "./calib_data/audio_data")
 
@@ -282,6 +284,18 @@ def ensure_onnx_int8() -> bool:
                  "--input-dir", FP32_DIR, "--output-dir", INT8_DIR])
 
 
+def ensure_vad() -> bool:
+    """确保 Silero VAD 模型存在（服务启动必需）。缺失则尝试下载。"""
+    if os.path.exists(VAD_MODEL):
+        print("[OK] VAD 模型已存在")
+        return True
+    print(f"[构建] VAD 模型缺失，尝试下载到 {VAD_DIR} ...")
+    ok = _run([sys.executable, "scripts/download_vad.py", "--output-dir", VAD_DIR])
+    if not ok:
+        print(f"[警告] VAD 模型下载失败，请手动放置: {VAD_MODEL}")
+    return ok
+
+
 # ============================================================
 # 按 precision 编排
 # ============================================================
@@ -293,6 +307,9 @@ def prepare(precision: str, check_only: bool = False) -> bool:
 
     if check_only:
         return _check_only(precision)
+
+    # VAD 模型服务启动必需，所有精度都先确保（缺失则下载，失败仅告警不阻断）
+    ensure_vad()
 
     if precision == "pt":
         return ensure_pt()
