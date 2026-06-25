@@ -123,8 +123,9 @@ pip install nvidia-modelopt==0.21.0 torchprofile --extra-index-url https://pypi.
 | bias_encoder | fp16（默认）/ INT8 (QDQ) | — | LSTM；trt_int8 时可 QDQ（精度需实测） |
 
 > **线上推荐 `trt_int8_enc`**：仅 encoder int8，cif/decoder/bias fp16，CER≈0、热词精度保留。
-> **`trt_int8`（4 段全 int8）**：cif/bias 也走 QDQ，显存最省，但 cif（cumsum 敏感）和
-> bias（LSTM）int8 精度需真实测试集实测，未达标可回退 fp16。
+> **`trt_int8`（4 段全 int8）**：cif/bias 也走 QDQ，显存最省，4 段 engine 已实测可正常运行，
+> 但**精度损失较大**（cif cumsum 数值敏感 + bias LSTM 量化），**不推荐线上**，
+> 仅在显存极度紧张且可接受精度下降时使用；追求精度请用 `trt_int8_enc`。
 >
 > decoder 全量化会破坏热词修正（"埃文"→"艾文"）。
 > `export_decoder_qdq.py` 默认 `--exclude-patterns seaco_decoder hotword_output_layer`，
@@ -362,7 +363,7 @@ docker-compose up -d
 | onnx_int8 | ORT | — | ONNX Runtime int8 动态量化（CPU） |
 | trt_fp32 | TRT | fp32/fp32/fp32/fp32 | 4 段全 fp32 |
 | trt_fp16 | TRT | fp16/fp16/fp16/fp16 | 4 段全 fp16 |
-| trt_int8 | TRT | int8/int8/int8/int8 | 4 段全 int8（QDQ：encoder/decoder + cif/bias，cif/bias int8 精度需实测） |
+| trt_int8 | TRT | int8/int8/int8/int8 | 4 段全 int8（QDQ）。实测可运行但**精度损失较大**，不推荐线上，仅显存极紧张时用 |
 | **trt_int8_enc** | TRT | **int8/fp16/fp16/fp16** | **线上推荐**：encoder 显存减半，热词精度保留 |
 
 单段精度可用环境变量覆盖（优先级最高）：`ENCODER_PRECISION` / `CIF_PRECISION` / `DECODER_PRECISION` / `BIAS_PRECISION`，取值 `fp32`/`fp16`/`int8`。

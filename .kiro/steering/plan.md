@@ -867,10 +867,14 @@ tokenizer 可编码(剔 OOV) → 试跑 bias_encoder 验 nan/inf。
 ## 最终精度矩阵（全部可构建）
     onnx_fp32 / onnx_int8 / trt_fp32 / trt_fp16 /
     trt_int8_enc（★线上推荐，encoder int8+其余 fp16，CER≈0）/
-    trt_int8（4 段全 int8 QDQ，cif/bias int8 精度待真实测试集实测）
+    trt_int8（4 段全 int8 QDQ，实测可跑但精度损失较大，不推荐线上）
+
+## 容器实测结论（2026-06-25）
+- trt_int8（4 段全 int8 QDQ）：✓ 4 段 engine 可正常运行，但精度损失较大
+  （cif cumsum 数值敏感 + bias LSTM 量化），保留该路径但不推荐线上，
+  追求精度用 trt_int8_enc（encoder int8 + 其余 fp16，CER≈0）
 
 ## 待容器实测
-- cif/bias int8 QDQ 精度（cif cumsum 敏感、bias LSTM 量化支持有限，未达标回退 fp16）
 - 默认词表预编码缓存命中、/hotwords/reload 多 worker 收敛
 - MAX_HOTWORD_NUM=256 改了 bias/decoder profile，需重新转 engine
 - 容器内 src/config.py 需同步最新（含 get_trt_profiles），否则 convert_trt 报错

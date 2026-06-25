@@ -333,7 +333,7 @@ docker-compose logs -f seaco-asr
 | onnx_int8 | ORT 整体 int8 | 减小 | CPU |
 | trt_fp16 | fp16×4 | ~50% | GPU 通用 |
 | **trt_int8_enc** | int8/fp16/fp16/fp16 | 更省 | **线上推荐** |
-| trt_int8 | int8×4（QDQ） | 最省 | cif/bias int8 精度需实测 |
+| trt_int8 | int8×4（QDQ） | 最省 | 实测可跑但精度损失较大，不推荐线上 |
 
 ---
 

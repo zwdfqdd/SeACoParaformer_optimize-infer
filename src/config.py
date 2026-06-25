@@ -13,7 +13,7 @@ MODEL_PRECISION 支持的完整精度矩阵：
   ORT     onnx_int8             —                                    ONNX Runtime int8 动态量化（CPU）
   TRT     trt_fp32              fp32/fp32/fp32/fp32                   4 段全 fp32
   TRT     trt_fp16              fp16/fp16/fp16/fp16                   4 段全 fp16
-  TRT     trt_int8              int8/int8/int8/int8                   4 段全 int8（QDQ）
+  TRT     trt_int8              int8/int8/int8/int8                   4 段全 int8 QDQ（实测可跑，精度损失较大，不推荐线上）
   TRT     trt_int8_enc          int8/fp16/fp16/fp16                   仅 encoder int8（★线上推荐）
 
 各 TRT 段精度也可用环境变量单独覆盖（优先级最高）：
@@ -32,6 +32,7 @@ TRT_PRECISION_PROFILES = {
     "trt_fp32": {"encoder": "fp32", "cif": "fp32", "decoder": "fp32", "bias_encoder": "fp32"},
     "trt_fp16": {"encoder": "fp16", "cif": "fp16", "decoder": "fp16", "bias_encoder": "fp16"},
     # 全 int8（4 段都 QDQ 量化：encoder/decoder + cif/bias）
+    # 实测 4 段 engine 可正常运行，但精度损失较大（cif cumsum + bias LSTM 量化），不推荐线上
     "trt_int8": {"encoder": "int8", "cif": "int8", "decoder": "int8", "bias_encoder": "int8"},
     # ★线上推荐：仅 encoder int8，其余 fp16（encoder 显存减半，热词精度保留，CER≈0）
     "trt_int8_enc": {"encoder": "int8", "cif": "fp16", "decoder": "fp16", "bias_encoder": "fp16"},

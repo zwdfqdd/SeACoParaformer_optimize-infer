@@ -12,6 +12,10 @@ WORKDIR /app
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Asia/Shanghai
 
+ENV LC_ALL C.UTF-8
+ENV LANG en_US.UTF-8
+
+
 # 仅安装缺少的系统库
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \

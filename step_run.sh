@@ -151,7 +151,8 @@ step 4:
 step 5:
     # ─── 全 INT8（trt_int8）：补充 cif + bias QDQ ──────────────────
     # 仅在需要 trt_int8（4 段全 int8）时执行；线上推荐 trt_int8_enc 无需此步。
-    # cif/bias int8 精度需实测，未达标可回退 fp16（即 trt_int8_enc）。
+    # 实测：4 段 engine 可正常运行，但精度损失较大（cif cumsum + bias LSTM 量化），
+    #       不推荐线上，仅显存极度紧张且可接受精度下降时使用。
 
     # cif QDQ（需 fp16 encoder engine 生成校准输入；cumsum 路径天然不量化）
     python scripts/export_cif_qdq.py \
