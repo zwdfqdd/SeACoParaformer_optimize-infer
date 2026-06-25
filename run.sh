@@ -128,7 +128,7 @@ echo ""
 exec python -m uvicorn src.main:app --host 0.0.0.0 --port "${PORT}" --workers "${WORKS}"
 
 :<<!
-docker run -it -p 8099:8080 --gpus '"device=0"' <镜像名> /bin/bash
+docker run -it -p 8099:8080 --gpus '"device=0"' seaco-asr_infer:latest /bin/bash
 curl http://localhost:8099/health
 
 # 默认 trt_int8_enc 启动
