@@ -14,7 +14,7 @@
 - **NumPy**: 数值计算
 - **SoundFile**: 音频文件读取
 - **FastAPI + Uvicorn**: HTTP 服务框架
-- **Prometheus + OpenTelemetry**: 可观测性
+- **Prometheus**: 可观测性（指标监控）
 
 ## 推理引擎选择
 

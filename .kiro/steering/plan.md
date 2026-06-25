@@ -210,7 +210,7 @@
                 torch + torchaudio — 特征提取（kaldi fbank）
                 numpy, soundfile — 音频处理
                 fastapi, uvicorn, pydantic — HTTP 服务
-                prometheus-client, opentelemetry — 可观测性
+                prometheus-client — 可观测性（OpenTelemetry 未接入，已移除依赖；如需链路追踪后续再加）
             不包含 funasr/modelscope（模型转换环境专用）
         20).性能优化实现方案
             特征提取（src/feature_extractor.py）：
