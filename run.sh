@@ -126,3 +126,27 @@ echo "       健康检查: curl http://localhost:${PORT}/health"
 echo ""
 
 exec python -m uvicorn src.main:app --host 0.0.0.0 --port "${PORT}" --workers "${WORKS}"
+
+:<<!
+docker run -it -p 8099:8080 --gpus '"device=0"' <镜像名> /bin/bash
+curl http://localhost:8099/health
+
+# 默认 trt_int8_enc 启动
+bash run.sh
+
+# 测试不同精度（命令行覆盖优先）
+MODEL_PRECISION=trt_fp16  bash run.sh
+MODEL_PRECISION=trt_fp32  bash run.sh
+MODEL_PRECISION=trt_int8  bash run.sh
+MODEL_PRECISION=onnx_fp32 bash run.sh
+MODEL_PRECISION=onnx_int8 bash run.sh
+
+# 单段精度混搭测试
+ENCODER_PRECISION=int8 DECODER_PRECISION=fp16 bash run.sh
+
+# 多 worker / 调 batch
+MODEL_PRECISION=trt_fp16 WORKS=2 BATCH=8 bash run.sh
+
+# 开详细耗时日志
+VERBOSE=1 bash run.sh
+!

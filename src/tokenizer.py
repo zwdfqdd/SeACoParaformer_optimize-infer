@@ -118,7 +118,12 @@ class Tokenizer:
         """
         将文本编码为 token ID 序列（用于 hotwords 编码）。
 
-        简单的逐字符匹配，优先匹配长 token。
+        简单的贪心最长匹配（最多 4 字符），优先匹配长 token。
+
+        说明：本词表为中文字 + 英文 BPE（@@ 后缀）混合。中文热词逐字命中、
+        encode/decode 字符级一致；英文热词因无 BPE merges 规则，贪心匹配可能
+        切成非连接片段（如 android → and/r/o/id），仅影响英文热词的偏置强度，
+        不影响中文热词与正常识别。本项目热词以中文为主，该限制可接受。
         """
         if not self._loaded:
             return []
