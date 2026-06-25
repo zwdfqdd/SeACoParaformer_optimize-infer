@@ -2,74 +2,83 @@
 # ============================================================
 # SeACo-Paraformer 容器内一键启动脚本（手动测试用）
 #
-# 适用场景：以 docker run -it ... 镜像 /bin/bash 进入容器后，
-#   手动运行本脚本一键启动服务，按需改下方环境变量测试各精度。
+# 适用场景：docker run -it ... 镜像 /bin/bash 进入容器后，
+#   手动改下方参数值再运行本脚本一键启动服务，测试各精度。
 #
 # 用法：
-#   bash run.sh                          # 用下方默认参数启动
-#   MODEL_PRECISION=trt_fp16 bash run.sh # 命令行临时覆盖某参数
-#   MODEL_PRECISION=trt_int8 WORKS=2 bash run.sh
+#   bash run.sh        # 用下方参数启动（直接改下面的值即可）
 #
 # 说明：
-#   - 命令行传入的环境变量优先级高于本脚本默认值（${VAR:-默认}）
+#   - 直接修改下方等号右边的值更换配置；每个参数后注释列出可选值
 #   - 启动前会调 prepare_model.py 按精度检查/构建产物，缺失则现场转换
 #   - 容器内部端口固定 8080，对外靠 docker run -p 宿主端口:8080 映射
 # ============================================================
 
 # ─── 模型精度（核心，逐个测试时改这里）───
-#   onnx_fp32 / onnx_int8 / trt_fp32 / trt_fp16 / trt_int8 / trt_int8_enc / auto
-export MODEL_PRECISION="${MODEL_PRECISION:-trt_int8_enc}"
+MODEL_PRECISION=trt_int8_enc        # 可选: auto onnx_fp32 onnx_int8 trt_fp32 trt_fp16 trt_int8 trt_int8_enc
 
-# 单段精度覆盖（可选，优先级高于 MODEL_PRECISION；留空则不覆盖）
-#   取值 fp32 / fp16 / int8
-export ENCODER_PRECISION="${ENCODER_PRECISION:-}"
-export CIF_PRECISION="${CIF_PRECISION:-}"
-export DECODER_PRECISION="${DECODER_PRECISION:-}"
-export BIAS_PRECISION="${BIAS_PRECISION:-}"
+# 单段精度覆盖（可选，优先级高于 MODEL_PRECISION；留空 "" 表示不覆盖）
+ENCODER_PRECISION=""                # 可选: "" fp32 fp16 int8
+CIF_PRECISION=""                    # 可选: "" fp32 fp16 int8
+DECODER_PRECISION=""                # 可选: "" fp32 fp16 int8
+BIAS_PRECISION=""                   # 可选: "" fp32 fp16 int8
 
 # ─── 服务运行参数 ───
-export WORKS="${WORKS:-1}"                                  # uvicorn worker 进程数（GPU 显存够才调大）
-export BATCH="${BATCH:-12}"                                 # 最大 batch（合法值 1,2,4,8,12）
-export BATCH_TIMEOUT="${BATCH_TIMEOUT:-10}"                 # batch 等待超时（毫秒）
-export MAX_CONCURRENT_REQUESTS="${MAX_CONCURRENT_REQUESTS:-2000}"
-export ACQUIRE_TIMEOUT="${ACQUIRE_TIMEOUT:-5}"             # 过载拒绝等待超时（秒），0=不拒绝
-export MAX_AUDIO_DURATION_MS="${MAX_AUDIO_DURATION_MS:-7200000}"  # 音频时长上限（ms），0=不限
-export LOG_LEVEL="${LOG_LEVEL:-INFO}"                       # DEBUG/INFO/WARNING/ERROR
-export VERBOSE="${VERBOSE:-0}"                              # 1=输出各阶段耗时
+WORKS=1                             # uvicorn worker 进程数；可选: 1 2 4...（GPU 显存够才调大）
+BATCH=12                            # 最大 batch；合法值: 1 2 4 8 12
+BATCH_TIMEOUT=10                    # batch 等待超时（毫秒）；可选: 5 10 20 50
+MAX_CONCURRENT_REQUESTS=2000        # 最大并发请求数
+ACQUIRE_TIMEOUT=5                   # 过载拒绝等待超时（秒）；0=不拒绝（无限排队）
+MAX_AUDIO_DURATION_MS=7200000       # 音频时长上限（ms）；默认 2 小时；0=不限
+LOG_LEVEL=INFO                      # 可选: DEBUG INFO WARNING ERROR
+VERBOSE=0                           # 可选: 0 1（1=输出各阶段耗时）
 
 # ─── Bucket / Batch（改动后需重新转 engine）───
-export BUCKET_SEQ_LENS="${BUCKET_SEQ_LENS:-34,67,134}"
-export VALID_BATCH_SIZES="${VALID_BATCH_SIZES:-1,2,4,8,12}"
-export TRT_OPT_SEQ="${TRT_OPT_SEQ:-67}"
-export TRT_OPT_BATCH="${TRT_OPT_BATCH:-4}"
+BUCKET_SEQ_LENS=34,67,134           # 桶边界 LFR 帧数（2s/4s/8s）
+VALID_BATCH_SIZES=1,2,4,8,12        # 合法 batch size 列表
+TRT_OPT_SEQ=67                      # TRT profile opt 主力桶；可选: 34 67 134
+TRT_OPT_BATCH=4                     # TRT profile opt batch；可选: 1 2 4 8 12
 
 # ─── 热词参数（改 MAX/OPT 后需重新转 bias/decoder engine）───
-export MAX_HOTWORD_NUM="${MAX_HOTWORD_NUM:-256}"
-export OPT_HOTWORD_NUM="${OPT_HOTWORD_NUM:-64}"
-export NFILTER="${NFILTER:-50}"
-export MAX_HOTWORD_LEN="${MAX_HOTWORD_LEN:-8}"
+MAX_HOTWORD_NUM=256                 # 热词硬上限 / 路径切换点（≤走 SeACo，>走 Faiss）
+OPT_HOTWORD_NUM=64                  # TRT profile opt 热词数
+NFILTER=50                          # ASF 过滤注入 decoder 的 top-K
+MAX_HOTWORD_LEN=8                   # 单热词最大 token 数
 
 # ─── 词表热更新 ───
-export DEFAULT_HOTWORD_PATH="${DEFAULT_HOTWORD_PATH:-models/asr/hotwords.txt}"
-export HOTWORD_RELOAD_ENABLED="${HOTWORD_RELOAD_ENABLED:-true}"
-export HOTWORD_POLL_INTERVAL="${HOTWORD_POLL_INTERVAL:-5}"
+DEFAULT_HOTWORD_PATH=models/asr/hotwords.txt
+HOTWORD_RELOAD_ENABLED=true         # 可选: true false
+HOTWORD_POLL_INTERVAL=5             # 各 worker 轮询 version 间隔（秒）
 
 # ─── 路径 B：Faiss 大词库纠错（默认词表 >MAX_HOTWORD_NUM 时启用）───
-export FAISS_WINDOW_SIZES="${FAISS_WINDOW_SIZES:-2,3,4}"
-export FAISS_TOPK="${FAISS_TOPK:-30}"
-export FAISS_PINYIN_WEIGHT="${FAISS_PINYIN_WEIGHT:-0.75}"
-export FAISS_EDIT_WEIGHT="${FAISS_EDIT_WEIGHT:-0.25}"
-export FAISS_SCORE_THRESHOLD="${FAISS_SCORE_THRESHOLD:-0.85}"
-export GAP_THRESHOLD="${GAP_THRESHOLD:-0.05}"
-export FINAL_SCORE_THRESHOLD="${FINAL_SCORE_THRESHOLD:-0.88}"
+FAISS_WINDOW_SIZES=2,3,4            # 滑窗大小
+FAISS_TOPK=30                       # 召回数
+FAISS_PINYIN_WEIGHT=0.75            # 拼音权重
+FAISS_EDIT_WEIGHT=0.25             # 编辑距离权重
+FAISS_SCORE_THRESHOLD=0.85          # Faiss 检索分门槛
+GAP_THRESHOLD=0.05                  # top1-top2 区分度门槛
+FINAL_SCORE_THRESHOLD=0.88          # 融合分门槛
 
 # ─── 本地 PT 权重目录 + 校准数据 ───
-export PT_MODEL_DIR="${PT_MODEL_DIR:-models/asr/pt}"
-export CALIB_DATA="${CALIB_DATA:-calib_data/audio_data}"
+PT_MODEL_DIR=models/asr/pt
+CALIB_DATA=calib_data/audio_data
 
 # ─── UTF-8 locale（中文日志/文件安全）───
-export LC_ALL="${LC_ALL:-C.UTF-8}"
-export LANG="${LANG:-C.UTF-8}"
+LC_ALL=C.UTF-8                      # 可选: C.UTF-8 en_US.UTF-8
+LANG=C.UTF-8
+
+# ============================================================
+# 以下为执行逻辑，一般无需修改
+# ============================================================
+export MODEL_PRECISION ENCODER_PRECISION CIF_PRECISION DECODER_PRECISION BIAS_PRECISION
+export WORKS BATCH BATCH_TIMEOUT MAX_CONCURRENT_REQUESTS ACQUIRE_TIMEOUT MAX_AUDIO_DURATION_MS
+export LOG_LEVEL VERBOSE
+export BUCKET_SEQ_LENS VALID_BATCH_SIZES TRT_OPT_SEQ TRT_OPT_BATCH
+export MAX_HOTWORD_NUM OPT_HOTWORD_NUM NFILTER MAX_HOTWORD_LEN
+export DEFAULT_HOTWORD_PATH HOTWORD_RELOAD_ENABLED HOTWORD_POLL_INTERVAL
+export FAISS_WINDOW_SIZES FAISS_TOPK FAISS_PINYIN_WEIGHT FAISS_EDIT_WEIGHT
+export FAISS_SCORE_THRESHOLD GAP_THRESHOLD FINAL_SCORE_THRESHOLD
+export PT_MODEL_DIR CALIB_DATA LC_ALL LANG
 
 # 内部固定端口（对外映射由 docker run -p 决定）
 PORT=8080
