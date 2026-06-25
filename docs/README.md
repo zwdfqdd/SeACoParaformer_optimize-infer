@@ -420,7 +420,7 @@ SeACoParaformer/
 │   ├── attention.py          # SANM Self-Attention / Cross-Attention
 │   ├── layers.py             # LayerNorm / FFN / SinusoidalPositionEncoder
 │   ├── utils.py              # MultiSequential / repeat / make_pad_mask
-│   └── load_model.py         # FunASR Export 模式加载 + 加载本地权重
+│   └── load_model.py         # 加载本地 PT 权重（PT_MODEL_DIR，不依赖 FunASR）
 ├── src/                      # 推理服务源代码
 │   ├── main.py               # FastAPI 入口（三级流水线 + 热词路由 + 热更新接口）
 │   ├── config.py             # 精度矩阵 + bucket/batch + 热词/Faiss 参数（单一数据源）

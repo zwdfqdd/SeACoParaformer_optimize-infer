@@ -52,7 +52,7 @@ class Settings:
     # 运行时可调
     WORKS: int = int(os.getenv("WORKS", "1"))
     BATCH: int = int(os.getenv("BATCH", "12"))
-    PORT: int = int(os.getenv("PORT", "8080"))
+    PORT: int = int(os.getenv("PORT", "8080"))  # 容器内部固定端口（entrypoint 硬编码 8080，对外由 HOST_PORT 映射）
     BATCH_TIMEOUT: int = int(os.getenv("BATCH_TIMEOUT", "10"))  # 毫秒
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     MAX_CONCURRENT_REQUESTS: int = int(os.getenv("MAX_CONCURRENT_REQUESTS", "2000"))
