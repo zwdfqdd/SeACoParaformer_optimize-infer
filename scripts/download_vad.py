@@ -22,7 +22,22 @@ def download_silero_vad(output_dir: Path):
         _verify_model(onnx_path)
         return onnx_path
 
-    # 方式一：直接从 GitHub 下载 ONNX 文件（推荐，无需 torch 依赖）
+    # 方式一：直接从 modelscope 下载 ONNX 文件（推荐，无需 torch 依赖）
+    try:
+        import urllib.request
+
+        url = "https://modelscope.cn/models/pengzhendong/silero-vad/resolve/master/silero_vad.onnx"
+        print(f"正在从 ModelScope 下载 Silero VAD ONNX...")
+        print(f"   URL: {url}")
+        urllib.request.urlretrieve(url, str(onnx_path))
+        print(f"   下载完成: {onnx_path}")
+        _verify_model(onnx_path)
+        return onnx_path
+    except Exception as e:
+        print(f"   直接下载失败 ({e})，尝试github方式...")
+
+
+    # 方式二：直接从 GitHub 下载 ONNX 文件（推荐，无需 torch 依赖）
     try:
         import urllib.request
 
@@ -34,9 +49,10 @@ def download_silero_vad(output_dir: Path):
         _verify_model(onnx_path)
         return onnx_path
     except Exception as e:
-        print(f"   直接下载失败 ({e})，尝试 torch.hub 方式...")
+        print(f"   直接下载失败 ({e})，尝试torch.hub方式...")
 
-    # 方式二：通过 torch.hub 获取
+
+    # 方式三：通过 torch.hub 获取
     try:
         import torch
         import shutil
@@ -62,7 +78,7 @@ def download_silero_vad(output_dir: Path):
     except Exception as e:
         print(f"   torch.hub 方式也失败: {e}")
 
-    # 方式三：通过 pip 包 silero-vad 获取内置 ONNX
+    # 方式四：通过 pip 包 silero-vad 获取内置 ONNX
     try:
         import silero_vad
         import shutil
