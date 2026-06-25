@@ -1,7 +1,9 @@
 """
-模型加载：从 ModelScope 下载 SeACo-Paraformer 权重并加载到 SeacoParaformer。
+模型加载：加载 SeACo-Paraformer 权重到 SeacoParaformer。
 
-依赖：modelscope（仅下载权重文件）。不依赖 funasr 运行时。
+优先从**本地预打包目录**加载（PT_MODEL_DIR，不触发下载）；
+仅当 model_id 为非本地目录的 ModelScope ID 时才在线下载（需额外装 modelscope）。
+不依赖 funasr 运行时。
 """
 
 import os

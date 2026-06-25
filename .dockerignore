@@ -1,0 +1,35 @@
+# 构建上下文裁剪：排除明确不需要进镜像的内容
+# 注意：models/asr/{pt,fp32,int8,split,trt} 视部署策略可能需打进镜像
+#       （PT 权重必须；预构建 engine 可选），故不在此排除。
+
+# 版本控制 / IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+*.swp
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 日志与临时产物
+logs/
+*.log
+report_*.json
+report_*.csv
+tmp_*/
+
+# 未使用的大体积模型词典（代码不引用）
+models/asr/**/seg_dict
+
+# 校准数据（仅本地转换用，不打进镜像）
+calib_data/
+int8/
+
+# Kiro
+.kiro/
