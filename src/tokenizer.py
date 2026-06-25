@@ -198,17 +198,36 @@ class Tokenizer:
         """
         拼接 token 为文本。
 
-        规则：
-        - 中文字符直接拼接
-        - 英文 subword 用 ▁ 分隔（替换为空格）
-        - 去除多余空格
+        本词表（vocab8404）BPE 约定：
+        - 中文字符：独立 token，直接拼接
+        - 英文 subword：用 `@@` 后缀表示"与下一个 token 连接"（如 and@@ + roid → android）
+        - 兼容 sentencepiece `▁` 前缀（若存在则替换为空格）
+
+        拼接规则：
+        - token 以 `@@` 结尾 → 去掉 `@@`，与下一 token 直接相连（无分隔）
+        - 否则该 token 是词尾，英文词之间补空格、中文之间不补
         """
-        text = "".join(tokens)
-        # 处理 sentencepiece 的 ▁ 标记
-        text = text.replace("▁", " ")
-        # 去除首尾空格和多余空格
-        text = " ".join(text.split())
-        return text
+        parts: list[str] = []
+        for tok in tokens:
+            if tok.endswith("@@"):
+                # BPE 连接片段：去后缀，标记不加分隔
+                parts.append((tok[:-2], False))
+            else:
+                parts.append((tok, True))
+
+        out = ""
+        for i, (frag, word_end) in enumerate(parts):
+            frag = frag.replace("▁", " ")
+            out += frag
+            # 词尾且后面还有内容时，若两侧都是 ASCII 字母则补空格（英文分词）
+            if word_end and i < len(parts) - 1:
+                nxt = parts[i + 1][0]
+                if frag[-1:].isascii() and frag[-1:].isalnum() and nxt[:1].isascii() and nxt[:1].isalnum():
+                    out += " "
+
+        # 归一化空格
+        out = " ".join(out.split())
+        return out
 
 
 # 全局单例
