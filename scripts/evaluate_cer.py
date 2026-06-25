@@ -15,19 +15,19 @@ engine 命名约定（models/asr/trt/ 下）：
 
 用法：
     # 默认：fp16 基准 vs int8 待测，阈值 3%
-    python scripts/evaluate_cer.py --audio-dir int8/calib_data/audio_data
+    python scripts/evaluate_cer.py --audio-dir calib_data/audio_data
 
     # 含热词评测
-    python scripts/evaluate_cer.py --audio-dir int8/calib_data/audio_data --hotwords 埃文 账号
+    python scripts/evaluate_cer.py --audio-dir calib_data/audio_data --hotwords 埃文 账号
 
     # 自定义阈值 + 显式指定 engine
-    python scripts/evaluate_cer.py --audio-dir int8/calib_data/audio_data \\
+    python scripts/evaluate_cer.py --audio-dir calib_data/audio_data \\
         --threshold 0.03 \\
         --test-encoder ./models/asr/trt/2080_ti_encoder_int8_qdq.engine \\
         --test-decoder ./models/asr/trt/2080_ti_decoder_int8_qdq.engine
 
     # 导出逐条明细 CSV
-    python scripts/evaluate_cer.py --audio-dir int8/calib_data/audio_data --csv report_cer.csv
+    python scripts/evaluate_cer.py --audio-dir calib_data/audio_data --csv report_cer.csv
 """
 
 import argparse
@@ -216,7 +216,7 @@ def find_engine(engine_dir: Path, module: str, suffix_candidates: list[str]) -> 
 
 def main():
     parser = argparse.ArgumentParser(description="数据集级 CER 批量评测")
-    parser.add_argument("--audio-dir", default="int8/calib_data/audio_data",
+    parser.add_argument("--audio-dir", default="calib_data/audio_data",
                         help="测试音频目录（递归扫描 *.wav）")
     parser.add_argument("--engine-dir", default="./models/asr/trt")
     parser.add_argument("--config-dir", default="./models/asr")

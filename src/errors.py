@@ -21,6 +21,7 @@ class ErrorCode(IntEnum):
     AUDIO_TOO_LONG = 1005
     MODEL_LOAD_FAILED = 1006
     SERVICE_BUSY = 1007
+    HOTWORD_VERSION_CONFLICT = 1008
 
 
 # 错误码 → HTTP Status 映射
@@ -33,6 +34,7 @@ ERROR_HTTP_STATUS: dict[int, int] = {
     ErrorCode.ASR_INFER_FAILED: 500,
     ErrorCode.MODEL_LOAD_FAILED: 500,
     ErrorCode.SERVICE_BUSY: 503,
+    ErrorCode.HOTWORD_VERSION_CONFLICT: 409,
 }
 
 # 错误码 → 默认错误消息
@@ -45,6 +47,7 @@ ERROR_MESSAGES: dict[int, str] = {
     ErrorCode.AUDIO_TOO_LONG: "音频超出最大时长限制",
     ErrorCode.MODEL_LOAD_FAILED: "模型加载失败",
     ErrorCode.SERVICE_BUSY: "服务繁忙，请稍后重试",
+    ErrorCode.HOTWORD_VERSION_CONFLICT: "词表已被其他实例更新，请基于最新版本重试",
 }
 
 

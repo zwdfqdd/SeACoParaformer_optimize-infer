@@ -48,6 +48,11 @@ class ASREngine:
         backend = settings.get_inference_backend()
         logger.info(f"模型精度策略: {precision} (设备: {self._device}, 后端: {backend})")
 
+        if backend == "pt":
+            # PT 原始模型仅用于转换环境，推理服务不支持，回退 ORT fp32
+            logger.warning("backend=pt 在推理服务中不支持，回退 ORT onnx_fp32")
+            backend = "ort"
+
         if backend == "trt":
             if self._load_trt_engines():
                 self._backend = "trt"
@@ -162,8 +167,8 @@ class ASREngine:
     # 预热
     # ============================================================
     def _warmup(self):
-        bucket_seq_lens = [34, 67, 134]
-        batch_sizes = [1, 2, 4, 8, 12]
+        bucket_seq_lens = settings.BUCKET_SEQ_LENS
+        batch_sizes = settings.VALID_BATCH_SIZES
 
         if self._backend == "trt" and self._trt_engine is not None:
             self._trt_engine.warmup(bucket_seq_lens, batch_sizes)

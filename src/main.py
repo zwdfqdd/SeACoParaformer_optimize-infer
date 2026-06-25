@@ -24,6 +24,11 @@ from src.audio_segment import ChunkMeta, extract_chunk_audio, segment_to_chunks
 from src.config import settings
 from src.errors import ASRException, ErrorCode, ERROR_HTTP_STATUS
 from src.feature_extractor import extract_features, load_cmvn
+from src.hotword_manager import (
+    hotword_manager,
+    ValidationError as HotwordValidationError,
+    VersionConflict as HotwordVersionConflict,
+)
 from src.logger import (
     generate_request_id,
     log_request,
@@ -36,6 +41,9 @@ from src.schemas import (
     ASRResponse,
     ErrorResponse,
     HealthResponse,
+    HotwordReloadRequest,
+    HotwordReloadResponse,
+    HotwordStatusResponse,
     SegmentDetail,
 )
 from src.tokenizer import tokenizer
@@ -100,6 +108,14 @@ async def lifespan(app: FastAPI):
     vad_engine.load()
     asr_engine.load()
     await gpu_scheduler.start()
+
+    # 默认词表加载 + 预编码缓存（路径 A）/ 热更新轮询
+    # bias 编码统一收口到 GPU 单线程池（避免 CUDA stream 冲突）
+    from src.scheduler import encode_hotwords_on_gpu
+    hotword_manager.set_encoders(tokenizer.encode, encode_hotwords_on_gpu)
+    hotword_manager.load_initial()
+    hotword_manager.start_polling()
+
     _concurrent_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_REQUESTS)
     # CPU 线程池
     import os
@@ -136,6 +152,7 @@ async def lifespan(app: FastAPI):
 
     # 关闭：优雅停止
     logger.info("服务关闭中...")
+    hotword_manager.stop_polling()
     await gpu_scheduler.stop()
     logger.info("服务已关闭")
 
@@ -190,7 +207,7 @@ def _load_resources():
 # ============================================================
 app = FastAPI(
     title="SeACo-Paraformer ASR Service",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -228,9 +245,97 @@ async def health_check():
 @app.get("/metrics")
 async def metrics():
     """Prometheus 指标接口。"""
+    # scrape 时刷新 GPU 显存实际值（Gauge 标准做法）
+    _update_gpu_memory_metric()
     return JSONResponse(
         content=generate_latest().decode("utf-8"),
         media_type=CONTENT_TYPE_LATEST,
+    )
+
+
+def _update_gpu_memory_metric():
+    """刷新 GPU 显存使用量指标（当前进程占用的显存）。"""
+    if gpu_memory_usage is None:
+        return
+    try:
+        import torch
+        if torch.cuda.is_available():
+            # 已预留显存（reserved）最能反映进程实际占用
+            gpu_memory_usage.set(float(torch.cuda.memory_reserved(0)))
+    except Exception:
+        pass
+
+
+# ============================================================
+# 词表热更新接口（运行时不中断，多 worker 文件轮询收敛）
+# ============================================================
+@app.get("/hotwords/status", response_model=HotwordStatusResponse)
+async def hotwords_status():
+    """查看当前默认词表版本状态（巡检各 worker 收敛）。"""
+    return HotwordStatusResponse(**hotword_manager.status())
+
+
+@app.post("/hotwords/reload", response_model=HotwordReloadResponse)
+async def hotwords_reload(req: HotwordReloadRequest):
+    """
+    重载默认词表（本 worker 立即生效，其他 worker 轮询收敛）。
+
+    - words 与 reload_from_file 二选一
+    - expected_version 乐观并发，与磁盘当前版本不符返回 409
+    - 校验失败返回 400，保留旧词表
+    """
+    if not settings.HOTWORD_RELOAD_ENABLED:
+        raise ASRException(ErrorCode.INPUT_PARAM_FAILED, "词表热更新未开启")
+
+    loop = asyncio.get_event_loop()
+    try:
+        # reload 含文件 IO + bias 预编码，放线程池避免阻塞事件循环
+        cache = await loop.run_in_executor(
+            _cpu_executor,
+            lambda: hotword_manager.reload(
+                words=req.words,
+                reload_from_file=req.reload_from_file,
+                expected_version=req.expected_version,
+            ),
+        )
+    except HotwordVersionConflict as e:
+        raise ASRException(ErrorCode.HOTWORD_VERSION_CONFLICT, str(e))
+    except HotwordValidationError as e:
+        raise ASRException(ErrorCode.INPUT_PARAM_FAILED, f"词表校验失败：{e}")
+    except Exception as e:
+        raise ASRException(ErrorCode.INPUT_PARAM_FAILED, f"词表更新失败：{e}")
+
+    return HotwordReloadResponse(
+        code=0,
+        version=cache.version,
+        md5=cache.md5,
+        count=cache.count,
+        route=cache.route,
+        message=f"词表更新成功，已切换至 version {cache.version}",
+    )
+
+
+@app.post("/hotwords/rollback", response_model=HotwordReloadResponse)
+async def hotwords_rollback():
+    """回滚到上一版默认词表。"""
+    if not settings.HOTWORD_RELOAD_ENABLED:
+        raise ASRException(ErrorCode.INPUT_PARAM_FAILED, "词表热更新未开启")
+
+    loop = asyncio.get_event_loop()
+    try:
+        cache = await loop.run_in_executor(_cpu_executor, hotword_manager.rollback)
+    except HotwordValidationError as e:
+        raise ASRException(ErrorCode.INPUT_PARAM_FAILED, f"回滚失败：{e}")
+    except Exception as e:
+        raise ASRException(ErrorCode.INPUT_PARAM_FAILED, f"回滚失败：{e}")
+
+    return HotwordReloadResponse(
+        code=0,
+        version=cache.version,
+        md5=cache.md5,
+        count=cache.count,
+        route=cache.route,
+        message=f"已回滚至上一版内容（发布为 version {cache.version}）",
     )
 
 
@@ -245,8 +350,22 @@ async def asr_recognize(req: ASRRequest):
 
     多请求间各 Stage 独立并行，CPU/GPU 同时满载。
     """
-    # 并发控制：排队等待，超过 MAX_CONCURRENT_REQUESTS 时自然阻塞
-    await _concurrent_semaphore.acquire()
+    # 并发控制：等待至多 ACQUIRE_TIMEOUT 秒，超时则拒绝（SERVICE_BUSY）。
+    # ACQUIRE_TIMEOUT=0 表示无限等待（不拒绝，退回纯排队语义）。
+    if settings.ACQUIRE_TIMEOUT > 0:
+        try:
+            await asyncio.wait_for(
+                _concurrent_semaphore.acquire(),
+                timeout=settings.ACQUIRE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            asr_request_total.labels(status="error").inc()
+            raise ASRException(
+                ErrorCode.SERVICE_BUSY,
+                f"服务过载，并发已达上限 {settings.MAX_CONCURRENT_REQUESTS}，请稍后重试",
+            )
+    else:
+        await _concurrent_semaphore.acquire()
 
     try:
         rid = generate_request_id()
@@ -277,10 +396,22 @@ async def asr_recognize(req: ASRRequest):
         )
 
         # ====== Stage 2: 特征提取（CPU 线程池） ======
-        # 热词编码（如有）
+        # 热词路由（按生效词表大小三路分流）：
+        #   1) 客户端传 hotwords → 路径 A：实时编码（含 Top-N 截断）
+        #   2) 未传 + 默认词表 route=A（≤MAX_HOTWORD_NUM）→ 复用启动预编码缓存
+        #   3) 未传 + 默认词表 route=B（>MAX_HOTWORD_NUM）→ bias=None（普通 ASR，后续 Faiss 纠错）
         bias_embeddings = None
+        use_faiss_correction = False
         if req.hotwords and asr_engine.has_bias_model:
-            bias_embeddings = _encode_hotwords(req.hotwords)
+            bias_embeddings = await _encode_hotwords(req.hotwords)
+        elif not req.hotwords:
+            default_cache = hotword_manager.cache
+            if default_cache is not None:
+                if default_cache.route == "A":
+                    bias_embeddings = default_cache.bias_embed
+                else:
+                    # route=B：普通 ASR + Faiss 后处理纠错（阶段 4 实现）
+                    use_faiss_correction = True
 
         def _stage2_extract_features():
             t0 = time.time()
@@ -324,7 +455,10 @@ async def asr_recognize(req: ASRRequest):
             chunk_results.append(result)
 
         # ====== 结果合并 ======
-        response = _build_response(chunks, chunk_results, hotwords=req.hotwords)
+        response = _build_response(
+            chunks, chunk_results, hotwords=req.hotwords,
+            use_faiss_correction=use_faiss_correction,
+        )
 
         # 记录日志
         elapsed_ms = (time.time() - start_time) * 1000
@@ -381,21 +515,50 @@ def _decode_audio(b64_str: str) -> tuple[np.ndarray, int, int]:
 
     duration_ms = int(len(pcm) / sample_rate * 1000)
 
-    # 时长限制检查（可选，暂不设上限）
+    # 时长上限检查（MAX_AUDIO_DURATION_MS=0 表示不限制）
+    if settings.MAX_AUDIO_DURATION_MS > 0 and duration_ms > settings.MAX_AUDIO_DURATION_MS:
+        raise ASRException(
+            ErrorCode.AUDIO_TOO_LONG,
+            f"音频时长 {duration_ms/1000:.1f}s 超出上限 "
+            f"{settings.MAX_AUDIO_DURATION_MS/1000:.0f}s",
+        )
+
     return pcm, sample_rate, duration_ms
 
 
-def _encode_hotwords(hotwords: list[str]) -> np.ndarray | None:
+async def _encode_hotwords(hotwords: list[str]) -> np.ndarray | None:
     """
-    将热词列表编码为 bias embeddings。
+    将热词列表编码为 bias embeddings（路径 A：SeACo 在线热词）。
 
-    流程：hotwords → tokenizer.encode → 追加 [sos]=[1] 哨兵 → padding → bias encoder → embeddings
+    流程：hotwords → Top-N 截断 → tokenizer.encode → 追加 [sos]=[1] 哨兵 → padding → bias encoder → embeddings
+
+    超过 MAX_HOTWORD_NUM（默认 256）时截断保留前 N 个并告警，
+    保证 bias 维度恒定、TRT engine profile 无需重建（显存上界固定）。
 
     SeACo 架构要求 hotword 矩阵末尾必须有一行 [sos] 占位（NO_BIAS 标记），
     由模型 SeACo decoder 内部用于"无热词修正"的回退路径。
+
+    bias 编码统一走 GPU 单线程池（gpu_scheduler.encode_hotwords），避免 CUDA stream 冲突。
     """
+    # 过滤空热词
+    valid = [hw for hw in hotwords if hw]
+    if not valid:
+        return None
+
+    # Top-N 截断（超限保留前 N 个 + 告警）
+    max_num = settings.MAX_HOTWORD_NUM
+    if len(valid) > max_num:
+        logger.warning(
+            f"热词数量 {len(valid)} 超过上限 {max_num}，截断保留前 {max_num} 个"
+        )
+        valid = valid[:max_num]
+
     # 将每个热词编码为 token ID 序列
-    encoded = [tokenizer.encode(hw) for hw in hotwords if hw]
+    # 注：此处在 encode 后过滤 OOV（编码为空的词），与预编码缓存路径
+    # （hotword_manager._validate_and_clean 在编码前剔 OOV）行为等价——
+    # 最终行数只会 ≤ MAX_HOTWORD_NUM，加哨兵后 ≤ MAX_HOTWORD_NUM+1，不超 engine profile。
+    encoded = [tokenizer.encode(hw) for hw in valid]
+    encoded = [ids for ids in encoded if ids]
     if not encoded:
         return None
 
@@ -408,20 +571,28 @@ def _encode_hotwords(hotwords: list[str]) -> np.ndarray | None:
     for i, ids in enumerate(encoded):
         padded[i, :len(ids)] = ids
 
-    # 通过 bias encoder 获取 embeddings
-    return asr_engine.encode_hotwords(padded)
+    # 通过 bias encoder 获取 embeddings（GPU 单线程池）
+    return await gpu_scheduler.encode_hotwords(padded)
 
 
 def _build_response(
     chunks: list[ChunkMeta],
     logits_list: list[np.ndarray],
     hotwords: list[str] | None = None,
+    use_faiss_correction: bool = False,
 ) -> ASRResponse:
     """
     构建最终响应。
 
     将各 chunk 的 logits 解码为文本，并恢复原始时间戳。
+    use_faiss_correction=True（路径 B）时，对每段文本做拼音检索纠错。
     """
+    corrector = None
+    if use_faiss_correction:
+        from src.hotword_faiss import faiss_corrector
+        if faiss_corrector.is_ready:
+            corrector = faiss_corrector
+
     detail: dict[str, SegmentDetail] = {}
     full_text_parts: list[str] = []
 
@@ -429,6 +600,10 @@ def _build_response(
         # 解码 logits → 文本（argmax 贪心解码 + tokenizer）
         token_ids = np.argmax(logits, axis=-1).flatten()
         text = tokenizer.decode(token_ids)
+
+        # 路径 B：Faiss 后处理纠错
+        if corrector is not None and text:
+            text = corrector.correct(text)
 
         # 使用原始 VAD 时间戳
         detail[str(i)] = SegmentDetail(

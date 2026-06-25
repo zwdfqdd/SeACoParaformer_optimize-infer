@@ -284,7 +284,11 @@ class TRTEngine:
     # 预热
     # --------------------------------------------------------
     def warmup(self, bucket_seq_lens: list[int], batch_sizes: list[int]):
-        """对每个 (bucket_seq_len, batch_size) 组合执行一次推理。"""
+        """对每个 (bucket_seq_len, batch_size) 组合执行一次推理。
+
+        含热词维度预热：用 OPT/MAX 热词数各跑一次，避免首个带热词请求
+        因 bias_embed 新 shape 触发 TRT 现场优化导致首请求延迟突增。
+        """
         if not self._loaded:
             return
 
@@ -301,6 +305,33 @@ class TRTEngine:
                     count += 1
                 except Exception as e:
                     logger.warning(f"  TRT 预热失败 batch={batch}, seq={seq_len}: {e}")
+
+        # 热词维度预热（bias_encoder + decoder bias_embed 路径）
+        if self.has_bias_encoder:
+            try:
+                from src.config import settings as _settings
+                seq_len = bucket_seq_lens[len(bucket_seq_lens) // 2]  # 主力桶
+                # 用 OPT 与 MAX 热词数各预热一次（含 [sos] 哨兵 +1）
+                hw_nums = sorted({
+                    _settings.OPT_HOTWORD_NUM,
+                    _settings.MAX_HOTWORD_NUM,
+                })
+                hw_count = 0
+                for num in hw_nums:
+                    # 构造 (num+1, L) 热词 token（末行 [sos] 哨兵）
+                    hw_len = min(4, _settings.MAX_HOTWORD_LEN)
+                    hotword_ids = np.ones((num + 1, hw_len), dtype=np.int64)
+                    bias_embed = self.encode_hotwords(hotword_ids)
+                    if bias_embed is None:
+                        break
+                    dummy_feats = np.random.randn(1, seq_len, feat_dim).astype(np.float32)
+                    dummy_lengths = np.full(1, seq_len, dtype=np.int32)
+                    self.infer_batch_raw(dummy_feats, dummy_lengths, bias_embed)
+                    hw_count += 1
+                count += hw_count
+                logger.info(f"  热词维度预热完成（{hw_count} 个热词 shape: {hw_nums}）")
+            except Exception as e:
+                logger.warning(f"  热词维度预热失败（不影响功能）: {e}")
 
         logger.info(f"TRT engine 预热完成（{count} 个 shape）")
 

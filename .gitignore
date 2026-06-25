@@ -17,9 +17,18 @@ env/
 models/asr/**/*.onnx
 models/asr/**/*.bin
 models/asr/**/*.pt
+models/asr/**/seg_dict
 models/vad/**/*.onnx
 models/vad/**/*.pt
 models/vad/**/*.jit
+
+# 推理必需的小配置文件纳入版本控制（显式不忽略）
+!models/asr/config.yaml
+!models/asr/am.mvn
+!models/asr/tokens.json
+!models/asr/tokens.txt
+!models/asr/pt/am.mvn
+!models/asr/pt/tokens.json
 
 # IDE
 .idea/

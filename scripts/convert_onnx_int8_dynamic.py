@@ -9,10 +9,10 @@ ONNX fp32 → int8 动态量化脚本
 
 用法：
     # 转换整个目录
-    python scripts/convert_int8.py --input-dir ./models/asr/fp32 --output-dir ./models/asr/int8
+    python scripts/convert_onnx_int8_dynamic.py --input-dir ./models/asr/fp32 --output-dir ./models/asr/int8
 
     # 转换单个模型
-    python scripts/convert_int8.py --input ./models/asr/fp32/model.onnx --output ./models/asr/int8/model.onnx
+    python scripts/convert_onnx_int8_dynamic.py --input ./models/asr/fp32/model.onnx --output ./models/asr/int8/model.onnx
 
     # 转换后验证（CPU）
     python scripts/verify_onnx.py --audio test_data/audio_16000_30s.wav --onnx-dir ./models/asr/int8 --device cpu

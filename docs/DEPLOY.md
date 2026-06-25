@@ -61,16 +61,18 @@ VERBOSE=0
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | HOST_PORT | 8099 | 宿主机映射端口 |
-| WORKS | 1 | uvicorn workers（GPU 服务必须为 1） |
+| WORKS | 1 | uvicorn workers（默认 1，最小启动成本；可按显存调大） |
 | BATCH | 12 | 最大 batch size（合法值：1,2,4,8,12） |
 | BATCH_TIMEOUT | 10 | batch 等待超时（毫秒） |
 | LOG_LEVEL | INFO | 日志级别（DEBUG/INFO/WARNING/ERROR） |
 | MAX_CONCURRENT_REQUESTS | 2000 | 最大并发请求数 |
-| MODEL_PRECISION | auto | 模型精度选择（auto/fp32/int8） |
+| MODEL_PRECISION | auto | 模型精度选择（见 README MODEL_PRECISION 取值表） |
 | VERBOSE | 0 | 详细日志输出（1=开启，输出各阶段耗时） |
 
-> **重要**：GPU 推理服务 WORKS 必须为 1（单进程模式），靠 asyncio + CPU 线程池实现并发。
-> 多 worker 会导致多进程 fork，空闲时 CPU 占用异常。
+> **WORKS 默认 1**：单进程靠 asyncio + CPU 线程池实现并发，启动成本与显存占用最小。
+> 代码已按多 worker 安全设计——词表热更新通过容器本地文件 + 版本轮询在各 worker 间收敛
+> （见 API.md 词表热更新）。运维可按 GPU 显存调大 WORKS，但每个 worker 进程独立加载
+> 一份 engine + CUDA context，显存随 WORKS 线性增长，需确认显存充足。
 
 ### MODEL_PRECISION 说明
 
@@ -260,14 +262,16 @@ K8s 部署时需确保 `initialDelaySeconds` 大于预热时间，避免 Pod 被
 
 ### 概述
 
-v2 使用 TensorRT 10.6 替代 ORT 进行 GPU 推理，分段模型架构：
-- **encoder**（fp32）+ **cif**（fp16）+ **decoder**（fp16）
-- 相比 v1 ORT fp32，推理速度提升约 2-3x，显存减半
+线上推理使用 TensorRT 10.6 进行 GPU 推理，分段模型架构（encoder/cif/decoder/bias_encoder），
+转换与推理合一镜像：启动时按 `MODEL_PRECISION` 从本地 PT 权重逐级转换出所需产物。
 
-### 构建 TRT 推理镜像
+线上推荐精度 `trt_int8_enc`：encoder int8(QDQ) + cif/decoder/bias fp16
+（encoder 显存减半且 CER≈0，热词精度保留）。
+
+### 构建推理镜像
 
 ```bash
-docker build -f Dockerfile.trt -t seaco-asr:trt .
+docker build -t seaco-asr:latest .
 ```
 
 基础镜像：`nvcr.io/nvidia/tensorrt:24.11-py3`（TRT 10.6 + CUDA 12.6 + PyTorch 2.5）
@@ -275,46 +279,61 @@ docker build -f Dockerfile.trt -t seaco-asr:trt .
 ### 启动服务
 
 ```bash
-# 使用 TRT 专用 docker-compose
-docker-compose -f docker-compose.trt.yml up -d
+docker-compose up -d
 
 # 查看日志
-docker-compose -f docker-compose.trt.yml logs -f seaco-asr-trt
+docker-compose logs -f seaco-asr
 ```
 
 ### 首次启动流程
 
-1. `entrypoint_trt.sh` 检测 TRT engine 是否存在
-2. 不存在则自动构建（约 5-10 分钟）
-3. Engine 缓存到 Docker volume（`trt_engine_cache`），重启不重新构建
+1. `entrypoint.sh` 调用 `prepare_model.py` 按 `MODEL_PRECISION` 检查产物
+2. 缺失则从本地 PT 权重（`PT_MODEL_DIR`，默认 `models/asr/pt`）逐级转换：
+   PT → 分段 ONNX →（QDQ ONNX）→ TRT engine
+3. Engine 写入镜像内 `models/asr/trt/`（容器层，无 volume 持久化）
 4. 启动 uvicorn 服务 + 模型预热
 
 > 首次启动总耗时约 15-20 分钟（engine 构建 + 预热）。
 > K8s 部署时 `start_period` 需设为 900s。
+> 注意：未挂载 engine 缓存 volume，容器**重建**会重新构建 engine（重启不会）。
+> 如需避免重建开销，可在镜像构建期预生成 engine 一并打包。
 
-### Engine 缓存策略
+### 词表热更新的持久化
 
-- 镜像内只打包 ONNX fp32 分段模型
-- 首次启动时自动检测 GPU 并构建对应 engine
-- Engine 缓存到 Docker volume，持久化
-- 不同 GPU 自动生成不同文件名（`{gpu}_{model}_{precision}.engine`）
+默认词表 `models/asr/hotwords.txt` 打包在镜像内，`POST /hotwords/reload` 写入的是
+**容器本地文件**：
+
+- 运行期间：写入立即生效，多 worker 经版本轮询收敛（见 API.md）
+- 容器**重启/重建**：容器层改动丢失，词表回到镜像打包时的版本
+
+如需热更新结果跨容器生命周期持久化，二选一：
+1. 把 `models/asr/hotwords.txt` 所在目录挂载为 volume（reload 写入持久化到宿主机）
+2. 词表纳入镜像构建源，变更走重新构建镜像 + 滚动更新（与 engine 同策略）
+
+> 临时/在线热词建议走客户端 `hotwords` 参数（路径 A），无需改默认词表。
+> 默认大词库变更频率低时，推荐方式 2（镜像即词表，版本可追溯）。
+
+### Engine 生成策略
+
+- 镜像打包本地 PT 权重 + 配置；ONNX/engine 现场生成或预打包
+- 首次启动自动检测 GPU 并构建对应 engine
+- Engine 直接写入容器内 `models/asr/trt/`（不挂载 volume）
+- 不同 GPU 自动生成不同文件名（`{gpu}_{module}_{precision}[_qdq].engine`）
 
 ### 回退机制
 
-- TRT engine 构建失败 → 服务仍可启动（回退 ORT fp32）
+- 目标精度产物准备失败 → 回退 ORT onnx_fp32（现场生成兜底）
 - TRT 推理异常 → 日志告警，返回错误码
 
-### v1 vs v2 对比
+### 精度方案对比
 
-| 维度 | v1（ORT） | v2（TRT） |
-|------|-----------|-----------|
-| 推理引擎 | ONNX Runtime | TensorRT 10.6 |
-| 模型精度 | fp32 | encoder fp32 + cif/decoder fp16 |
-| 推理速度 | 基线 | ~2-3x 提升 |
-| 显存占用 | 基线 | ~50% 减少 |
-| 部署复杂度 | 低 | 中（需 engine 构建） |
-| Dockerfile | Dockerfile | Dockerfile.trt |
-| docker-compose | docker-compose.yml | docker-compose.trt.yml |
+| MODEL_PRECISION | 各段精度(enc/cif/dec/bias) | 显存 | 适用 |
+|---|---|---|---|
+| onnx_fp32 | ORT 整体 fp32 | 基线 | CPU/兜底 |
+| onnx_int8 | ORT 整体 int8 | 减小 | CPU |
+| trt_fp16 | fp16×4 | ~50% | GPU 通用 |
+| **trt_int8_enc** | int8/fp16/fp16/fp16 | 更省 | **线上推荐** |
+| trt_int8 | int8×4（QDQ） | 最省 | cif/bias int8 精度需实测 |
 
 ---
 

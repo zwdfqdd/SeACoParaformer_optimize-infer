@@ -77,7 +77,7 @@ step 3:
 # v2 阶段 2 — INT8 量化（QDQ Explicit Quantization）
 # ============================================================
 # 量化对象：encoder + decoder（cif/bias 保持 fp16）
-# 校准数据：int8/calib_data/audio_data 目录下 16kHz 单声道 WAV（300 条）
+# 校准数据：calib_data/audio_data 目录下 16kHz 单声道 WAV（300 条）
 # 量化方法：QDQ Explicit（nvidia-modelopt 插入 QuantizeLinear/DequantizeLinear 节点）
 #
 # 关键背景：
@@ -96,7 +96,7 @@ step 4:
     # ─── 步骤 1：encoder QDQ 量化 ─────────────────────────────────
     # modelopt INT8 量化 + 校准 → 导出含 QDQ 节点的 ONNX
     python scripts/export_encoder_qdq.py \
-        --calib-data ./int8/calib_data/audio_data \
+        --calib-data ./calib_data/audio_data \
         --output ./models/asr/split/encoder_qdq.onnx
 
     # QDQ ONNX → INT8 engine（QDQ 自带 scale，不需要 calibrator）
@@ -138,15 +138,49 @@ step 4:
     # 基准 fp16（与 PT baseline 一致）vs 待测 int8，阈值 3%
     # 注：当前无真实标注，以 fp16 输出作为参考基准（偏乐观，待后续用标注测试集复核）
     python scripts/evaluate_cer.py \
-        --audio-dir int8/calib_data/audio_data \
+        --audio-dir calib_data/audio_data \
         --threshold 0.03 \
         --csv report_cer.csv
 
     # 含热词评测
     python scripts/evaluate_cer.py \
-        --audio-dir int8/calib_data/audio_data \
+        --audio-dir calib_data/audio_data \
         --hotwords 埃文 账号 \
         --threshold 0.03
+
+step 5:
+    # ─── 全 INT8（trt_int8）：补充 cif + bias QDQ ──────────────────
+    # 仅在需要 trt_int8（4 段全 int8）时执行；线上推荐 trt_int8_enc 无需此步。
+    # cif/bias int8 精度需实测，未达标可回退 fp16（即 trt_int8_enc）。
+
+    # cif QDQ（需 fp16 encoder engine 生成校准输入；cumsum 路径天然不量化）
+    python scripts/export_cif_qdq.py \
+        --calib-data ./calib_data/audio_data \
+        --encoder-engine ./models/asr/trt/2080_ti_encoder_fp16.engine \
+        --output ./models/asr/split/cif_qdq.onnx
+    python scripts/convert_trt.py \
+        --input ./models/asr/split/cif_qdq.onnx \
+        --precision int8 --profile cif \
+        --output ./models/asr/trt/2080_ti_cif_int8_qdq.engine
+
+    # bias QDQ（自包含，用词表编码 token 校准）
+    python scripts/export_bias_qdq.py \
+        --hotword-file ./models/asr/hotwords.txt \
+        --output ./models/asr/split/bias_encoder_qdq.onnx
+    python scripts/convert_trt.py \
+        --input ./models/asr/split/bias_encoder_qdq.onnx \
+        --precision int8 --profile bias \
+        --output ./models/asr/trt/2080_ti_bias_encoder_int8_qdq.engine
+
+    # 验证：4 段全 int8
+    python tests/test_trt_pipeline.py --audio test_data/audio_16000_10s.wav \
+        --encoder-precision int8 --cif-precision int8 \
+        --decoder-precision int8 --bias-precision int8 \
+        --encoder-engine ./models/asr/trt/2080_ti_encoder_int8_qdq.engine \
+        --cif-engine ./models/asr/trt/2080_ti_cif_int8_qdq.engine \
+        --decoder-engine ./models/asr/trt/2080_ti_decoder_int8_qdq.engine \
+        --bias-engine ./models/asr/trt/2080_ti_bias_encoder_int8_qdq.engine \
+        --hotwords 埃文 账号
 
 # ============================================================
 # v2 阶段 2 INT8 成果（2080 Ti）

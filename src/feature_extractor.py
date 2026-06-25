@@ -62,6 +62,11 @@ def extract_features(
         snip_edges=True,
     )  # (num_frames, 80)
 
+    # 防御：极短音频（< 1 帧，snip_edges 下 <25ms）可能产生 0 帧。
+    # 正常管线有 VAD min-speech(250ms) + 桶下限(2s) 双重兜底，此处仅防直接调用崩溃。
+    if mat.shape[0] == 0:
+        return np.zeros((0, NUM_MEL_BINS * LFR_M), dtype=np.float32)
+
     # Step 2: LFR
     lfr_feats = _apply_lfr(mat, LFR_M, LFR_N)  # (T_lfr, 560)
 

@@ -108,17 +108,25 @@ def load_model(
     """加载 SeACo-Paraformer 模型。
 
     Args:
-        model_id: ModelScope 模型 ID
+        model_id: ModelScope 模型 ID，或**本地模型目录路径**（含权重文件）。
+                  若为已存在的本地目录，直接加载，不触发 ModelScope 下载。
         device: 'cpu' 或 'cuda'
-        cache_dir: 模型缓存目录
+        cache_dir: 模型缓存目录（仅在线下载时用）
         config: 自定义配置，None 时使用 DEFAULT_CONFIG
 
     Returns:
         model: SeacoParaformer 实例（已加载权重，eval 模式）
     """
     cfg = config or DEFAULT_CONFIG
-    logger.info(f"下载模型: {model_id}")
-    model_dir = _download_model(model_id, cache_dir)
+
+    # 优先支持本地预打包模型目录（不触发下载）
+    if os.path.isdir(model_id):
+        model_dir = model_id
+        logger.info(f"使用本地模型目录: {model_dir}")
+    else:
+        logger.info(f"下载模型: {model_id}")
+        model_dir = _download_model(model_id, cache_dir)
+
     ckpt_path = _find_checkpoint(model_dir)
     logger.info(f"权重文件: {ckpt_path}")
 

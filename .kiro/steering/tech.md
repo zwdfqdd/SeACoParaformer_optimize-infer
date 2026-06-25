@@ -27,9 +27,8 @@
 ## 构建与依赖管理
 
 - `pip` + `requirements.txt` 管理 Python 依赖
-- requirements-convert.txt：模型转换环境（含 FunASR/ModelScope）
-- requirements-infer.txt：推理服务环境（轻量化）
-- Docker 多阶段构建分离转换和推理环境
+- requirements-infer.txt：推理 + 现场转换统一依赖（转换推理合一镜像）
+- Docker 单镜像：TRT 基础镜像内完成 PT→ONNX→engine 转换 + 推理
 
 ## 常用命令
 
@@ -43,12 +42,17 @@ python -m uvicorn src.main:app --host 0.0.0.0 --port 8080
 # 运行测试
 python tests/test_single.py --audio test_data/audio_16000_30s.wav
 
-# 模型转换（转换环境）
-python scripts/export_onnx.py --skip-fp16 --output-dir ./models/asr
-python scripts/convert_int8.py --input-dir ./models/asr/fp32 --output-dir ./models/asr/int8
+# 启动服务（容器内 entrypoint 自动按精度准备模型）
+python scripts/prepare_model.py --precision trt_int8_enc
+python -m uvicorn src.main:app --host 0.0.0.0 --port 8080
 
-# TRT 转换（v2）
-python scripts/convert_trt.py --input ./models/asr/fp32/model.onnx --precision fp16
+# 整体 ONNX 导出 + int8 动态量化（onnx_fp32 / onnx_int8）
+python scripts/export_onnx_whole.py --skip-fp16 --output-dir ./models/asr
+python scripts/convert_onnx_int8_dynamic.py --input-dir ./models/asr/fp32 --output-dir ./models/asr/int8
+
+# 分段 ONNX 导出 + TRT 转换（trt 系列）
+python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 30000
+python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp16 --profile encoder
 ```
 
 ## 开发规范

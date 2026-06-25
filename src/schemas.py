@@ -44,3 +44,36 @@ class HealthResponse(BaseModel):
     status: str = Field(default="ok")
     device: str = Field(..., description="当前推理设备")
     models_loaded: bool = Field(..., description="模型是否已加载")
+
+
+class HotwordReloadRequest(BaseModel):
+    """词表热更新请求。words 与 reload_from_file 二选一。"""
+    words: list[str] | None = Field(
+        default=None, description="新词表内容（与 reload_from_file 二选一）"
+    )
+    reload_from_file: bool = Field(
+        default=False, description="true 表示重读磁盘 hotwords.txt"
+    )
+    expected_version: int | None = Field(
+        default=None, description="乐观并发版本号，与当前不符则拒绝"
+    )
+
+
+class HotwordReloadResponse(BaseModel):
+    """词表热更新响应。"""
+    code: int = Field(default=0)
+    version: int = Field(..., description="更新后的词表版本号")
+    md5: str = Field(..., description="词表内容哈希")
+    count: int = Field(..., description="有效词条数")
+    route: str = Field(..., description="生效路径 A（SeACo）或 B（Faiss）")
+    message: str = Field(default="")
+
+
+class HotwordStatusResponse(BaseModel):
+    """词表状态响应。"""
+    version: int = Field(default=0)
+    md5: str = Field(default="")
+    count: int = Field(default=0)
+    route: str | None = Field(default=None)
+    loaded_at: str | None = Field(default=None)
+    cache_ready: bool = Field(default=False)

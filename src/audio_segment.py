@@ -15,14 +15,21 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from src.config import settings
 from src.errors import ASRException, ErrorCode
 from src.vad import VADSegment
 
 
-# 桶边界（毫秒）
-BUCKET_MS = [2000, 4000, 8000]
-MIN_BUCKET_MS = BUCKET_MS[0]   # 2s
-MAX_BUCKET_MS = BUCKET_MS[-1]  # 8s
+# 桶边界（毫秒）：从 config 的 LFR 帧数桶派生，保证与 scheduler/TRT profile 单一数据源一致。
+#   1 LFR 帧 = LFR_N(6) × FRAME_SHIFT_MS(10) = 60ms
+# 例：帧数 [34,67,134] → ms [2040,4020,8040]（≈2s/4s/8s）
+_MS_PER_LFR_FRAME = 60
+BUCKET_MS = [int(f * _MS_PER_LFR_FRAME) for f in settings.BUCKET_SEQ_LENS]
+MIN_BUCKET_MS = BUCKET_MS[0]   # 最小桶
+MAX_BUCKET_MS = BUCKET_MS[-1]  # 最大桶
+# 切分上限留 1 帧（60ms）余量：避免 int 取整边界下特征帧数恰好溢出最大桶（134）
+# 导致 scheduler 截断丢失尾帧。切分按此上限，归桶仍用 MAX_BUCKET_MS。
+SPLIT_MAX_MS = MAX_BUCKET_MS - _MS_PER_LFR_FRAME
 
 
 @dataclass
@@ -100,9 +107,9 @@ def _merge_short_segments(segments: list[VADSegment]) -> list[dict]:
 
     for i in range(1, len(segments)):
         seg = segments[i]
-        # 尝试合并：合并后总时长不超过最大桶
+        # 尝试合并：合并后总时长不超过安全上限（留 1 帧余量）
         merged_duration = seg.end_ms - current_start
-        if merged_duration <= MAX_BUCKET_MS:
+        if merged_duration <= SPLIT_MAX_MS:
             # 合并
             current_end = seg.end_ms
         else:
@@ -119,19 +126,19 @@ def _merge_short_segments(segments: list[VADSegment]) -> list[dict]:
 
 def _split_long_segments(segments: list[dict]) -> list[dict]:
     """
-    Step 2: 超长段按 8s 切分。
+    Step 2: 超长段按最大桶切分（留 1 帧余量，避免特征帧溢出最大桶被截断）。
     """
     result = []
     for seg in segments:
         duration = seg["end_ms"] - seg["start_ms"]
-        if duration <= MAX_BUCKET_MS:
+        if duration <= SPLIT_MAX_MS:
             result.append(seg)
         else:
             current_start = seg["start_ms"]
             while current_start < seg["end_ms"]:
-                chunk_end = min(current_start + MAX_BUCKET_MS, seg["end_ms"])
+                chunk_end = min(current_start + SPLIT_MAX_MS, seg["end_ms"])
                 result.append({"start_ms": current_start, "end_ms": chunk_end})
-                current_start += MAX_BUCKET_MS
+                current_start += SPLIT_MAX_MS
     return result
 
 
@@ -148,7 +155,7 @@ def _merge_trailing_short(segments: list[dict]) -> list[dict]:
     if last_duration < MIN_BUCKET_MS and len(segments) >= 2:
         prev = segments[-2]
         merged_duration = last["end_ms"] - prev["start_ms"]
-        if merged_duration <= MAX_BUCKET_MS:
+        if merged_duration <= SPLIT_MAX_MS:
             # 合并到前一段
             segments[-2] = {"start_ms": prev["start_ms"], "end_ms": last["end_ms"]}
             segments = segments[:-1]

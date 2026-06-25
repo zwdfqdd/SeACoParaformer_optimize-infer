@@ -2,149 +2,116 @@
 
 ## 模型更新流程
 
-当需要更新 ASR 模型版本时：
+当需要更新 ASR 模型版本或重新导出 ONNX/TRT engine 时，参考本指南。
 
 ### 1. 模型代码框架
 
-项目内置了完整的 SeACo-Paraformer 模型定义（`seaco_paraformer/` 目录），不依赖 FunASR：
+项目内置完整的 SeACo-Paraformer 模型定义（`seaco_paraformer/` 目录），**不依赖 FunASR 运行时**：
 
 ```
 seaco_paraformer/
 ├── __init__.py          # 包入口
-├── model.py             # SeACoParaformer 主模型
-├── encoder.py           # SANMEncoder (50层 Pre-Norm)
-├── decoder.py           # ParaformerSANMDecoder (16+1层)
-├── predictor.py         # CifPredictorV3 + cif_v1_export
-├── attention.py         # MultiHeadedAttentionSANM (FSMN+Attention)
-├── layers.py            # LayerNorm, FFN, SinusoidalPositionEncoder
-├── utils.py             # MultiSequential, repeat, make_pad_mask
-└── load_model.py        # 从 ModelScope 加载权重
+├── model.py             # SeacoParaformer 主模型
+├── encoder.py           # SANMEncoder + EncoderLayerSANM（含 clamp_value 参数）
+├── decoder.py           # ParaformerSANMDecoder + DecoderLayerSANM
+├── predictor.py         # CifPredictorV3 + cif / cif_v1_export（向量化，TRT 兼容）
+├── attention.py         # SANM Self-Attention / Cross-Attention（FSMN）
+├── layers.py            # LayerNorm / FFN / SinusoidalPositionEncoder
+├── utils.py             # MultiSequential / repeat / make_pad_mask
+└── load_model.py        # 加载本地 PT 权重（PT_MODEL_DIR）
 ```
 
-依赖：`torch` + `torchaudio` + `numpy` + `modelscope`（仅下载权重）
+PT 权重提前下载并打包进 `models/asr/pt/`（默认 `PT_MODEL_DIR`），不在运行时下载。
 
-### 2. 导出 ONNX 模型
+### 2. 启动编排（推荐方式）
+
+线上不手动逐条执行转换命令，统一由 `prepare_model.py` 按 `MODEL_PRECISION`
+检查产物，缺失则从本地 PT 权重按依赖链逐级转换：
 
 ```bash
-# 分段导出 encoder/cif/decoder（推荐，用于 TRT）
-python scripts/export_onnx_split.py --output-dir ./models/asr/split
+# 检查 + 按需构建（容器 entrypoint.sh 自动调用）
+python scripts/prepare_model.py --precision trt_int8_enc
 
-# 截断 encoder 导出（验证前 N 层精度）
-python scripts/export_encoder_truncated.py --num-layers 40
-
-# 截断 decoder 导出
-python scripts/export_decoder_truncated.py --num-layers 12
-
-# encoder clamp 导出（fp16 安全版，残差 Add 后 clamp）
-python scripts/export_encoder_clamped.py --num-layers 40 --clamp-start 2
-
-# v1 整体导出（完整模型）
-python scripts/export_onnx.py --output-dir ./models/asr
+# 仅检查不构建
+python scripts/prepare_model.py --precision trt_fp16 --check-only
 ```
 
-### 3. 精度验证
-
-```bash
-# 验证截断后精度（对比全模型 vs 截断模型 CER）
-python scripts/verify_truncated.py --audio test_data/audio_16000_30s.wav --encoder-layers 40
-python scripts/verify_truncated.py --audio test_data/audio_16000_30s.wav --decoder-layers 12
-
-# 分析 encoder fp16 溢出（值域分析）
-python scripts/analyze_encoder_value_range.py --onnx models/asr/split/encoder.onnx --audio test_data/audio_16000_10s.wav
-
-# PT 模型推理测试
-python tests/test_pt_inference.py --audio test_data/audio_16000_30s.wav --device cuda
+依赖链：
+```
+PT 权重 → 分段 ONNX（export_onnx_split.py）→ TRT fp32/fp16 engine（convert_trt.py）
+                                          → QDQ ONNX（export_{encoder,cif,decoder,bias}_qdq.py）→ TRT int8 engine
+       → 整体 ONNX（export_onnx_whole.py）→ int8 动态量化（convert_onnx_int8_dynamic.py）
 ```
 
-### 4. TRT Engine 转换
+### 3. 手动导出 + 转换（开发调试）
+
+完整流程见 `step_run.sh`，关键命令：
 
 ```bash
-# Encoder — fp32（fp16 需要 clamp 版本）
-python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp32 --profile encoder
+# 分段 ONNX 导出（opset 17 + clamp 30000，纯 fp16 关键）
+python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 30000
 
-# Encoder — fp16（使用 clamped 版本）
-python scripts/convert_trt.py --input ./models/asr/split/encoder_40layers_clamped.onnx --precision fp16 --profile encoder
-
-# CIF — fp16
+# TRT fp16（纯 fp16，无 fp32 fallback）
+python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp16 --profile encoder
 python scripts/convert_trt.py --input ./models/asr/split/cif.onnx --precision fp16 --profile cif
-
-# Decoder — fp16
 python scripts/convert_trt.py --input ./models/asr/split/decoder.onnx --precision fp16 --profile decoder
-```
+python scripts/convert_trt.py --input ./models/asr/split/bias_encoder.onnx --precision fp16 --profile bias
 
-### 5. int8 量化（CPU 部署）
+# 整体 ONNX（v1 ORT 路径）+ int8 动态量化（CPU）
+python scripts/export_onnx_whole.py --output-dir ./models/asr --skip-fp16
+python scripts/convert_onnx_int8_dynamic.py --input-dir ./models/asr/fp32 --output-dir ./models/asr/int8
 
-```bash
-python scripts/convert_int8.py --input-dir ./models/asr/fp32 --output-dir ./models/asr/int8
-```
-
-### 6. 下载 VAD 模型
-
-```bash
+# VAD 模型
 python scripts/download_vad.py --output-dir ./models/vad
+```
+
+### 4. 精度验证
+
+```bash
+# PT baseline（独立包推理）
+python tests/test_pt_inference_v2.py --audio test_data/audio_16000_10s.wav --hotwords 埃文 账号
+
+# ORT 分段串联验证
+python tests/test_split_onnx_pipeline.py --audio test_data/audio_16000_10s.wav --device cuda --hotwords 埃文 账号
+
+# TRT 分段验证（各段独立精度）
+python tests/test_trt_pipeline.py --audio test_data/audio_16000_10s.wav \
+    --encoder-precision fp16 --cif-precision fp16 \
+    --decoder-precision fp16 --bias-precision fp16 --hotwords 埃文 账号
+
+# 数据集级 CER 评测（基准 fp16 vs 待测 int8）
+python scripts/evaluate_cer.py --audio-dir calib_data/audio_data --csv report_cer.csv
 ```
 
 ---
 
-## v2 TRT 分段模型导出与转换
+## v2 TRT 分段模型架构
 
-### 概述
+模型拆分为四个子模型独立转换（含热词支持）：
 
-v2 使用 TensorRT 替代 ORT 进行 GPU 推理，将模型拆分为四个子模型独立转换（含热词支持）：
-
-| 子模型 | 功能 | 精度 | 说明 |
-|--------|------|------|------|
-| encoder.onnx | 语音编码 | fp32 | fp16 精度崩溃，需混合精度优化 |
+| 子模型 | 功能 | 推荐精度 | 说明 |
+|--------|------|----------|------|
+| encoder.onnx | 语音编码 | fp16 | opset 17 + clamp 30000，纯 fp16 不崩溃 |
 | cif.onnx | CIF 预测器 | fp16 | 向量化实现（cumsum+bmm），TRT 兼容 |
-| decoder.onnx | 解码器+SeACo | fp32 | 含 ASF + SeACo decoder + 热词合并 |
+| decoder.onnx | 解码器+SeACo | fp16 | 含 ASF + SeACo decoder + 热词合并 |
 | bias_encoder.onnx | 热词编码器 | fp16 | LSTM 编码热词 token IDs |
 
-### 分段导出流程
+> 历史问题：早期 encoder/decoder 全 fp16 会精度崩溃（残差 Add 溢出 inf）。
+> 现已通过 **opset 17 原生 LayerNormalization + encoder 残差 Add clamp 30000**
+> 实现纯 fp16，无需任何 fp32 fallback（详见 docs/README.md）。
 
-```bash
-# 在转换容器内执行（需要 funasr==1.3.1）
-python scripts/export_onnx_split.py --output-dir ./models/asr/split
-```
+### 纯 fp16 三大关键技术
 
-导出产物：
-```
-models/asr/split/
-├── encoder.onnx        # Encoder（~604MB）
-├── cif.onnx            # CIF Predictor（~22MB）
-├── decoder.onnx        # Decoder + SeACo（~287MB）
-└── bias_encoder.onnx   # 热词编码器（~32MB）
-```
+1. **opset 17 LayerNormalization 单节点**：TRT 10.6 内部对该算子自动 fp32 累加
+2. **encoder 残差 Add 后 clamp 30000**：≫ PT 真实峰值 ~7554，≪ fp16 上限 65504
+3. **纯 trtexec --fp16**：无需 Python TRT API / OBEY_PRECISION_CONSTRAINTS / 手动 fallback
 
-### TRT Engine 转换
+### INT8 量化（QDQ Explicit）
 
-```bash
-# 在 TRT 容器内执行（nvcr.io/nvidia/tensorrt:24.11-py3）
-
-# Encoder — fp32（fp16 精度崩溃）
-python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp32 --profile encoder
-
-# CIF — fp16
-python scripts/convert_trt.py --input ./models/asr/split/cif.onnx --precision fp16 --profile cif
-
-# Decoder+SeACo — fp32（fp16 精度崩溃）
-python scripts/convert_trt.py --input ./models/asr/split/decoder.onnx --precision fp32 --profile decoder
-
-# Bias Encoder — fp16
-python scripts/convert_trt.py --input ./models/asr/split/bias_encoder.onnx --precision fp16 --profile bias
-```
-
-### 验证分段模型
-
-```bash
-# PT Export 模式验证（含热词）
-python tests/test_pt_export_inference.py --audio test_data/audio_16000_30s.wav --hotwords 埃文 账号
-
-# ORT 验证
-python tests/test_split_onnx_pipeline.py --audio test_data/audio_16000_30s.wav --device cuda --hotwords 埃文 账号
-
-# TRT 验证（fp32，含热词）
-python tests/test_trt_pipeline.py --audio test_data/audio_16000_30s.wav --precision fp32 --hotwords 埃文 账号
-```
+- 量化库：`nvidia-modelopt==0.21.0`（必须钉版本，0.44+ 破坏 torch 环境）
+- 方案：QDQ Explicit（插入 Q/DQ 节点显式标记量化边界），Calibrator Implicit 在 SeACo 架构上无效
+- encoder QDQ：`export_encoder_qdq.py`；decoder QDQ：`export_decoder_qdq.py`（默认排除 SeACo 路径保 fp16）
+- cif QDQ：`export_cif_qdq.py`（trt_int8 用）；bias QDQ：`export_bias_qdq.py`（trt_int8 用）
 
 ### 热词推理流程
 
@@ -156,7 +123,7 @@ speech → encoder → cif → acoustic_embeds + encoder_out + bias_embed → de
 
 SeACo 内部：
 1. 主 decoder → logits + hidden
-2. ASF（注意力分数过滤）→ top-51 热词
+2. ASF（注意力分数过滤）→ top-NFILTER(50) 热词
 3. SeACo decoder × 2（query=acoustic_embeds / hidden，memory=filtered_hotwords）
 4. merged → hotword_output_layer → dha_logits
 5. NO_BIAS mask 合并：`logits * mask + dha_logits * (1-mask)`
@@ -164,29 +131,20 @@ SeACo 内部：
 Engine 产物（按 GPU 命名）：
 ```
 models/asr/trt/
-├── 2080_ti_encoder_fp32.engine
+├── 2080_ti_encoder_fp16.engine
 ├── 2080_ti_cif_fp16.engine
-├── 2080_ti_decoder_fp32.engine
-└── 2080_ti_bias_encoder_fp16.engine
+├── 2080_ti_decoder_fp16.engine
+├── 2080_ti_bias_encoder_fp16.engine
+└── {gpu}_{module}_int8_qdq.engine   # int8 QDQ 产物
 ```
 
 > **注意**：TRT engine 与 GPU 硬件绑定，不同 GPU 需分别构建。
 
-### Encoder 精度分析（混合精度优化）
-
-Encoder 全 fp16 会导致精度崩溃（残差连接溢出 inf），需要逐层分析定位敏感层：
+### engine 层精度诊断
 
 ```bash
-# 第一轮：全 fp16 分析，定位问题层
-python scripts/analyze_encoder_precision.py --audio test_data/audio_16000_10s.wav
-
-# 第二轮：指定问题层 fallback fp32，继续分析
-python scripts/analyze_encoder_precision.py --audio test_data/audio_16000_10s.wav \
-    --fp32-layers-from report_encoder_precision.json
-
-# 按类别批量 fallback
-python scripts/analyze_encoder_precision.py --audio test_data/audio_16000_10s.wav \
-    --fp32-pattern "norm" "Softmax"
+# 查看 engine 各层精度分布（判断 INT8 是否真正生效）
+python scripts/inspect_engine_precision.py --engine models/asr/trt/2080_ti_encoder_int8_qdq.engine
 ```
 
 ---
@@ -197,15 +155,17 @@ python scripts/analyze_encoder_precision.py --audio test_data/audio_16000_10s.wa
 - 文档和日志：中文
 - 不自动生成测试文件
 - 未明确要求创建新文件时，在原文件上修改
+- 涉及中文内容的文件编辑只用代码编辑工具（避免 shell 文本替换导致编码损坏）
 
 ## 目录结构
 
 | 目录 | 用途 |
 |------|------|
+| seaco_paraformer/ | 模型代码框架（独立，不依赖 FunASR 运行时） |
 | src/ | 服务源代码 |
-| scripts/ | 工具脚本（导出、转换、验证、分析） |
+| scripts/ | 工具脚本（导出、转换、量化、评测、编排） |
 | models/ | 模型文件（不纳入 Git） |
 | configs/ | 配置文件 |
 | docs/ | 文档 |
-| logs/ | 运行日志（按天轮转） |
+| logs/ | 运行日志（按天轮转，多 worker 按 PID 分文件） |
 | tests/ | 测试代码 |

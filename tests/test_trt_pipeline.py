@@ -98,6 +98,7 @@ def find_engine(engine_dir: Path, keyword: str, precision: str) -> str:
     """按关键字 + 精度查找 engine 文件。
 
     严格匹配格式 {gpu}_{keyword}_{precision}.engine，区分 'encoder' 和 'bias_encoder'。
+    int8 精度优先匹配带 _qdq 后缀的 QDQ 量化产物。
     """
     candidates = list(engine_dir.glob("*.engine"))
 
@@ -106,10 +107,19 @@ def find_engine(engine_dir: Path, keyword: str, precision: str) -> str:
         if not filename.endswith(".engine"):
             return False
         stem = filename[:-7]  # 去掉 ".engine"
-        suffix = f"_{prec}"
-        if not stem.endswith(suffix):
-            return False
-        stem_no_prec = stem[:-len(suffix)]
+        # int8 允许 _qdq 后缀
+        if prec == "int8":
+            if stem.endswith("_int8_qdq"):
+                stem_no_prec = stem[:-len("_int8_qdq")]
+            elif stem.endswith("_int8"):
+                stem_no_prec = stem[:-len("_int8")]
+            else:
+                return False
+        else:
+            suffix = f"_{prec}"
+            if not stem.endswith(suffix):
+                return False
+            stem_no_prec = stem[:-len(suffix)]
         # stem_no_prec 应该以 _{kw} 结尾
         if not stem_no_prec.endswith(f"_{kw}"):
             return False
@@ -120,7 +130,13 @@ def find_engine(engine_dir: Path, keyword: str, precision: str) -> str:
                 return False
         return True
 
-    # 优先匹配指定 precision
+    # int8 优先匹配 _qdq 后缀
+    if precision == "int8":
+        for f in candidates:
+            if f.name.endswith("_qdq.engine") and matches(f.name, keyword, precision):
+                return str(f)
+
+    # 匹配指定 precision
     for f in candidates:
         if matches(f.name, keyword, precision):
             return str(f)

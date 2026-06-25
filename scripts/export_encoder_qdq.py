@@ -94,11 +94,11 @@ def load_calib_features(audio_dir: str, cmvn_path: str, calib_seq_len: int = 134
 # ============================================================
 # EncoderWrapper（与 export_onnx_split.py 一致）
 # ============================================================
-def build_encoder_wrapper(clamp_value: float):
+def build_encoder_wrapper(clamp_value: float, model_id: str = None):
     from seaco_paraformer.load_model import load_model
     from scripts.export_onnx_split import EncoderWrapper
 
-    model = load_model()
+    model = load_model(model_id) if model_id else load_model()
     if clamp_value and clamp_value > 0:
         for layer in model.encoder.encoders0:
             layer.clamp_value = clamp_value
@@ -200,7 +200,7 @@ def quantize_with_pytorch_quantization(wrapper, calib_feats, output_path, opset,
 
 def main():
     parser = argparse.ArgumentParser(description="Encoder QDQ 量化导出（方案 1）")
-    parser.add_argument("--calib-data", default="./int8/calib_data/audio_data", help="校准音频目录")
+    parser.add_argument("--calib-data", default="./calib_data/audio_data", help="校准音频目录")
     parser.add_argument("--cmvn-path", default="./models/asr/am.mvn")
     parser.add_argument("--output", default="./models/asr/split/encoder_qdq.onnx")
     parser.add_argument("--opset", type=int, default=17)
@@ -210,6 +210,8 @@ def main():
     parser.add_argument("--backend", default=None,
                         choices=["modelopt", "pytorch_quantization"],
                         help="强制指定量化库（默认自动检测）")
+    parser.add_argument("--model-id", default=None,
+                        help="PT 模型 ID 或本地目录路径（默认 ModelScope 在线）")
     args = parser.parse_args()
 
     backend = detect_backend(args.backend)
@@ -222,7 +224,7 @@ def main():
     print("=" * 60)
 
     print("\n[1/3] 加载 encoder...")
-    wrapper = build_encoder_wrapper(args.clamp_value)
+    wrapper = build_encoder_wrapper(args.clamp_value, args.model_id)
 
     print("\n[2/3] 加载校准数据...")
     calib_feats = load_calib_features(

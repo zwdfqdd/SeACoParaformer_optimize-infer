@@ -110,12 +110,12 @@ def detect_backend(prefer: str | None = None) -> str:
     sys.exit("未找到量化库，请安装 nvidia-modelopt==0.21.0 torchprofile")
 
 
-def build_decoder_wrapper():
+def build_decoder_wrapper(model_id: str = None):
     """加载 DecoderWithSeACoWrapper。"""
     from seaco_paraformer.load_model import load_model
     from scripts.export_onnx_split import DecoderWithSeACoWrapper
 
-    model = load_model()
+    model = load_model(model_id) if model_id else load_model()
     wrapper = DecoderWithSeACoWrapper(model)
     wrapper.eval()
     return wrapper
@@ -277,7 +277,7 @@ def quantize_with_modelopt(wrapper, samples, output_path, opset, calib_tok_len, 
 
 def main():
     parser = argparse.ArgumentParser(description="Decoder QDQ 量化导出（方案 1）")
-    parser.add_argument("--calib-data", default="./int8/calib_data/audio_data")
+    parser.add_argument("--calib-data", default="./calib_data/audio_data")
     parser.add_argument("--cmvn-path", default="./models/asr/am.mvn")
     parser.add_argument("--encoder-engine", required=True, help="上游 encoder fp16 engine")
     parser.add_argument("--cif-engine", required=True, help="上游 cif fp16 engine")
@@ -293,6 +293,8 @@ def main():
                         help="排除量化的模块名模式（保持 fp16）。"
                              "默认排除 SeACo 热词路径（数值敏感，INT8 会破坏热词修正）。"
                              "传空 [] 则全部量化。")
+    parser.add_argument("--model-id", default=None,
+                        help="PT 模型 ID 或本地目录路径（默认 ModelScope 在线）")
     args = parser.parse_args()
 
     backend = detect_backend(args.backend)
@@ -306,7 +308,7 @@ def main():
     print("=" * 60)
 
     print("\n[1/3] 加载 decoder...")
-    wrapper = build_decoder_wrapper()
+    wrapper = build_decoder_wrapper(args.model_id)
 
     print("\n[2/3] 用 fp16 encoder+cif 生成 decoder 校准输入...")
     samples = collect_decoder_inputs(

@@ -20,14 +20,23 @@ from src.config import settings
 from src.errors import ASRException, ErrorCode
 from src.logger import logger
 
-# 桶边界（LFR 帧数）：2s→34, 4s→67, 8s→134
-BUCKET_SEQ_LENS = [34, 67, 134]
-
-# 合法 batch sizes
-VALID_BATCH_SIZES = [1, 2, 4, 8, 12]
+# 桶边界 / 合法 batch：统一来自 config（单一数据源，与 TRT profile 一致）
+BUCKET_SEQ_LENS = settings.BUCKET_SEQ_LENS
+VALID_BATCH_SIZES = settings.VALID_BATCH_SIZES
 
 # GPU 专用线程池（单线程串行推理）
 _gpu_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
+
+
+def encode_hotwords_on_gpu(hotword_token_ids: np.ndarray) -> np.ndarray | None:
+    """
+    同步版热词 bias 编码，统一收口到 GPU 单线程池。
+
+    供热词管理器（启动加载 / reload / 轮询线程等同步上下文）调用，
+    与主推理共用同一 GPU 线程，避免 CUDA stream 冲突。
+    阻塞等待结果（bias_encoder 推理为毫秒级）。
+    """
+    return _gpu_executor.submit(asr_engine.encode_hotwords, hotword_token_ids).result()
 
 
 def get_bucket_idx(seq_len: int) -> int:
@@ -75,7 +84,13 @@ class GPUScheduler:
     """
 
     def __init__(self):
-        self._buckets: list[list[InferRequest]] = [[] for _ in BUCKET_SEQ_LENS]
+        # 分组键 = (bucket_idx, bias_key)，bias_key 用 id(bias) 区分热词身份：
+        #   - 同一请求的多 chunk 共享同一 bias 对象 → 同组合并
+        #   - 默认词表 route=A 复用同一缓存 bias 对象 → 跨请求可合并
+        #   - 不同客户端热词 = 不同对象 → 不会错误合并（避免热词串扰）
+        #   - 无热词 bias=None → key=0，全部合并
+        # value = (requests 列表, bias_embeddings 引用)
+        self._groups: dict[tuple[int, int], tuple[list[InferRequest], np.ndarray | None]] = {}
         self._lock = asyncio.Lock()
         self._running = False
         self._task: asyncio.Task | None = None
@@ -97,6 +112,19 @@ class GPUScheduler:
                 await self._task
             except asyncio.CancelledError:
                 pass
+
+    async def encode_hotwords(self, hotword_token_ids: np.ndarray) -> np.ndarray | None:
+        """
+        热词 bias 编码（统一收口到 GPU 单线程池）。
+
+        bias_encoder 是 TRT/CUDA 推理，必须与主推理共用同一 GPU 线程，
+        避免多线程并发提交 CUDA 工作造成 stream 冲突（见 plan.md GPU Scheduler 设计）。
+        """
+        return await asyncio.get_event_loop().run_in_executor(
+            _gpu_executor,
+            asr_engine.encode_hotwords,
+            hotword_token_ids,
+        )
 
     async def submit(
         self,
@@ -128,15 +156,23 @@ class GPUScheduler:
             future=loop.create_future(),
         )
 
+        # 分组键：bias 身份隔离，避免跨请求热词串扰
+        bias_key = id(bias_embeddings) if bias_embeddings is not None else 0
+        group_key = (bucket_idx, bias_key)
+
         async with self._lock:
-            self._buckets[bucket_idx].append(request)
-            # 立即触发：达到合法 batch size
-            bucket = self._buckets[bucket_idx]
-            trigger_size = get_trigger_batch_size(len(bucket))
-            if trigger_size >= VALID_BATCH_SIZES[1] and len(bucket) >= trigger_size:
-                batch = bucket[:trigger_size]
-                self._buckets[bucket_idx] = bucket[trigger_size:]
-                asyncio.create_task(self._execute_batch(batch, bucket_idx))
+            group = self._groups.setdefault(group_key, ([], bias_embeddings))[0]
+            group.append(request)
+            # 立即触发：同组达到合法 batch size
+            trigger_size = get_trigger_batch_size(len(group))
+            if trigger_size >= VALID_BATCH_SIZES[1] and len(group) >= trigger_size:
+                batch = group[:trigger_size]
+                remaining = group[trigger_size:]
+                if remaining:
+                    self._groups[group_key] = (remaining, bias_embeddings)
+                else:
+                    del self._groups[group_key]
+                asyncio.create_task(self._execute_batch(batch, bucket_idx, bias_embeddings))
 
         return await request.future
 
@@ -146,27 +182,34 @@ class GPUScheduler:
             timeout_sec = settings.BATCH_TIMEOUT / 1000.0
             await asyncio.sleep(timeout_sec)
 
-            if not any(self._buckets):
+            if not self._groups:
                 continue
 
             async with self._lock:
-                for bucket_idx in range(len(self._buckets)):
-                    bucket = self._buckets[bucket_idx]
-                    if not bucket:
+                # 取出所有非空分组分别触发
+                for group_key, (group, bias) in list(self._groups.items()):
+                    if not group:
                         continue
-                    # 超时触发：取所有等待中的 chunk
-                    batch = list(bucket)
-                    self._buckets[bucket_idx] = []
-                    asyncio.create_task(self._execute_batch(batch, bucket_idx))
+                    bucket_idx = group_key[0]
+                    batch = list(group)
+                    del self._groups[group_key]
+                    asyncio.create_task(self._execute_batch(batch, bucket_idx, bias))
 
-    async def _execute_batch(self, batch: list[InferRequest], bucket_idx: int):
-        """执行推理：pad 到合法 batch size，推理后丢弃 padding 结果。"""
+    async def _execute_batch(
+        self,
+        batch: list[InferRequest],
+        bucket_idx: int,
+        bias_embeddings: np.ndarray | None,
+    ):
+        """执行推理：pad 到合法 batch size，推理后丢弃 padding 结果。
+
+        同一 batch 内所有 chunk 共享同一 bias（由分组键保证），无热词串扰。
+        """
         import time as _time
 
         actual_count = len(batch)
         target_seq_len = BUCKET_SEQ_LENS[bucket_idx]
         feat_dim = batch[0].features.shape[1]
-        bias_embeddings = batch[0].bias_embeddings
 
         # pad 到合法 batch size
         pad_batch_size = get_pad_batch_size(actual_count)

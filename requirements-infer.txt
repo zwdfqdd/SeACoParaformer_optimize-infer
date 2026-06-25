@@ -1,15 +1,43 @@
-# 推理服务环境依赖
-onnxruntime-gpu==1.19.2
-torch==2.3.1
-torchaudio==2.3.1
-numpy>=1.26.0
+# ============================================================
+# SeACo-Paraformer 线上推理 + 现场转换 统一依赖
+# 基础镜像 nvcr.io/nvidia/tensorrt:24.11-py3 已内置：
+#   TensorRT 10.6, CUDA 12.6, cuDNN 9, Python 3.10, PyTorch 2.5.0, numpy
+# 以下仅安装镜像缺少的业务 + 转换依赖
+# ============================================================
+
+# ─── 推理框架 ───
+onnxruntime-gpu==1.19.2        # ORT 推理后端（onnx_fp32 / onnx_int8）
+
+# ─── 音频特征 ───
+torchaudio==2.5.0              # kaldi fbank 特征提取（与镜像 torch 2.5.0 对齐）
+soundfile==0.12.1
+
+# ─── HTTP 服务 ───
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 pydantic==2.7.4
-soundfile==0.12.1
-prometheus-client==0.20.0
 python-multipart==0.0.9
+
+# ─── 可观测性 ───
+prometheus-client==0.20.0
 opentelemetry-api==1.25.0
 opentelemetry-sdk==1.25.0
 opentelemetry-instrumentation-fastapi==0.46b0
-aiohttp==3.9.5
+
+# ─── 现场模型转换（PT → ONNX → engine） ───
+# PT 权重提前打包进镜像（PT_MODEL_DIR），不在运行时下载，故无需 modelscope
+onnx==1.16.1                   # ONNX 导出 / int8 动态量化
+
+# ─── INT8 QDQ 量化（trt_int8* 精度需要） ───
+# 重要：必须钉版本，且不要装 nvidia-modelopt[torch] extra！
+#   nvidia-modelopt 0.44+ 会把 torch 顶到 2.12+cu130，破坏 torchaudio/TRT 环境
+#   0.21.0 兼容镜像内置的 torch 2.5.0+cu124
+# 安装：pip install nvidia-modelopt==0.21.0 torchprofile --extra-index-url https://pypi.nvidia.com
+nvidia-modelopt==0.21.0
+torchprofile==0.0.4
+
+# ─── 路径 B：Faiss 大词库后处理纠错（默认词表 >MAX_HOTWORD_NUM 时启用） ───
+# 缺失时路径 B 自动禁用（懒导入），不影响路径 A / 主推理
+faiss-cpu==1.8.0               # 拼音向量检索（IndexFlatIP）
+pypinyin==0.51.0               # 中文 → 拼音音节
+python-Levenshtein==0.25.1     # 编辑距离

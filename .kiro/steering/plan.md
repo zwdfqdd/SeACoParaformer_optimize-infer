@@ -687,7 +687,7 @@ python tests/test_trt_pipeline.py --audio test_data/audio_16000_10s.wav \
 ```bash
 # 1. encoder QDQ
 python scripts/export_encoder_qdq.py \
-    --calib-data ./int8/calib_data/audio_data \
+    --calib-data ./calib_data/audio_data \
     --output ./models/asr/split/encoder_qdq.onnx
 python scripts/convert_trt.py --input ./models/asr/split/encoder_qdq.onnx \
     --precision int8 --profile encoder \
@@ -703,7 +703,7 @@ python scripts/convert_trt.py --input ./models/asr/split/decoder_qdq.onnx \
     --output ./models/asr/trt/2080_ti_decoder_int8_qdq.engine
 
 # 3. CER 评测
-python scripts/evaluate_cer.py --audio-dir int8/calib_data/audio_data --csv report_cer.csv
+python scripts/evaluate_cer.py --audio-dir calib_data/audio_data --csv report_cer.csv
 ```
 
 ## 性能与精度（2080 Ti）
@@ -721,5 +721,158 @@ python scripts/evaluate_cer.py --audio-dir int8/calib_data/audio_data --csv repo
 3. **多 GPU engine 构建**（A10/T4 各自 build，验证 INT8 在 Ampere/Turing 的速度收益）
 4. **服务集成**：src/config.py 增加 trt_int8 精度的 4 段 engine 路径解析
    （engine 命名 {gpu}_{module}_int8_qdq.engine，需适配 find_engine）
+
+# ============================================================
+
+
+# ============================================================
+# 热词管理 — 最终技术方案（冻结，2026-06-25）
+# ============================================================
+
+> 路由判断按"生效词表大小"，切换点 = MAX_HOTWORD_NUM = 256。
+
+## 一、总体架构：三路分流
+
+```
+请求到达
+├─ 客户端传了 hotwords？
+│   ├─ 是 → 截断 Top256 → 路径 A：SeACo 在线热词（每请求实时编码 bias_embed）
+│   └─ 否 → 看服务端默认词表大小
+│            ├─ ≤256 → 路径 A：SeACo（用启动预编码缓存的 bias_embed，零额外成本）
+│            └─ >256 → 路径 B：普通 ASR + Faiss 后处理纠错
+```
+
+| 路径 | 触发 | 处理 | bias_embed 来源 |
+|---|---|---|---|
+| A-客户端 | 传 hotwords | SeACo 模型内增强 | 每请求实时编码（含 Top256 截断） |
+| A-默认 | 不传 且 默认表 ≤256 | SeACo 模型内增强 | 启动预编码缓存，复用（省 LSTM） |
+| B-默认 | 不传 且 默认表 >256 | 普通 ASR + Faiss 纠错 | 不用（bias=全零 NO_BIAS） |
+
+设计依据：词表越小越适合 SeACo（精准、强修正）；词表越大 SeACo 误触发风险越高，
+Faiss "检索命中 + 三重阈值才替换" 更适合大规模词库。
+
+## 二、路径 A：SeACo 在线热词
+
+| 项 | 值 |
+|---|---|
+| 数量上限 / 切换点 MAX_HOTWORD_NUM | 256（客户端超限截断 Top256 + 告警） |
+| profile opt OPT_HOTWORD_NUM | 64 |
+| ASF 过滤 NFILTER | 50 |
+| 编码 | tokenizer.encode → 追加 [sos] 哨兵 → padding → bias_encoder |
+| 显存 | bias 维度固定 ≤256（engine profile max=256+1=257 含哨兵），永不重建 |
+| 默认词表优化 | 静态，启动预编码 bias_embed 缓存，命中默认路径直接复用 |
+
+## 三、路径 B：Faiss 大词库后处理纠错
+
+| 项 | 值 |
+|---|---|
+| 触发 | 不传热词 且 默认词表 >256 |
+| ASR | 普通识别（SeACo bias=全零） |
+| 热词表示 | 拼音向量（multi-hot 音节计数 + L2 归一化） |
+| Faiss 索引 | IndexFlatIP（余弦，未来百万级换 IVFFlat） |
+| 检索粒度 | 滑窗片段，窗口 2/3/4 字 |
+| TopK 召回 | 30 |
+| 重排打分 | 拼音×0.75 + 编辑距离×0.25 |
+| 词库规模 | 1万~20万（models/asr/hotwords.txt） |
+
+三重联合判定（全满足才替换）：
+```
+if (top1.faiss_score > 0.85
+    and (top1.faiss_score - top2.faiss_score) > 0.05
+    and final_score > 0.88):
+    replace()
+```
+
+## 四、词表热更新（运行时不中断，多 worker 安全）
+
+部署形态：单机单容器、指定 GPU、WORKS=N（默认 1，运维按显存调大）。
+所有 worker 共享容器本地文件，无需挂载/NFS/K8s。
+```
+models/asr/hotwords.txt        词表内容（原子写）
+models/asr/hotwords.txt.version 版本标记 {version, md5, count, route, updated_at}
+models/asr/.hotwords.lock      跨进程互斥锁文件
+```
+更新流程：POST /hotwords/reload → flock 锁 → 校验链 → expected_version CAS →
+原子写(temp→fsync→rename，commit=version 文件) → 本 worker 重建+原子切换引用 →
+其他 worker 后台轮询 version（HOTWORD_POLL_INTERVAL 默认 5s）收敛（最终一致）。
+校验链（任一失败保留旧表）：UTF-8/去空白/去重/非空 → 数量(≤256 A/>256 B) →
+tokenizer 可编码(剔 OOV) → 试跑 bias_encoder 验 nan/inf。
+回滚：以上一版内容发布新版本（version 递增，触发各 worker 收敛）。
+
+## 五、接口
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | /hotwords/reload | words 或 {"reload_from_file":true}；返回校验结果+新 version |
+| GET | /hotwords/status | version/md5/count/route/loaded_at |
+| POST | /hotwords/rollback | 回滚到上一版内容（发布为新 version） |
+
+## 六、参数表
+| 参数 | 默认 | 路径 |
+|---|---|---|
+| MAX_HOTWORD_NUM | 256 | A（硬上限/切换点，engine profile=257 含哨兵） |
+| OPT_HOTWORD_NUM | 64 | A |
+| NFILTER | 50 | A |
+| DEFAULT_HOTWORD_PATH | models/asr/hotwords.txt | A/B |
+| HOTWORD_RELOAD_ENABLED | true | — |
+| HOTWORD_POLL_INTERVAL | 5 | — |
+| FAISS_WINDOW_SIZES | 2,3,4 | B |
+| FAISS_TOPK | 30 | B |
+| FAISS_PINYIN_WEIGHT | 0.75 | B |
+| FAISS_EDIT_WEIGHT | 0.25 | B |
+| FAISS_SCORE_THRESHOLD | 0.85 | B |
+| GAP_THRESHOLD | 0.05 | B |
+| FINAL_SCORE_THRESHOLD | 0.88 | B |
+
+## 七、实现状态：阶段 1-4 全部完成 ✓（待容器实测）
+交付文件：
+- src/hotword_manager.py（新增）：默认词表加载+校验链+预编码缓存+flock/CAS/原子写热更新+轮询收敛+回滚
+- src/hotword_faiss.py（新增）：拼音向量+IndexFlatIP+滑窗+TopK+三重判定+非重叠区间重组（依赖懒导入缺失自动禁用）
+- src/config.py：256/64/50 + DEFAULT_HOTWORD_PATH/HOTWORD_RELOAD_ENABLED/HOTWORD_POLL_INTERVAL + FAISS_* + get_trt_profiles 热词维度=256+1
+- src/main.py：三路路由+启动加载/注入/轮询+3 个热更新接口
+- src/scheduler.py：bias-aware 分组(key=(bucket_idx,id(bias)))+GPU 单线程池收口热词编码
+- src/errors.py：HOTWORD_VERSION_CONFLICT=1008(409)
+- src/schemas.py：HotwordReload/Status schema
+- src/trt_engine.py：warmup 含热词维度预热
+- requirements-infer.txt：faiss-cpu+pypinyin+python-Levenshtein
+
+# ============================================================
+# 深度核查修复清单（第 1-7 轮）
+# ============================================================
+1. [严重] scheduler 跨请求 batch 共用 batch[0].bias→热词串扰
+   修复：_buckets(list)→_groups(dict,key=(bucket_idx,id(bias)))，bias 身份隔离
+2. [严重] convert_trt.py 硬编码 fallback profile(batch=8/seq=289)与 config 漂移
+   修复：移除分段硬编码 fallback，强制 config.get_trt_profiles 单一源（+hasattr 检测旧 config）
+3. [次要] _encode_hotwords OOV 过滤时机注释说明与预编码路径等价
+4. [次要] rollback version 语义修正：以旧内容发布新版本(version 递增)
+5. [并发] reload 预编码绕过 GPU 单线程池→CUDA stream 冲突
+   修复：scheduler.encode_hotwords(async)+encode_hotwords_on_gpu(sync)，全部收口 _gpu_executor
+6. [性能] 预热未覆盖热词维度→首热词请求延迟突增
+   修复：trt_engine.warmup 用 OPT/MAX 热词数(+哨兵)各预热一次
+7. [一致性] audio_segment 硬编码 BUCKET_MS 未跟随 config.BUCKET_SEQ_LENS
+   修复：BUCKET_MS 从帧数派生(1帧=60ms)，[34,67,134]→[2040,4020,8040]ms
+8. [一致性] 精度矩阵声明无法构建的方案
+   修复：移除 trt_int8_enc_bias；新增 export_cif_qdq.py / export_bias_qdq.py，
+   prepare_model 支持全 4 段 QDQ，trt_int8 可完整构建（cif/bias int8 精度待实测）
+9. [多 worker] 日志 TimedRotatingFileHandler 多进程轮转竞争
+   修复：日志文件名 asr_{pid}.log 每 worker 独立
+10. [边界] audio_segment 最大桶零余量，int 取整可能溢出 134 帧被截断
+    修复：SPLIT_MAX_MS = 最大桶-1帧(60ms)=7980ms，切分/合并/尾段统一用此上限
+11. [spec] AUDIO_TOO_LONG(1005) 声明但未触发
+    修复：config MAX_AUDIO_DURATION_MS（默认 2 小时=7200000ms，0=不限），_decode_audio 超限抛 1005
+12. [spec] SERVICE_BUSY(1007) 声明但 await acquire 无限阻塞
+    修复：config ACQUIRE_TIMEOUT（默认 5s，0=无限），asyncio.wait_for 超时抛 1007(503)
+13. [防御] feature_extractor 0 帧音频(<25ms)不防御
+    修复：mat.shape[0]==0 返回 (0,560) 空特征
+
+## 最终精度矩阵（全部可构建）
+    onnx_fp32 / onnx_int8 / trt_fp32 / trt_fp16 /
+    trt_int8_enc（★线上推荐，encoder int8+其余 fp16，CER≈0）/
+    trt_int8（4 段全 int8 QDQ，cif/bias int8 精度待真实测试集实测）
+
+## 待容器实测
+- cif/bias int8 QDQ 精度（cif cumsum 敏感、bias LSTM 量化支持有限，未达标回退 fp16）
+- 默认词表预编码缓存命中、/hotwords/reload 多 worker 收敛
+- MAX_HOTWORD_NUM=256 改了 bias/decoder profile，需重新转 engine
+- 容器内 src/config.py 需同步最新（含 get_trt_profiles），否则 convert_trt 报错
 
 # ============================================================

@@ -51,11 +51,19 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 try:
     import tensorrt as trt
     TRT_VERSION = trt.__version__
 except ImportError:
     TRT_VERSION = "unknown (需要在 TRT 容器内运行)"
+
+# 统一参数源：从 config 动态生成分段 profile
+try:
+    from src.config import Settings as _Settings
+except Exception:
+    _Settings = None
 
 
 # ============================================================
@@ -83,58 +91,9 @@ ASR_PROFILES = {
     },
 }
 
-# Encoder：speech(B,T,560) → encoder_out(B,T,512)
-# 注意：speech_lengths 在 trace 时被优化掉了，不在 ONNX 输入中
-ENCODER_PROFILES = {
-    "speech": {
-        "min": (1, 8, 560),
-        "opt": (1, 128, 560),
-        "max": (8, 289, 560),
-    },
-}
 
-# CIF：encoder_out(B,T,512) + mask(B,1,T) → acoustic_embeds(B,N,512)
-CIF_PROFILES = {
-    "encoder_out": {
-        "min": (1, 8, 512),
-        "opt": (1, 128, 512),
-        "max": (8, 289, 512),
-    },
-    "mask": {
-        "min": (1, 1, 8),
-        "opt": (1, 1, 128),
-        "max": (8, 1, 289),
-    },
-}
-
-# Decoder：acoustic_embeds + encoder_out + bias_embed → logits
-# 注意：token_num 和 encoder_out_lens 在 trace 时被优化掉了
-DECODER_PROFILES = {
-    "acoustic_embeds": {
-        "min": (1, 2, 512),
-        "opt": (1, 128, 512),
-        "max": (8, 289, 512),
-    },
-    "encoder_out": {
-        "min": (1, 8, 512),
-        "opt": (1, 128, 512),
-        "max": (8, 289, 512),
-    },
-    "bias_embed": {
-        "min": (1, 1, 512),
-        "opt": (1, 4, 512),
-        "max": (8, 32, 512),
-    },
-}
-
-# Bias Encoder：hotword(H,L) → hw_embed(H,1,512)
-BIAS_PROFILES = {
-    "hotword": {
-        "min": (1, 1),
-        "opt": (1, 4),
-        "max": (8, 8),
-    },
-}
+# 分段模型 profile（encoder/cif/decoder/bias）统一由 src.config.Settings.get_trt_profiles
+# 动态生成，不在此硬编码，避免与 scheduler bucket/batch + 热词维度漂移。
 
 
 def get_gpu_name() -> str:
@@ -201,17 +160,27 @@ def build_engine(
         cmd.extend(["--int8", "--fp16"])
     # fp32: 不加任何精度 flag
 
-    # Dynamic shape profiles
-    if profile_type == "encoder":
-        profiles = ENCODER_PROFILES
-    elif profile_type == "cif":
-        profiles = CIF_PROFILES
-    elif profile_type == "decoder":
-        profiles = DECODER_PROFILES
-    elif profile_type == "bias":
-        profiles = BIAS_PROFILES
-    else:
+    # Dynamic shape profiles：
+    #   - 分段模型（encoder/cif/decoder/bias）：强制由 config 动态生成
+    #     （单一数据源，与 scheduler bucket/batch + 热词维度严格一致，杜绝硬编码漂移）
+    #   - 完整模型（asr）：用 ASR_PROFILES
+    if profile_type in ("encoder", "cif", "decoder", "bias"):
+        if _Settings is None:
+            raise RuntimeError(
+                "无法导入 src.config.Settings，分段 profile 必须由 config 生成。"
+                "请在项目根目录运行，确保 src 可导入。"
+            )
+        if not hasattr(_Settings, "get_trt_profiles"):
+            raise RuntimeError(
+                "src.config.Settings 缺少 get_trt_profiles 方法——检测到过时的 config.py。\n"
+                "  容器内的 src/config.py 是旧版本（TASK 4 之前），请同步最新代码：\n"
+                "  重新构建镜像，或把最新 src/config.py 复制进容器后重试。"
+            )
+        profiles = _Settings.get_trt_profiles(profile_type)
+    elif profile_type == "asr":
         profiles = ASR_PROFILES
+    else:
+        raise ValueError(f"未知 profile_type: {profile_type}")
     min_shapes = []
     opt_shapes = []
     max_shapes = []

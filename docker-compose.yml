@@ -1,10 +1,11 @@
+# SeACo-Paraformer 推理服务部署（TRT 10.6 + CUDA 12.6，转换推理合一）
+# 用法：docker-compose up -d
 services:
   seaco-asr:
     image: seaco-asr:latest
     build:
       context: .
       dockerfile: Dockerfile
-      target: inference
     container_name: seaco-asr
     ports:
       - "${HOST_PORT:-8099}:8080"
@@ -14,14 +15,42 @@ services:
       - BATCH_TIMEOUT=${BATCH_TIMEOUT:-10}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-2000}
-      - MODEL_PRECISION=${MODEL_PRECISION:-auto}
+      # 音频最大时长（ms），超出返回 1005；默认 2 小时，0=不限
+      - MAX_AUDIO_DURATION_MS=${MAX_AUDIO_DURATION_MS:-7200000}
+      # 过载拒绝：并发等待超时（秒），超时返回 1007；0=无限等待
+      - ACQUIRE_TIMEOUT=${ACQUIRE_TIMEOUT:-5}
+      # 精度方案：
+      #   线上推荐 trt_int8_enc = encoder int8(QDQ) + cif/decoder/bias fp16
+      #   可选 trt_fp16 / trt_fp32 / trt_int8 /
+      #        onnx_fp32 / onnx_int8 / auto
+      - MODEL_PRECISION=${MODEL_PRECISION:-trt_int8_enc}
+      # 单段精度覆盖（可选，优先级高于 MODEL_PRECISION）
+      # - ENCODER_PRECISION=int8
+      # - CIF_PRECISION=fp16
+      # - DECODER_PRECISION=fp16
+      # - BIAS_PRECISION=fp16
+      # 本地 PT 权重目录（默认 ./models/asr/pt）
+      # - PT_MODEL_DIR=/app/models/asr/pt
+      # ─── Bucket/Batch 参数（改动后需重新转 engine，转换与运行共用）───
+      # - BUCKET_SEQ_LENS=34,67,134
+      # - VALID_BATCH_SIZES=1,2,4,8,12
+      # - TRT_OPT_SEQ=67
+      # - TRT_OPT_BATCH=4
+      # ─── 热词参数（路径 A：SeACo 在线热词，改动 MAX/OPT 后需重新转 engine）───
+      # - MAX_HOTWORD_NUM=256   # 在线热词硬上限 / 路径切换点（≤A SeACo，>B Faiss）
+      # - OPT_HOTWORD_NUM=64    # TRT profile opt point
+      # - NFILTER=50            # ASF 过滤注入 decoder 的 top-K
+      # ─── 词表热更新（默认词表 + 多 worker 轮询收敛）───
+      # - DEFAULT_HOTWORD_PATH=models/asr/hotwords.txt
+      # - HOTWORD_RELOAD_ENABLED=true
+      # - HOTWORD_POLL_INTERVAL=5
+      - VERBOSE=${VERBOSE:-0}
     restart: unless-stopped
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              # count: all
               device_ids: ['0']
               capabilities: [gpu]
     healthcheck:
@@ -29,4 +58,5 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 420s
+      # 首次启动需构建 engine（5-10min）+ 预热
+      start_period: 900s

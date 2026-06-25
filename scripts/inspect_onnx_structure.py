@@ -3,7 +3,7 @@
 用于确定拆分点。
 
 用法：
-    python scripts/inspect_onnx.py --input ./models/asr/fp32/model.onnx
+    python scripts/inspect_onnx_structure.py --input ./models/asr/fp32/model.onnx
 """
 
 import argparse
