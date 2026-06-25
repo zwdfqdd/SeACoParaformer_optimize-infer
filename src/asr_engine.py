@@ -185,7 +185,7 @@ class ASREngine:
             for batch in batch_sizes:
                 try:
                     dummy_feats = np.random.randn(batch, seq_len, feat_dim).astype(np.float32)
-                    dummy_lengths = np.full(batch, seq_len, dtype=np.int32)
+                    dummy_lengths = np.full(batch, seq_len, dtype=np.int64)
 
                     feed = {}
                     for name in self._input_names:
@@ -232,14 +232,15 @@ class ASREngine:
         if self._bias_session is None:
             return None
         try:
-            feed = {self._bias_input_names[0]: hotword_token_ids.astype(np.int32)}
+            feed = {self._bias_input_names[0]: hotword_token_ids.astype(np.int64)}
             if len(self._bias_input_names) >= 2:
                 lengths = np.array(
-                    [(row != 0).sum() for row in hotword_token_ids], dtype=np.int32
+                    [(row != 0).sum() for row in hotword_token_ids], dtype=np.int64
                 )
                 feed[self._bias_input_names[1]] = lengths
             outputs = self._bias_session.run(self._bias_output_names, feed)
             hw_embed = outputs[0]
+            # model_eb.onnx 输出 (H, D)，补 batch 维 → (1, H, D)
             if hw_embed.ndim == 2:
                 hw_embed = hw_embed[np.newaxis, :, :]
             return hw_embed
@@ -289,7 +290,7 @@ class ASREngine:
                 if name == "speech":
                     feed[name] = padded_feats
                 elif name == "speech_lengths":
-                    feed[name] = lengths.astype(np.int32)
+                    feed[name] = lengths.astype(np.int64)
                 elif "bias_embed" in name:
                     if bias_embeddings is not None:
                         feed[name] = np.tile(bias_embeddings, (batch_size, 1, 1)).astype(np.float32)

@@ -6,57 +6,200 @@ SeACo-Paraformer 模型 ONNX 导出脚本
 2. 使用 onnxconverter-common mixed precision 转为 fp16
    - keep_io_types=True 保持输入输出为 fp32
    - op_block_list 保留精度敏感算子为 fp32
-3. opset_version=16
+3. opset_version=17
 """
 
 import argparse
 import sys
 from pathlib import Path
 
+import torch
+import torch.nn as nn
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
-def export_fp32_onnx(model_id: str, output_dir: Path, opset_version: int = 16):
-    """使用 seaco_paraformer 加载模型并导出 fp32 ONNX（v1 整体导出）。"""
+# ============================================================
+# 整体模型 Wrapper（含热词 bias_embed 输入）
+# ============================================================
+class WholeModelWithBiasWrapper(nn.Module):
+    """整体模型导出 wrapper（encoder + predictor + decoder + SeACo）。
+
+    输入：
+        speech (B, T, feat_dim)
+        speech_lengths (B,) int64
+        bias_embed (B, H, D) — 热词编码（来自 model_eb.onnx）；无热词时传 (B, 1, D) 全零
+
+    输出：
+        logits (B, N, vocab) — log_softmax 合并后
+        token_num (B,)
+
+    SeACo 解码逻辑与分段导出 DecoderWithSeACoWrapper 完全一致（直接吃 bias_embed 张量，
+    不在图内做 ASF 过滤；ASF/Top256 截断由外部完成）。
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.decoder = model.decoder
+        self.seaco_decoder = model.seaco_decoder
+        self.hotword_output_layer = model.hotword_output_layer
+        self.NO_BIAS = model.NO_BIAS
+        self.seaco_weight = model.seaco_weight
+
+    def forward(self, speech, speech_lengths, bias_embed):
+        # encoder + predictor（与原 forward 一致，复用 Loop 版 CIF，ORT 兼容）
+        encoder_out, encoder_out_lens = self.model.encode(speech, speech_lengths)
+        acoustic_embeds, token_num, _, _ = self.model.calc_predictor(
+            encoder_out, encoder_out_lens
+        )
+        pre_token_length = token_num.round().long()
+
+        # 主 decoder（return logits + hidden）
+        decoder_out, decoder_hidden, _ = self.decoder(
+            encoder_out, encoder_out_lens,
+            acoustic_embeds, pre_token_length,
+            return_hidden=True, return_both=True,
+        )
+        decoder_pred = torch.log_softmax(decoder_out, dim=-1)
+
+        # SeACo decoder：bias_embed 作为 memory
+        B, H, D = bias_embed.shape
+        contextual_length = torch.full(
+            (B,), H, dtype=torch.long, device=bias_embed.device
+        )
+
+        cif_attended, _ = self.seaco_decoder(
+            bias_embed, contextual_length,
+            acoustic_embeds, pre_token_length,
+        )
+        dec_attended, _ = self.seaco_decoder(
+            bias_embed, contextual_length,
+            decoder_hidden, pre_token_length,
+        )
+
+        merged = cif_attended + dec_attended
+        dha_output = self.hotword_output_layer(merged)
+        dha_pred = torch.log_softmax(dha_output, dim=-1)
+
+        # NO_BIAS mask 合并
+        lmbd = self.seaco_weight
+        a = (1.0 - lmbd) / lmbd
+        b = 1.0 / lmbd
+        dha_ids = dha_pred.max(-1)[1]
+        dha_mask = (dha_ids == self.NO_BIAS).int().unsqueeze(-1).float()
+        dha_mask_scaled = (dha_mask + a) / b
+
+        final_logits = decoder_pred * dha_mask_scaled + dha_pred * (1.0 - dha_mask_scaled)
+        return final_logits, token_num
+
+
+# ============================================================
+# Bias Encoder Wrapper（输出已按热词长度取最后有效时间步 → (H, D)）
+# ============================================================
+class BiasEncoderWrapper(nn.Module):
+    """Bias Encoder 导出 wrapper（整体模型配套）。
+
+    输入：
+        hotword (H, L) int64 — H 个热词的 token IDs（已 pad）
+        hotword_lengths (H,) int64 — 每个热词实际长度
+
+    输出：
+        selected (H, D) — 每个热词取 LSTM 最后有效时间步
+
+    与分段版不同：这里内部完成 gather（输出 (H, D)），asr_engine ORT 路径直接加 batch 维使用。
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.embed = model.decoder.embed
+        self.bias_encoder = model.bias_encoder
+        self.lstm_proj = model.lstm_proj
+
+    def forward(self, hotword, hotword_lengths):
+        hw_embed = self.embed(hotword)            # (H, L, D)
+        rnn_output, _ = self.bias_encoder(hw_embed)  # (H, L, D[/2D])
+        if self.lstm_proj is not None:
+            rnn_output = self.lstm_proj(rnn_output)
+
+        H = rnn_output.shape[0]
+        D = rnn_output.shape[2]
+        idx = (hotword_lengths.long() - 1).clamp(min=0).view(H, 1, 1).expand(H, 1, D)
+        selected = torch.gather(rnn_output, 1, idx).squeeze(1)  # (H, D)
+        return selected
+
+
+def export_fp32_onnx(model_id: str, output_dir: Path, opset_version: int = 17):
+    """使用 seaco_paraformer 加载模型并导出 fp32 ONNX（v1 整体导出，含热词）。
+
+    导出两个产物：
+        model.onnx    — 主模型（speech + speech_lengths + bias_embed → logits + token_num）
+        model_eb.onnx — bias encoder（hotword + hotword_lengths → selected）
+    """
     from seaco_paraformer.load_model import load_model
 
     export_dir = output_dir / "fp32"
     export_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[1/2] 加载模型: {model_id}")
+    print(f"[1/3] 加载模型: {model_id}")
     pt_model = load_model(model_id)
 
-    print(f"[2/2] 导出 fp32 ONNX (opset_version={opset_version})...")
+    print(f"[2/3] 导出主模型 model.onnx (opset_version={opset_version}, 含 bias_embed)...")
 
-    import torch
+    inner_dim = pt_model.inner_dim
+    main_wrapper = WholeModelWithBiasWrapper(pt_model)
+    main_wrapper.eval()
 
-    # 导出完整模型（encoder + predictor + decoder 一体）
     batch, seq_len, feat_dim = 1, 289, 560
+    num_hotwords = 3
     speech = torch.randn(batch, seq_len, feat_dim)
     speech_lengths = torch.tensor([seq_len], dtype=torch.long)
+    bias_embed = torch.randn(batch, num_hotwords, inner_dim)
 
-    output_path = export_dir / "model.onnx"
+    model_path = export_dir / "model.onnx"
     torch.onnx.export(
-        pt_model,
-        (speech, speech_lengths),
-        str(output_path),
+        main_wrapper,
+        (speech, speech_lengths, bias_embed),
+        str(model_path),
         opset_version=opset_version,
-        input_names=["speech", "speech_lengths"],
+        input_names=["speech", "speech_lengths", "bias_embed"],
         output_names=["logits", "token_num"],
         dynamic_axes={
             "speech": {0: "batch", 1: "seq_len"},
             "speech_lengths": {0: "batch"},
+            "bias_embed": {0: "batch", 1: "num_hotwords"},
             "logits": {0: "batch", 1: "token_len"},
             "token_num": {0: "batch"},
         },
     )
+    print(f"   导出完成: {model_path.name}")
+
+    print(f"[3/3] 导出 bias encoder model_eb.onnx (opset_version={opset_version})...")
+    bias_wrapper = BiasEncoderWrapper(pt_model)
+    bias_wrapper.eval()
+
+    max_len = 4
+    hotword = torch.randint(1, 8404, (num_hotwords, max_len), dtype=torch.long)
+    hotword_lengths = torch.tensor([max_len] * num_hotwords, dtype=torch.long)
+
+    eb_path = export_dir / "model_eb.onnx"
+    torch.onnx.export(
+        bias_wrapper,
+        (hotword, hotword_lengths),
+        str(eb_path),
+        opset_version=opset_version,
+        input_names=["hotword", "hotword_lengths"],
+        output_names=["bias_embed"],
+        dynamic_axes={
+            "hotword": {0: "num_hotwords", 1: "max_len"},
+            "hotword_lengths": {0: "num_hotwords"},
+            "bias_embed": {0: "num_hotwords"},
+        },
+    )
+    print(f"   导出完成: {eb_path.name}")
 
     onnx_files = list(export_dir.rglob("*.onnx"))
-    if not onnx_files:
-        print("错误：未找到导出的 ONNX 文件")
-        sys.exit(1)
-
-    print(f"   导出完成: {[f.name for f in onnx_files]}")
+    print(f"   全部产物: {[f.name for f in onnx_files]}")
     return onnx_files
 
 
@@ -188,7 +331,7 @@ def main():
     parser = argparse.ArgumentParser(description="SeACo-Paraformer ONNX 导出")
     parser.add_argument("--model-id", default="iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
     parser.add_argument("--output-dir", default="./models/asr")
-    parser.add_argument("--opset-version", type=int, default=16)
+    parser.add_argument("--opset-version", type=int, default=17)
     parser.add_argument("--skip-fp16", action="store_true")
     parser.add_argument("--op-block-list", nargs="+",
                         default=["Range"])
