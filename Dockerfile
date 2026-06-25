@@ -46,6 +46,10 @@ COPY seaco_paraformer/ seaco_paraformer/
 # 配置文件：models/asr/{am.mvn,tokens.json}
 COPY models/ models/
 
+# INT8 量化校准数据（转 trt_int8/trt_int8_enc 时 QDQ 校准需要，默认 CALIB_DATA=calib_data/audio_data）
+# 仅 int8 精度构建时用到；其他精度不依赖。如不需现场转 int8 可在 .dockerignore 排除以减小镜像。
+COPY calib_data/ calib_data/
+
 # 环境变量默认值
 ENV WORKS=1
 ENV BATCH=12

@@ -27,8 +27,8 @@ tmp_*/
 # 未使用的大体积模型词典（代码不引用）
 models/asr/**/seg_dict
 
-# 校准数据（仅本地转换用，不打进镜像）
-calib_data/
+# 校准数据：calib_data 需打进镜像（int8 QDQ 现场校准用，Dockerfile 有 COPY）；
+# int8/ 为历史 scratch 目录，不打进镜像
 int8/
 
 # Kiro
