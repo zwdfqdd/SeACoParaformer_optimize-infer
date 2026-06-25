@@ -55,7 +55,7 @@ def main():
     parser.add_argument("--model-id", default="iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
     parser.add_argument("--num-layers", type=int, default=40, help="保留的 encoder 层数")
     parser.add_argument("--output", default=None, help="输出路径")
-    parser.add_argument("--opset", type=int, default=16)
+    parser.add_argument("--opset", type=int, default=17)
     args = parser.parse_args()
 
     if args.output is None:

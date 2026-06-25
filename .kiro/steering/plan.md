@@ -18,7 +18,7 @@
         导出产物（双模型架构）：
             model.onnx — ASR 主模型（encoder + predictor + decoder）
             model_eb.onnx — SeACo bias encoder（热词编码器）
-        1).FunASR AutoModel.export() 导出 fp32 ONNX，opset_version=16。
+        1).FunASR AutoModel.export() 导出 fp32 ONNX，opset_version=17。
         CIF 向量化导出（消除 Loop 算子）：
             问题：FunASR bicif_paraformer 中 CifPredictorV3Export 调用的 cif_export/cif_wo_hidden_export 是带 for 循环的 TorchScript 函数，导出为 ONNX Loop 算子。
             方案：在转换容器内修改 FunASR 源码，将 Loop 版本替换为 paraformer 模块中的向量化版本（cumsum 实现）：
@@ -48,7 +48,7 @@
             依赖说明：
                 PT 推理依赖 funasr（仅转换环境）
                 ONNX 推理使用内联 torchaudio 特征提取 + 内联 tokenizer（不引用 src/，脚本自包含）
-        3).opset_version=16
+        3).opset_version=17
     3.构建fastapi服务
         1).环境变量：
             变量（运行时可调）：

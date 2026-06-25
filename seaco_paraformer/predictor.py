@@ -45,7 +45,9 @@ def cif(hidden, alphas, threshold):
     fires = torch.stack(list_fires, 1)
     frames = torch.stack(list_frames, 1)
     list_ls = []
-    len_labels = torch.round(alphas.sum(-1)).int()
+    # 用 int64（long）避免与 tensor.size()/索引（int64）混用，
+    # 否则整体导出 ONNX 时下游 Concat 会绑定 int32+int64 报类型错。
+    len_labels = torch.round(alphas.sum(-1)).long()
     max_label_len = len_labels.max()
     for b in range(batch_size):
         fire = fires[b, :]
