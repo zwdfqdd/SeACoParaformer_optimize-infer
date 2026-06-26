@@ -199,3 +199,83 @@ step 5:
 #       python scripts/export_decoder_qdq.py ... \
 #           --exclude-patterns seaco_decoder hotword_output_layer src_attn
 # ============================================================
+
+
+# ============================================================
+# v1 ORT 整体模型路径（onnx_fp32 / onnx_int8）导出 + 全功能测试
+# ============================================================
+# 与上面 TRT 分段路径独立。整体模型 = encoder + 向量化 predictor + decoder + SeACo，
+# 单文件 model.onnx（3 输入：speech/speech_lengths/bias_embed）+ model_eb.onnx（热词编码）。
+# 关键：predictor 用向量化 CIF（无 Loop），支持 batch>1（多 chunk 合批）。
+
+step 6:
+    # ─── 整体 ONNX 导出（fp32）+ int8 动态量化 ───────────────────
+    # 产物：models/asr/fp32/{model.onnx, model_eb.onnx}
+    python scripts/export_onnx_whole.py --skip-fp16 --output-dir ./models/asr
+
+    # fp32 → int8 动态量化（CPU 线上用，遍历 fp32/ 下所有 onnx）
+    python scripts/convert_onnx_int8_dynamic.py \
+        --input-dir ./models/asr/fp32 --output-dir ./models/asr/int8
+
+    # ─── ONNX 等价性验证（PT vs ONNX，CER 对比） ─────────────────
+    python scripts/verify_onnx.py --audio test_data/audio_16000_10s.wav \
+        --onnx-dir ./models/asr/fp32 --device cuda
+
+    # ─── 模型直推全链路（跳过服务，特征→ONNX→解码） ─────────────
+    # fp32（GPU）
+    python tests/test_model.py --audio test_data/audio_16000_30s.wav \
+        --model-dir ./models/asr/fp32 --device cuda
+    python tests/test_model.py --audio test_data/audio_16000_10s.wav \
+        --model-dir ./models/asr/fp32 --device cuda --hotwords 埃文 账号
+    # int8（CPU）
+    python tests/test_model.py --audio test_data/audio_16000_30s.wav \
+        --model-dir ./models/asr/int8 --device cpu
+
+step 7:
+    # ─── VAD 单独测试（语音段时间戳） ───────────────────────────
+    python tests/test_vad.py --audio test_data/audio_16000_30s.wav \
+        --vad-model ./models/vad/silero_vad.onnx
+
+step 8:
+    # ─── 启动服务（手动在另一终端执行，或后台 nohup） ───────────
+    # bash run.sh
+    # 健康检查：curl http://localhost:8080/health
+
+    # ─── ASR 接口冒烟（标准库 urllib，无需 requests） ───────────
+    # 单 chunk（10s）
+    python tests/test_asr_api.py test_data/audio_16000_10s.wav --url http://localhost:8080
+    # 含热词
+    python tests/test_asr_api.py test_data/audio_16000_10s.wav \
+        --url http://localhost:8080 --hotwords 埃文 账号
+    # 多 chunk 合批（30s，验证 batch>1 不越界）
+    python tests/test_asr_api.py test_data/audio_16000_30s.wav --url http://localhost:8080
+
+    # ─── 热词管理三接口（status/reload/rollback，标准库 urllib） ──
+    python tests/test_hotword_api.py --url http://localhost:8080
+
+    # ─── 健康/指标/错误码路径（标准库 urllib） ──────────────────
+    python tests/test_error_api.py --url http://localhost:8080
+
+    # ─── 单次请求详细输出（依赖 requests，需 pip install requests） ─
+    python tests/test_single.py --audio test_data/audio_16000_30s.wav --url http://localhost:8080
+
+    # ─── 性能/并发压测（依赖 aiohttp，需 pip install aiohttp） ────
+    # 单请求延迟
+    python tests/test_service.py --audio test_data/audio_16000_30s.wav --url http://localhost:8080
+    # 并发压测（10 并发，共 50 请求）
+    python tests/test_service.py --audio test_data/audio_16000_30s.wav \
+        --url http://localhost:8080 --concurrency 10 --total 50
+
+# ============================================================
+# 测试脚本依赖说明
+# ============================================================
+# 无额外依赖（标准库 urllib，推理镜像可直接跑）：
+#   tests/test_asr_api.py / test_hotword_api.py / test_error_api.py
+# 需 onnxruntime + torch + numpy + soundfile（推理镜像已含）：
+#   tests/test_model.py / test_vad.py / verify_onnx.py
+# 需额外 pip 安装：
+#   tests/test_single.py   → requests
+#   tests/test_service.py  → aiohttp
+# 转换环境专用（需 funasr/torch）：
+#   tests/test_pt_inference_v2.py / test_split_onnx_pipeline.py / test_trt_pipeline.py
+# ============================================================

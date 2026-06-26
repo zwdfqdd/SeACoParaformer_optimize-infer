@@ -9,6 +9,8 @@
         1001 DECODE_FAILED       非法 base64 / 非 WAV / 采样率不符
         1005 AUDIO_TOO_LONG      超时长上限（需服务端设较小 MAX_AUDIO_DURATION_MS 才能触发）
 
+依赖：仅 Python 标准库（urllib），推理镜像无需额外安装。
+
 用法：
     python tests/test_error_api.py --url http://localhost:8080
 """
@@ -18,8 +20,30 @@ import base64
 import io
 import json
 import sys
+import urllib.request
+import urllib.error
 
-import requests
+
+def _http(method: str, url: str, payload=None, timeout: int = 30):
+    """发起 HTTP 请求，返回 (status_code, body, raw_text)。"""
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        status = e.code
+        raw = e.read().decode("utf-8")
+    try:
+        body = json.loads(raw)
+    except Exception:
+        body = raw
+    return status, body, raw
 
 
 def _make_wav(sample_rate: int, num_samples: int, channels: int = 1) -> bytes:
@@ -49,53 +73,47 @@ def run(url: str):
             failed += 1; print(f"  ✗ {msg}")
 
     # 1. /health
-    r = requests.get(f"{url}/health", timeout=10)
-    body = r.json()
-    print(f"\n[health] {r.status_code} {body}")
-    check(r.status_code == 200, "health 返回 200")
-    check(body.get("status") == "ok", "status=ok")
-    check("device" in body and "models_loaded" in body, "含 device/models_loaded")
+    status, body, _ = _http("GET", f"{url}/health", timeout=10)
+    print(f"\n[health] {status} {body}")
+    check(status == 200, "health 返回 200")
+    check(isinstance(body, dict) and body.get("status") == "ok", "status=ok")
+    check(isinstance(body, dict) and "device" in body and "models_loaded" in body, "含 device/models_loaded")
 
     # 2. /metrics
-    r = requests.get(f"{url}/metrics", timeout=10)
-    text = r.text
-    print(f"\n[metrics] {r.status_code}, len={len(text)}")
-    check(r.status_code == 200, "metrics 返回 200")
+    status, _, text = _http("GET", f"{url}/metrics", timeout=10)
+    print(f"\n[metrics] {status}, len={len(text)}")
+    check(status == 200, "metrics 返回 200")
     check("asr_request_total" in text, "含 asr_request_total")
     check("asr_inference_duration_seconds" in text, "含 asr_inference_duration_seconds")
 
     # 3. 非法 base64 → 1001 DECODE_FAILED
-    r = requests.post(f"{url}/asr", json={"b64": "@@@not-base64@@@"}, timeout=30)
-    body = r.json()
-    print(f"\n[非法base64] {r.status_code} {body}")
-    check(r.status_code == 400, "非法 base64 返回 400")
-    check(body.get("code") in (1000, 1001), "错误码 1000/1001")
+    status, body, _ = _http("POST", f"{url}/asr", {"b64": "@@@not-base64@@@"}, timeout=30)
+    print(f"\n[非法base64] {status} {body}")
+    check(status == 400, "非法 base64 返回 400")
+    check(isinstance(body, dict) and body.get("code") in (1000, 1001), "错误码 1000/1001")
 
     # 4. 合法 base64 但非 WAV → 1001
-    r = requests.post(f"{url}/asr", json={"b64": _b64(b"this is not a wav file")}, timeout=30)
-    body = r.json()
-    print(f"\n[非WAV] {r.status_code} {body}")
-    check(r.status_code == 400, "非 WAV 返回 400")
-    check(body.get("code") == 1001, "错误码 1001(DECODE_FAILED)")
+    status, body, _ = _http("POST", f"{url}/asr", {"b64": _b64(b"this is not a wav file")}, timeout=30)
+    print(f"\n[非WAV] {status} {body}")
+    check(status == 400, "非 WAV 返回 400")
+    check(isinstance(body, dict) and body.get("code") == 1001, "错误码 1001(DECODE_FAILED)")
 
     # 5. 采样率不符（8kHz）→ 1001
     wav_8k = _make_wav(8000, 8000)  # 1s @ 8kHz
-    r = requests.post(f"{url}/asr", json={"b64": _b64(wav_8k)}, timeout=30)
-    body = r.json()
-    print(f"\n[采样率8k] {r.status_code} {body}")
-    check(r.status_code == 400, "采样率不符返回 400")
-    check(body.get("code") == 1001, "错误码 1001")
+    status, body, _ = _http("POST", f"{url}/asr", {"b64": _b64(wav_8k)}, timeout=30)
+    print(f"\n[采样率8k] {status} {body}")
+    check(status == 400, "采样率不符返回 400")
+    check(isinstance(body, dict) and body.get("code") == 1001, "错误码 1001")
 
     # 6. 缺少 b64 字段 → 422（pydantic 校验）或 400
-    r = requests.post(f"{url}/asr", json={"hotwords": ["张三"]}, timeout=30)
-    print(f"\n[缺b64] {r.status_code}")
-    check(r.status_code in (400, 422), "缺 b64 返回 400/422")
+    status, body, _ = _http("POST", f"{url}/asr", {"hotwords": ["张三"]}, timeout=30)
+    print(f"\n[缺b64] {status}")
+    check(status in (400, 422), "缺 b64 返回 400/422")
 
     # 7. 空字符串 b64 → 1000/1001
-    r = requests.post(f"{url}/asr", json={"b64": ""}, timeout=30)
-    body = r.json()
-    print(f"\n[空b64] {r.status_code} {body}")
-    check(r.status_code == 400, "空 b64 返回 400")
+    status, body, _ = _http("POST", f"{url}/asr", {"b64": ""}, timeout=30)
+    print(f"\n[空b64] {status} {body}")
+    check(status == 400, "空 b64 返回 400")
 
     print(f"\n{'=' * 50}\n结果: {passed} 通过, {failed} 失败\n{'=' * 50}")
     print("提示：1005 AUDIO_TOO_LONG 需服务端设较小 MAX_AUDIO_DURATION_MS（如 5000）"
@@ -109,7 +127,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        requests.get(f"{args.url}/health", timeout=5)
+        _http("GET", f"{args.url}/health", timeout=5)
     except Exception as e:
         sys.exit(f"服务不可用: {e}")
 
