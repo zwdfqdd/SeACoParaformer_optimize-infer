@@ -47,10 +47,60 @@ class WholeModelWithBiasWrapper(nn.Module):
         self.NO_BIAS = model.NO_BIAS
         self.seaco_weight = model.seaco_weight
 
+    def _calc_predictor_vectorized(self, encoder_out, encoder_out_lens):
+        """向量化 CIF predictor（无 for 循环，支持 batch>1）。
+
+        与分段导出 CIFWrapper 逻辑完全一致：避免原始 cif() 的
+        `for b in range(batch_size)` 在 batch=1 导出时被固化，
+        导致 batch>1 推理时 `index out of bounds`。
+        """
+        from seaco_paraformer.utils import make_pad_mask
+        from seaco_paraformer.predictor import cif_v1_export
+
+        pred = self.model.predictor
+        h = encoder_out
+        b, t, d = h.shape
+
+        # mask: (B, 1, T)
+        mask = (~make_pad_mask(encoder_out_lens, maxlen=t)[:, None, :]).to(h.device)
+
+        # 1. CIF conv → relu → cif_output → sigmoid → relu(smooth)
+        context = h.transpose(1, 2)
+        queries = pred.pad(context)
+        output = torch.relu(pred.cif_conv1d(queries))
+        output_t = output.transpose(1, 2)
+        cif_logit = pred.cif_output(output_t)
+        alphas = torch.sigmoid(cif_logit)
+        alphas = torch.nn.functional.relu(alphas * pred.smooth_factor - pred.noise_threshold)
+
+        # 2. mask
+        mask_t = mask.transpose(-1, -2).float()  # (B, T, 1)
+        alphas = alphas * mask_t
+        alphas = alphas.squeeze(-1)  # (B, T)
+        mask_squeezed = mask_t.squeeze(-1)  # (B, T)
+
+        # 3. tail_process
+        zeros_t = torch.zeros((b, 1), dtype=torch.float32, device=alphas.device)
+        ones_t = torch.ones_like(zeros_t)
+        mask_1 = torch.cat([mask_squeezed, zeros_t], dim=1)
+        mask_2 = torch.cat([ones_t, mask_squeezed], dim=1)
+        tail_mask = mask_2 - mask_1
+        tail_threshold = tail_mask * pred.tail_threshold
+        alphas = torch.cat([alphas, zeros_t], dim=1)
+        alphas = alphas + tail_threshold
+
+        zeros_hidden = torch.zeros((b, 1, d), dtype=h.dtype, device=h.device)
+        hidden = torch.cat([h, zeros_hidden], dim=1)
+        token_num = alphas.sum(dim=-1)
+
+        # 4. CIF 核心（向量化）
+        acoustic_embeds, _ = cif_v1_export(hidden, alphas, pred.threshold)
+        return acoustic_embeds, token_num
+
     def forward(self, speech, speech_lengths, bias_embed):
-        # encoder + predictor（与原 forward 一致，复用 Loop 版 CIF，ORT 兼容）
+        # encoder + 向量化 predictor（无 Loop，支持 batch>1）
         encoder_out, encoder_out_lens = self.model.encode(speech, speech_lengths)
-        acoustic_embeds, token_num, _, _ = self.model.calc_predictor(
+        acoustic_embeds, token_num = self._calc_predictor_vectorized(
             encoder_out, encoder_out_lens
         )
         pre_token_length = token_num.round().long()
