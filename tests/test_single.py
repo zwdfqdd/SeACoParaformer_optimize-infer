@@ -27,6 +27,8 @@
 用法：
     python tests/test_single.py --audio test_data/audio_16000_30s.wav
     python tests/test_single.py --audio test_data/audio_16000_30s.wav --url http://localhost:8099
+
+依赖：仅 Python 标准库（urllib），推理镜像无需额外安装。
 """
 
 import argparse
@@ -34,9 +36,9 @@ import base64
 import json
 import sys
 import time
+import urllib.request
+import urllib.error
 from pathlib import Path
-
-import requests
 
 
 def main():
@@ -58,13 +60,27 @@ def main():
         payload["hotwords"] = args.hotwords
 
     # 发送请求
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{args.url}/asr", data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
     t0 = time.perf_counter()
-    resp = requests.post(f"{args.url}/asr", json=payload, timeout=120)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            status = resp.status
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        status = e.code
+        raw = e.read().decode("utf-8")
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
-    result = resp.json()
-    print(f"状态: {resp.status_code} | 耗时: {elapsed_ms:.0f}ms")
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    try:
+        result = json.loads(raw)
+        pretty = json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception:
+        pretty = raw
+    print(f"状态: {status} | 耗时: {elapsed_ms:.0f}ms")
+    print(pretty)
 
 
 if __name__ == "__main__":

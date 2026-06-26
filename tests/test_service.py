@@ -22,37 +22,56 @@
 """
 
 import argparse
-import asyncio
 import base64
 import json
 import sys
 import time
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import numpy as np
 
-try:
-    import aiohttp
-except ImportError:
-    print("需要安装 aiohttp: pip install aiohttp")
-    sys.exit(1)
+def _percentile(sorted_vals: list, pct: float) -> float:
+    """线性插值百分位（替代 numpy.percentile，零依赖）。"""
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    k = (len(sorted_vals) - 1) * (pct / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    frac = k - lo
+    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * frac
 
 
-async def send_request(session: "aiohttp.ClientSession", url: str, payload: dict) -> dict:
-    """发送单个 ASR 请求，返回结果和耗时。"""
+def send_request(url: str, payload: dict) -> dict:
+    """发送单个 ASR 请求（同步，urllib），返回结果和耗时。"""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{url}/asr", data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
     t0 = time.perf_counter()
     try:
-        async with session.post(f"{url}/asr", json=payload, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             elapsed = time.perf_counter() - t0
             status = resp.status
-            body = await resp.json()
-            return {
-                "success": status == 200,
-                "status": status,
-                "elapsed_s": elapsed,
-                "text_len": len(body.get("text", "")) if status == 200 else 0,
-                "error": body.get("error", "") if status != 200 else "",
-            }
+            body = json.loads(resp.read().decode("utf-8"))
+        return {
+            "success": status == 200,
+            "status": status,
+            "elapsed_s": elapsed,
+            "text_len": len(body.get("text", "")) if status == 200 else 0,
+            "error": body.get("error", "") if status != 200 else "",
+        }
+    except urllib.error.HTTPError as e:
+        elapsed = time.perf_counter() - t0
+        try:
+            body = json.loads(e.read().decode("utf-8"))
+            err = body.get("error", f"HTTP {e.code}")
+        except Exception:
+            err = f"HTTP {e.code}"
+        return {"success": False, "status": e.code, "elapsed_s": elapsed, "text_len": 0, "error": err}
     except Exception as e:
         elapsed = time.perf_counter() - t0
         return {
@@ -64,30 +83,21 @@ async def send_request(session: "aiohttp.ClientSession", url: str, payload: dict
         }
 
 
-async def run_benchmark(url: str, payload: dict, concurrency: int, total: int, audio_duration: float):
-    """并发压测。"""
-    semaphore = asyncio.Semaphore(concurrency)
-    results = []
-
-    async def worker():
-        async with semaphore:
-            async with aiohttp.ClientSession() as session:
-                result = await send_request(session, url, payload)
-                results.append(result)
-
+def run_benchmark(url: str, payload: dict, concurrency: int, total: int, audio_duration: float):
+    """并发压测（线程池模拟多客户端）。"""
     print(f"开始压测: 并发={concurrency}, 总请求={total}")
     print(f"目标: {url}/asr")
     print()
 
     wall_start = time.perf_counter()
-    tasks = [asyncio.create_task(worker()) for _ in range(total)]
-    await asyncio.gather(*tasks)
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        results = list(pool.map(lambda _: send_request(url, payload), range(total)))
     wall_time = time.perf_counter() - wall_start
 
     return results, wall_time
 
 
-def compute_metrics(results: list[dict], wall_time: float, audio_duration: float, concurrency: int):
+def compute_metrics(results: list, wall_time: float, audio_duration: float, concurrency: int):
     """计算性能指标。"""
     success_results = [r for r in results if r["success"]]
     failed_results = [r for r in results if not r["success"]]
@@ -103,11 +113,11 @@ def compute_metrics(results: list[dict], wall_time: float, audio_duration: float
     latencies = sorted([r["elapsed_s"] for r in success_results])
 
     # 基础统计
-    avg_latency = np.mean(latencies)
-    p50 = np.percentile(latencies, 50)
-    p90 = np.percentile(latencies, 90)
-    p95 = np.percentile(latencies, 95)
-    p99 = np.percentile(latencies, 99)
+    avg_latency = sum(latencies) / len(latencies)
+    p50 = _percentile(latencies, 50)
+    p90 = _percentile(latencies, 90)
+    p95 = _percentile(latencies, 95)
+    p99 = _percentile(latencies, 99)
     min_latency = min(latencies)
     max_latency = max(latencies)
 
@@ -199,12 +209,13 @@ def main():
     if not Path(args.audio).exists():
         sys.exit(f"错误：音频不存在: {args.audio}")
 
-    # 加载音频并编码
-    import soundfile as sf
-    pcm, sr = sf.read(args.audio, dtype="float32")
-    if len(pcm.shape) > 1:
-        pcm = pcm[:, 0]
-    audio_duration = len(pcm) / sr
+    # 读取音频时长（标准库 wave，仅用于 RTF/RTX 计算）
+    import wave
+    try:
+        with wave.open(args.audio, "rb") as w:
+            audio_duration = w.getnframes() / w.getframerate()
+    except Exception as e:
+        sys.exit(f"错误：无法读取音频时长（需 WAV 格式）: {e}")
 
     # 读取原始字节做 base64
     with open(args.audio, "rb") as f:
@@ -249,8 +260,8 @@ def main():
     print()
 
     # 运行压测
-    results, wall_time = asyncio.run(
-        run_benchmark(args.url, payload, args.concurrency, args.total, audio_duration)
+    results, wall_time = run_benchmark(
+        args.url, payload, args.concurrency, args.total, audio_duration
     )
 
     # 计算指标

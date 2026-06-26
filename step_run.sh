@@ -256,10 +256,10 @@ step 8:
     # ─── 健康/指标/错误码路径（标准库 urllib） ──────────────────
     python tests/test_error_api.py --url http://localhost:8080
 
-    # ─── 单次请求详细输出（依赖 requests，需 pip install requests） ─
+    # ─── 单次请求详细输出（标准库 urllib） ─────────────────────
     python tests/test_single.py --audio test_data/audio_16000_30s.wav --url http://localhost:8080
 
-    # ─── 性能/并发压测（依赖 aiohttp，需 pip install aiohttp） ────
+    # ─── 性能/并发压测（标准库 urllib + 线程池） ────────────────
     # 单请求延迟
     python tests/test_service.py --audio test_data/audio_16000_30s.wav --url http://localhost:8080
     # 并发压测（10 并发，共 50 请求）
@@ -271,11 +271,9 @@ step 8:
 # ============================================================
 # 无额外依赖（标准库 urllib，推理镜像可直接跑）：
 #   tests/test_asr_api.py / test_hotword_api.py / test_error_api.py
+#   tests/test_single.py / test_service.py
 # 需 onnxruntime + torch + numpy + soundfile（推理镜像已含）：
 #   tests/test_model.py / test_vad.py / verify_onnx.py
-# 需额外 pip 安装：
-#   tests/test_single.py   → requests
-#   tests/test_service.py  → aiohttp
 # 转换环境专用（需 funasr/torch）：
 #   tests/test_pt_inference_v2.py / test_split_onnx_pipeline.py / test_trt_pipeline.py
 # ============================================================
