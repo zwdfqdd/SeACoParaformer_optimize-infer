@@ -117,10 +117,11 @@ async def lifespan(app: FastAPI):
     hotword_manager.start_polling()
 
     _concurrent_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_REQUESTS)
-    # CPU 线程池
+    # CPU 线程池（Stage1 VAD + Stage2 特征提取）
     import os
+    _cpu_pool_size = settings.CPU_THREAD_POOL_SIZE or (os.cpu_count() or 4)
     _cpu_executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=os.cpu_count() or 4,
+        max_workers=_cpu_pool_size,
         thread_name_prefix="cpu_worker",
     )
     _init_gpu_metrics()

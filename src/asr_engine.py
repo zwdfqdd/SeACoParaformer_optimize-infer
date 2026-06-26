@@ -120,8 +120,13 @@ class ASREngine:
         sess_options.enable_cpu_mem_arena = False
 
         if self._device == "cpu":
-            sess_options.intra_op_num_threads = os.cpu_count() or 4
-            sess_options.inter_op_num_threads = 2
+            intra = settings.ORT_INTRA_OP_THREADS or (os.cpu_count() or 4)
+            sess_options.intra_op_num_threads = intra
+            sess_options.inter_op_num_threads = settings.ORT_INTER_OP_THREADS
+            logger.info(
+                f"ORT CPU 线程配置: intra_op={intra}, inter_op={settings.ORT_INTER_OP_THREADS}"
+                f"（高并发请按 总核数/并发数 调小 ORT_INTRA_OP_THREADS 避免线程超额订阅）"
+            )
             providers = ["CPUExecutionProvider"]
         else:
             providers = [
