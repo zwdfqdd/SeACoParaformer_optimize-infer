@@ -67,6 +67,17 @@ class Settings:
     # 模型精度（见文件头精度矩阵）
     MODEL_PRECISION: str = os.getenv("MODEL_PRECISION", "auto")
 
+    # CPU 推理线程数（仅 onnx_int8/onnx_fp32 走 CPU 时生效）
+    #   ORT_INTRA_OP_THREADS：单个推理 session 内算子并行线程数（0=自动取 cpu_count）
+    #   ORT_INTER_OP_THREADS：session 间算子并行线程数（默认 1）
+    # 高并发场景务必显式设小（如 总核数 / 预期并发），避免线程超额订阅导致越并发越慢。
+    ORT_INTRA_OP_THREADS: int = int(os.getenv("ORT_INTRA_OP_THREADS", "0"))
+    ORT_INTER_OP_THREADS: int = int(os.getenv("ORT_INTER_OP_THREADS", "1"))
+
+    # CPU 流水线线程池大小（Stage1 VAD + Stage2 特征提取）。0=自动取 cpu_count。
+    # 多 worker（WORKS>1）时务必显式设小，避免每 worker 各开满核导致线程超额订阅。
+    CPU_THREAD_POOL_SIZE: int = int(os.getenv("CPU_THREAD_POOL_SIZE", "0"))
+
     # 固定参数（模型已打包进镜像）
     MODEL_DIR: str = "./models"
 
@@ -202,8 +213,8 @@ class Settings:
     # 设备 / 精度选择
     # ============================================================
     @classmethod
-    def get_device(cls) -> str:
-        """检测推理设备，有 GPU 用 GPU，否则用 CPU。"""
+    def _detect_hardware_device(cls) -> str:
+        """仅探测硬件：有可用 GPU 返回 cuda，否则 cpu（不考虑精度）。"""
         try:
             import torch
             if torch.cuda.is_available():
@@ -211,6 +222,19 @@ class Settings:
         except ImportError:
             pass
         return "cpu"
+
+    @classmethod
+    def get_device(cls) -> str:
+        """推理设备。
+
+        在硬件探测基础上叠加精度约束：
+        onnx_int8 是 CPU 专用（动态量化算子在 CUDA EP 上不支持，会 fallback
+        CPU 并反复 Memcpy，既慢又无意义），故强制返回 cpu。
+        """
+        device = cls._detect_hardware_device()
+        if device == "cuda" and cls.get_model_precision() == "onnx_int8":
+            return "cpu"
+        return device
 
     @classmethod
     def get_model_precision(cls) -> str:
@@ -228,7 +252,7 @@ class Settings:
             return precision
 
         # auto 或未知取值 → 自动探测
-        device = cls.get_device()
+        device = cls._detect_hardware_device()
         if device == "cuda":
             # 优先线上推荐方案：encoder int8 + 其余 fp16
             if cls._has_trt_profile("trt_int8_enc"):
