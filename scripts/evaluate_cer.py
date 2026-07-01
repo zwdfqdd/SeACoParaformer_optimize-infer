@@ -219,7 +219,7 @@ def main():
     parser.add_argument("--audio-dir", default="calib_data/audio_data",
                         help="测试音频目录（递归扫描 *.wav）")
     parser.add_argument("--engine-dir", default="./models/asr/trt")
-    parser.add_argument("--config-dir", default="./models/asr")
+    parser.add_argument("--config-dir", default="./models/asr/pt")
     parser.add_argument("--threshold", type=float, default=0.03,
                         help="CER 阈值（默认 0.03 = 3%）")
     parser.add_argument("--hotwords", nargs="*", default=None, help="热词列表")

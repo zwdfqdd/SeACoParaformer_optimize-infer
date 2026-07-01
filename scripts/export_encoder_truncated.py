@@ -52,10 +52,14 @@ class TruncatedEncoderWrapper(nn.Module):
 
 def main():
     parser = argparse.ArgumentParser(description="截断 Encoder 导出")
-    parser.add_argument("--model-id", default="iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
+    parser.add_argument("--model-id", default="./models/asr/pt",
+                        help="PT 模型本地目录路径（默认 ./models/asr/pt，不联网下载）")
     parser.add_argument("--num-layers", type=int, default=40, help="保留的 encoder 层数")
     parser.add_argument("--output", default=None, help="输出路径")
     parser.add_argument("--opset", type=int, default=17)
+    parser.add_argument("--compare", action="store_true",
+                        help="导出后立即用 PT(截断版) vs ORT 对比同输入的 encoder_out，定位误差层")
+    parser.add_argument("--cmp-frames", type=int, default=125, help="对比用的序列帧数")
     args = parser.parse_args()
 
     if args.output is None:
@@ -99,6 +103,27 @@ def main():
 
     size_mb = Path(output_path).stat().st_size / (1024 * 1024)
     print(f"\n  输出: {output_path} ({size_mb:.1f}MB)")
+
+    # 对比 PT(截断版) vs ORT，定位误差层
+    if args.compare:
+        import numpy as np
+        import onnxruntime as ort
+        print(f"\n{'='*60}")
+        print(f"[对比] PT(前{args.num_layers}层) vs ORT，{args.cmp_frames} 帧随机输入")
+        print(f"{'='*60}")
+        torch.manual_seed(0)
+        x = torch.randn(1, args.cmp_frames, 560)
+        xl = torch.tensor([args.cmp_frames], dtype=torch.long)
+        with torch.no_grad():
+            pt_out, _ = encoder(x, xl)
+        pt_out = pt_out.cpu().numpy()
+        sess = ort.InferenceSession(output_path, providers=["CPUExecutionProvider"])
+        ort_out = sess.run(["encoder_out"], {"speech": x.numpy(), "speech_lengths": xl.numpy()})[0]
+        d = np.abs(pt_out - ort_out).max()
+        print(f"  PT  out abs max={np.abs(pt_out).max():.4f}")
+        print(f"  ORT out abs max={np.abs(ort_out).max():.4f}")
+        print(f"  encoder_out 最大绝对误差: {d:.6f}  "
+              f"{'✓ 一致（此截断点无问题）' if d < 1e-2 else '✗ 误差已出现（根因在前 '+str(args.num_layers)+' 层内）'}")
 
 
 if __name__ == "__main__":

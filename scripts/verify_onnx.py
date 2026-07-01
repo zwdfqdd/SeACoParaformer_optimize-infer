@@ -194,8 +194,8 @@ def infer_pytorch(model_id, audio_data):
 
     pt_model = load_model(model_id)
 
-    # 特征提取
-    cmvn_path = os.path.join("./models/asr", "am.mvn")
+    # 特征提取（配置文件在 models/asr/pt 下）
+    cmvn_path = os.path.join("./models/asr/pt", "am.mvn")
     cmvn_mean, cmvn_istd = load_cmvn(cmvn_path)
     features = extract_features(audio_data, sample_rate=16000, cmvn_mean=cmvn_mean, cmvn_istd=cmvn_istd)
 
@@ -208,7 +208,7 @@ def infer_pytorch(model_id, audio_data):
 
     # 解码
     tokenizer = Tokenizer()
-    tokenizer.load(os.path.join("./models/asr", "tokens.json"))
+    tokenizer.load(os.path.join("./models/asr/pt", "tokens.json"))
     token_ids = np.argmax(logits[0].numpy(), axis=-1)
     text = tokenizer.decode(token_ids)
 
@@ -233,8 +233,8 @@ def infer_onnx(onnx_dir, audio_data, sr, device="cpu"):
             sys.exit(f"错误：{onnx_dir} 下未找到 .onnx 文件")
     print(f"  模型: {onnx_path}")
 
-    # 配置文件统一在 models/asr 下（onnx_dir 的父目录）
-    config_dir = onnx_dir.parent
+    # 配置文件统一在 models/asr/pt 下（onnx_dir 的父目录的 pt 子目录）
+    config_dir = onnx_dir.parent / "pt"
 
     # 加载 CMVN
     cmvn_mean, cmvn_istd = None, None
@@ -289,7 +289,7 @@ def infer_onnx(onnx_dir, audio_data, sr, device="cpu"):
     # 解码
     token_ids = np.argmax(logits[0], axis=-1)
     token_list = None
-    config_dir_tokens = onnx_dir.parent
+    config_dir_tokens = onnx_dir.parent / "pt"
     for name in ["tokens.json", "tokens.txt"]:
         p = config_dir_tokens / name
         if p.exists():
@@ -323,8 +323,9 @@ def compute_cer(reference, hypothesis):
 def main():
     parser = argparse.ArgumentParser(description="ONNX 精度验证（导出环境）")
     parser.add_argument("--audio", required=True, help="WAV 16kHz 单声道音频")
-    parser.add_argument("--model-id", default="iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
-    parser.add_argument("--onnx-dir", default="./models/asr/fp32", help="ONNX 模型目录（含 model.onnx；am.mvn 和 tokens.json 在父目录 models/asr 下）")
+    parser.add_argument("--model-id", default="./models/asr/pt",
+                        help="PT 模型本地目录路径（默认 ./models/asr/pt，不联网下载）")
+    parser.add_argument("--onnx-dir", default="./models/asr/fp32", help="ONNX 模型目录（含 model.onnx；am.mvn 和 tokens.json 在 models/asr/pt 下）")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="ONNX 推理设备（默认 cpu）")
     args = parser.parse_args()
 

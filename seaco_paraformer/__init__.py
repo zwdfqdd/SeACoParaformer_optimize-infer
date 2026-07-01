@@ -14,7 +14,7 @@ SeACo-Paraformer 模型代码框架（从 FunASR 训练源码抽取）
     encoder.py    — SANMEncoder + EncoderLayerSANM
     decoder.py    — ParaformerSANMDecoder + DecoderLayerSANM
     model.py      — SeacoParaformer（主模型，含 SeACo 热词推理）
-    load_model.py — 从 ModelScope 下载权重并加载
+    load_model.py — 从本地目录加载权重（默认 ./models/asr/pt，不联网下载）
 """
 
 from .load_model import load_model

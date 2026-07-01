@@ -128,7 +128,7 @@ def ensure_split_onnx() -> bool:
         return False
     print("[构建] 导出分段 ONNX...")
     return _run([sys.executable, "scripts/export_onnx_split.py",
-                 "--output-dir", SPLIT_DIR, "--clamp-value", "30000",
+                 "--output-dir", SPLIT_DIR, "--clamp-value", "60000",
                  *_model_id_args()])
 
 
@@ -148,7 +148,7 @@ def ensure_qdq_onnx(module: str) -> bool:
         return _run([sys.executable, "scripts/export_encoder_qdq.py",
                      "--calib-data", CALIB_DATA,
                      "--output", os.path.join(SPLIT_DIR, "encoder_qdq.onnx"),
-                     *_model_id_args()])
+                     *_model_id_args(), *_cmvn_args()])
     elif module == "cif":
         # cif QDQ 需要 fp16 encoder engine 生成校准输入
         gpu = _gpu_name()
@@ -164,7 +164,7 @@ def ensure_qdq_onnx(module: str) -> bool:
                      "--calib-data", CALIB_DATA,
                      "--encoder-engine", enc_engine,
                      "--output", os.path.join(SPLIT_DIR, "cif_qdq.onnx"),
-                     *_model_id_args()])
+                     *_model_id_args(), *_cmvn_args()])
     elif module == "decoder":
         # decoder QDQ 需要 fp16 encoder/cif engine 生成校准输入
         gpu = _gpu_name()
@@ -183,7 +183,7 @@ def ensure_qdq_onnx(module: str) -> bool:
                      "--encoder-engine", enc_engine,
                      "--cif-engine", cif_engine,
                      "--output", os.path.join(SPLIT_DIR, "decoder_qdq.onnx"),
-                     *_model_id_args()])
+                     *_model_id_args(), *_cmvn_args()])
     elif module == "bias_encoder":
         # bias QDQ 自包含（无需上游 engine），用词表编码 token 校准
         if not ensure_pt():
@@ -191,7 +191,7 @@ def ensure_qdq_onnx(module: str) -> bool:
         print("[构建] 导出 bias_encoder QDQ ONNX...")
         return _run([sys.executable, "scripts/export_bias_qdq.py",
                      "--output", os.path.join(SPLIT_DIR, "bias_encoder_qdq.onnx"),
-                     *_model_id_args()])
+                     *_model_id_args(), *_tokens_args()])
     else:
         print(f"[跳过] {module} 无 QDQ 导出脚本")
         return False
@@ -253,6 +253,22 @@ def _model_id_args() -> list[str]:
     """若本地 PT 目录存在，返回 --model-id 参数，否则返回空（用脚本默认在线 ID）。"""
     if os.path.isdir(PT_MODEL_DIR):
         return ["--model-id", PT_MODEL_DIR]
+    return []
+
+
+def _cmvn_args() -> list[str]:
+    """显式传 cmvn 路径（配置文件在 PT_MODEL_DIR=models/asr/pt 下）。"""
+    cmvn_path = os.path.join(PT_MODEL_DIR, "am.mvn")
+    if os.path.exists(cmvn_path):
+        return ["--cmvn-path", cmvn_path]
+    return []
+
+
+def _tokens_args() -> list[str]:
+    """显式传 tokens 路径（bias QDQ 用，配置文件在 PT_MODEL_DIR 下）。"""
+    tokens_path = os.path.join(PT_MODEL_DIR, "tokens.json")
+    if os.path.exists(tokens_path):
+        return ["--tokens-path", tokens_path]
     return []
 
 
