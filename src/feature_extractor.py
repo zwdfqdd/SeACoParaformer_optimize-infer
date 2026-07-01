@@ -33,6 +33,23 @@ DITHER = 0.0  # 推理时关闭抖动
 
 
 # ============================================================
+# CMVN tensor 缓存（CMVN 固定不变，避免每次调用重建 tensor）
+# 以输入 numpy 数组的 id 为 key，命中则复用已转换的 torch tensor。
+# ============================================================
+_cmvn_cache: dict[int, torch.Tensor] = {}
+
+
+def _as_cached_tensor(arr: np.ndarray) -> torch.Tensor:
+    """把 CMVN numpy 数组转 tensor 并缓存（按数组 id 复用）。"""
+    key = id(arr)
+    t = _cmvn_cache.get(key)
+    if t is None:
+        t = torch.from_numpy(arr).float()
+        _cmvn_cache[key] = t
+    return t
+
+
+# ============================================================
 # 公开接口
 # ============================================================
 def extract_features(
@@ -72,8 +89,8 @@ def extract_features(
 
     # Step 3: CMVN
     if cmvn_mean is not None and cmvn_istd is not None:
-        cmvn_mean_t = torch.from_numpy(cmvn_mean).float()
-        cmvn_istd_t = torch.from_numpy(cmvn_istd).float()
+        cmvn_mean_t = _as_cached_tensor(cmvn_mean)
+        cmvn_istd_t = _as_cached_tensor(cmvn_istd)
         lfr_feats = (lfr_feats + cmvn_mean_t) * cmvn_istd_t
 
     return lfr_feats.numpy().astype(np.float32)

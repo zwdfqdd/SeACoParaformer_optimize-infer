@@ -94,6 +94,23 @@ class GPUScheduler:
         self._lock = asyncio.Lock()
         self._running = False
         self._task: asyncio.Task | None = None
+        # 性能统计（batch 填充率诊断）：累计触发批次数、实际 chunk 数、pad 后 slot 数
+        # 填充率 = 实际 chunk 数 / pad slot 数（越接近 1 越好，越低说明 GPU 空跑 padding 越多）
+        self._stat_batches = 0
+        self._stat_actual = 0
+        self._stat_padded = 0
+
+    def stats(self) -> dict:
+        """返回 batch 调度统计（供 /metrics 诊断填充率）。"""
+        fill = (self._stat_actual / self._stat_padded) if self._stat_padded else 0.0
+        avg_batch = (self._stat_actual / self._stat_batches) if self._stat_batches else 0.0
+        return {
+            "batches": self._stat_batches,
+            "actual_chunks": self._stat_actual,
+            "padded_slots": self._stat_padded,
+            "fill_rate": round(fill, 4),
+            "avg_actual_batch": round(avg_batch, 2),
+        }
 
     async def start(self):
         self._running = True
@@ -213,6 +230,10 @@ class GPUScheduler:
 
         # pad 到合法 batch size
         pad_batch_size = get_pad_batch_size(actual_count)
+        # 填充率统计（诊断 GPU 是否空跑 padding）
+        self._stat_batches += 1
+        self._stat_actual += actual_count
+        self._stat_padded += pad_batch_size
         padded_feats = np.zeros((pad_batch_size, target_seq_len, feat_dim), dtype=np.float32)
         lengths = np.zeros(pad_batch_size, dtype=np.int32)
         actual_lengths = []

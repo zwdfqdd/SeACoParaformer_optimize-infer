@@ -68,17 +68,36 @@ asr_inference_duration = Histogram(
     "ASR 推理耗时",
     buckets=[0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
 )
+
+# 三级流水线分级耗时（定位瓶颈在哪一级：Stage1 CPU / Stage2 CPU / Stage3 GPU）
+_STAGE_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0]
+asr_stage_duration = Histogram(
+    "asr_stage_duration_seconds",
+    "各流水线阶段耗时",
+    ["stage"],  # stage1_decode_vad_seg / stage2_feature / stage3_gpu
+    buckets=_STAGE_BUCKETS,
+)
 gpu_memory_usage = None  # 延迟初始化（仅 GPU 模式）
+scheduler_fill_rate = None  # batch 填充率
+scheduler_avg_batch = None  # 平均实际 batch 大小
 
 
 def _init_gpu_metrics():
-    """初始化 GPU 内存指标（仅在 GPU 可用时）。"""
-    global gpu_memory_usage
+    """初始化 GPU 内存 + 调度器填充率指标。"""
+    global gpu_memory_usage, scheduler_fill_rate, scheduler_avg_batch
     try:
         from prometheus_client import Gauge
         gpu_memory_usage = Gauge(
             "gpu_memory_usage_bytes",
             "GPU 显存使用量（字节）",
+        )
+        scheduler_fill_rate = Gauge(
+            "asr_batch_fill_rate",
+            "GPU batch 填充率（实际chunk数/pad slot数，越接近1越好）",
+        )
+        scheduler_avg_batch = Gauge(
+            "asr_avg_actual_batch",
+            "平均每批实际 chunk 数",
         )
     except Exception:
         pass
@@ -265,6 +284,7 @@ async def metrics():
     """Prometheus 指标接口。"""
     # scrape 时刷新 GPU 显存实际值（Gauge 标准做法）
     _update_gpu_memory_metric()
+    _update_scheduler_metrics()
     return JSONResponse(
         content=generate_latest().decode("utf-8"),
         media_type=CONTENT_TYPE_LATEST,
@@ -280,6 +300,18 @@ def _update_gpu_memory_metric():
         if torch.cuda.is_available():
             # 已预留显存（reserved）最能反映进程实际占用
             gpu_memory_usage.set(float(torch.cuda.memory_reserved(0)))
+    except Exception:
+        pass
+
+
+def _update_scheduler_metrics():
+    """刷新 GPU 调度器 batch 填充率指标（诊断吞吐瓶颈）。"""
+    if scheduler_fill_rate is None:
+        return
+    try:
+        s = gpu_scheduler.stats()
+        scheduler_fill_rate.set(s["fill_rate"])
+        scheduler_avg_batch.set(s["avg_actual_batch"])
     except Exception:
         pass
 
@@ -409,9 +441,11 @@ async def asr_recognize(req: ASRRequest):
                 )
             return pcm, sample_rate, audio_duration_ms, vad_segments, chunks
 
+        _t_s1 = time.time()
         pcm, sample_rate, audio_duration_ms, vad_segments, chunks = (
             await loop.run_in_executor(_cpu_executor, _stage1_cpu)
         )
+        asr_stage_duration.labels(stage="stage1_decode_vad_seg").observe(time.time() - _t_s1)
 
         # ====== Stage 2: 特征提取（CPU 线程池） ======
         # 热词路由（按生效词表大小三路分流）：
@@ -431,29 +465,30 @@ async def asr_recognize(req: ASRRequest):
                     # route=B：普通 ASR + Faiss 后处理纠错（阶段 4 实现）
                     use_faiss_correction = True
 
-        def _stage2_extract_features():
-            t0 = time.time()
-            features_list = []
-            for chunk in chunks:
-                chunk_audio = extract_chunk_audio(pcm, chunk, sample_rate)
-                features = extract_features(
-                    chunk_audio,
-                    sample_rate=sample_rate,
-                    cmvn_mean=_cmvn_mean,
-                    cmvn_istd=_cmvn_istd,
-                )
-                features_list.append(features)
-            if settings.VERBOSE:
-                shapes = [f.shape for f in features_list]
-                logger.debug(
-                    f"[Stage2] 特征提取={int((time.time()-t0)*1000)}ms, "
-                    f"chunks={len(features_list)}, shapes={shapes}"
-                )
-            return features_list
+        def _extract_one(chunk: ChunkMeta) -> np.ndarray:
+            chunk_audio = extract_chunk_audio(pcm, chunk, sample_rate)
+            return extract_features(
+                chunk_audio,
+                sample_rate=sample_rate,
+                cmvn_mean=_cmvn_mean,
+                cmvn_istd=_cmvn_istd,
+            )
 
-        features_list = await loop.run_in_executor(_cpu_executor, _stage2_extract_features)
+        # Stage 2：多 chunk 特征提取并行（各 chunk 提交到 CPU 线程池，asyncio.gather 并发）
+        # 长音频多 chunk 时，相比串行循环显著降低 Stage2 墙钟耗时。
+        t_feat0 = time.time()
+        feat_tasks = [loop.run_in_executor(_cpu_executor, _extract_one, c) for c in chunks]
+        features_list = await asyncio.gather(*feat_tasks)
+        asr_stage_duration.labels(stage="stage2_feature").observe(time.time() - t_feat0)
+        if settings.VERBOSE:
+            shapes = [f.shape for f in features_list]
+            logger.debug(
+                f"[Stage2] 特征提取={int((time.time()-t_feat0)*1000)}ms（并行）, "
+                f"chunks={len(features_list)}, shapes={shapes}"
+            )
 
         # ====== Stage 3: GPU 推理（Scheduler: 固定 shape bucket + batch_timeout） ======
+        _t_s3 = time.time()
         with asr_inference_duration.time():
             tasks = []
             for features in features_list:
@@ -461,6 +496,7 @@ async def asr_recognize(req: ASRRequest):
                 tasks.append(task)
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
+        asr_stage_duration.labels(stage="stage3_gpu").observe(time.time() - _t_s3)
 
         # 检查异常
         chunk_results = []
