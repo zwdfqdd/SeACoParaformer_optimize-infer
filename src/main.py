@@ -228,15 +228,22 @@ app = FastAPI(
 # ============================================================
 @app.exception_handler(ASRException)
 async def asr_exception_handler(request: Request, exc: ASRException):
-    """统一业务异常处理。"""
+    """统一业务异常处理。
+
+    /asr 接口的失败响应补充 text/detail 空值字段，与成功响应结构保持一致，
+    便于客户端用统一结构解析（成功 text 有值/detail 有段，失败均为空）。
+    其他接口（如 /hotwords/*）保持精简的 code/error/message 结构。
+    """
     asr_request_total.labels(status="error").inc()
+    content = {"code": int(exc.code)}
+    if request.url.path == "/asr":
+        content["text"] = ""
+        content["detail"] = {}
+    content["error"] = exc.code.name
+    content["message"] = exc.message
     return JSONResponse(
         status_code=exc.http_status,
-        content={
-            "code": int(exc.code),
-            "error": exc.code.name,
-            "message": exc.message,
-        },
+        content=content,
     )
 
 

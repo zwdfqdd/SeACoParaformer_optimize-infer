@@ -32,6 +32,11 @@ onnx==1.16.1                   # ONNX 导出 / int8 动态量化
 # 安装：pip install nvidia-modelopt==0.21.0 torchprofile --extra-index-url https://pypi.nvidia.com
 nvidia-modelopt==0.21.0
 torchprofile==0.0.4
+# modelopt 0.21 的隐性依赖（其元数据未声明为强制，但 import modelopt.torch 时全量加载子模块会触发）：
+#   缺失会报 ModuleNotFoundError: No module named 'pulp' / 'regex'
+#   → ImportError: Please install optional [torch] dependencies（误导，实为缺这两个纯工具库）
+pulp==2.8.0                    # modelopt NAS/搜索模块依赖（量化路径间接加载）
+regex==2024.5.15               # modelopt 量化算法模块依赖
 
 # ─── 路径 B：Faiss 大词库后处理纠错（默认词表 >MAX_HOTWORD_NUM 时启用） ───
 # 缺失时路径 B 自动禁用（懒导入），不影响路径 A / 主推理
