@@ -124,7 +124,8 @@ def quantize_with_modelopt(wrapper, samples, output_path, opset, calib_hw_len,
     print(f"\n[modelopt] 导出 QDQ ONNX: {output_path}")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # dummy：(H, L) 热词 token（含哨兵行）
+    # dummy：(num_hotwords, hw_len) 热词 token，含哨兵行。
+    # num_hotwords/hw_len 均为动态轴，dummy 取 (4, calib_hw_len) 示例值（各导出统一）。
     dummy = torch.ones((4, calib_hw_len), dtype=torch.long)
 
     with torch.no_grad():
@@ -158,18 +159,18 @@ def main():
     parser = argparse.ArgumentParser(description="Bias Encoder QDQ 量化导出（方案 1）")
     parser.add_argument("--hotword-file", default="./models/asr/hotwords.txt",
                         help="校准用词表（编码出 token 序列）")
-    parser.add_argument("--tokens-path", default="./models/asr/tokens.json")
+    parser.add_argument("--tokens-path", default="./models/asr/pt/tokens.json")
     parser.add_argument("--output", default="./models/asr/split/bias_encoder_qdq.onnx")
     parser.add_argument("--opset", type=int, default=17)
-    parser.add_argument("--calib-hw-len", type=int, default=8)
+    parser.add_argument("--calib-hw-len", type=int, default=16)
     parser.add_argument("--max-samples", type=int, default=500)
     parser.add_argument("--backend", default=None,
                         choices=["modelopt", "pytorch_quantization"])
     parser.add_argument("--exclude-patterns", nargs="*", default=[],
                         help="排除量化的模块名模式（保持 fp16）。"
                              "如 LSTM 量化导致热词精度下降，可加 bias_encoder。")
-    parser.add_argument("--model-id", default=None,
-                        help="PT 模型 ID 或本地目录路径（默认 ModelScope 在线）")
+    parser.add_argument("--model-id", default="./models/asr/pt",
+                        help="PT 模型本地目录路径（默认 ./models/asr/pt，不联网下载）")
     args = parser.parse_args()
 
     backend = detect_backend(args.backend)

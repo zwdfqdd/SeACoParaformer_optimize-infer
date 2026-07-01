@@ -178,8 +178,8 @@ class DecoderWithSeACoWrapper(nn.Module):
 class BiasEncoderWrapper(nn.Module):
     """Bias Encoder 导出 wrapper。
 
-    输入：hotword (H, L) — H 个热词的 token IDs（已 pad）
-    输出：hw_embed (L, H, D) — LSTM 全序列输出（外部按热词长度取最后时间步）
+    输入：hotword (num_hotwords, hw_len) — num_hotwords 个热词的 token IDs（已 pad）
+    输出：hw_embed (hw_len, num_hotwords, D) — LSTM 全序列输出（外部按热词长度取最后时间步）
 
     简化：使用全序列 LSTM（不用 pack_padded_sequence，便于 ONNX 导出）。
     外部代码需按 hotword_lengths 取每个热词的最后有效时间步。
@@ -212,8 +212,9 @@ def export_encoder(model, output_path: str, opset: int = 17, clamp_value: float 
     """导出 Encoder（仅 speech 输入）。
 
     Args:
-        clamp_value: 残差 Add 后的 clamp 阈值。None 或 0 = 不 clamp（PT/fp32 模式）。
-                     fp16 ONNX 推荐 30000（远大于 PT 真实峰值 ~7554，且远小于 fp16 上限 65504）。
+        clamp_value: 残差 Add 后的 clamp 阈值。None 或 0 = 不 clamp（PT/fp32/ORT 模式，无损）。
+                     fp16/int8 推荐 60000：encoder 后段层残差激活峰值高达 ~48万（远超 fp16 上限
+                     65504），60000 贴近上限最大化保留信息；clamp=30000 裁剪过狠已弃用。
     """
     print("\n[1/4] 导出 Encoder...")
     if clamp_value is not None and clamp_value > 0:
@@ -228,7 +229,7 @@ def export_encoder(model, output_path: str, opset: int = 17, clamp_value: float 
     encoder = EncoderWrapper(model.encoder)
     encoder.eval()
 
-    batch, seq_len, feat_dim = 1, 167, 560
+    batch, seq_len, feat_dim = 1, 134, 560
     speech = torch.randn(batch, seq_len, feat_dim)
 
     torch.onnx.export(
@@ -255,8 +256,8 @@ def export_cif(model, output_path: str, opset: int = 17):
 
     # 用真实 encoder 输出作为 dummy input
     with torch.no_grad():
-        dummy_speech = torch.randn(1, 167, 560)
-        dummy_lengths = torch.tensor([167], dtype=torch.long)
+        dummy_speech = torch.randn(1, 134, 560)
+        dummy_lengths = torch.tensor([134], dtype=torch.long)
         enc_out, _, _ = model.encoder(dummy_speech, dummy_lengths)
 
     mask = torch.ones(1, 1, enc_out.shape[1])
@@ -287,8 +288,8 @@ def export_decoder(model, output_path: str, opset: int = 17):
     dec_wrapper = DecoderWithSeACoWrapper(model)
     dec_wrapper.eval()
 
-    batch, token_len, enc_len, hidden_dim = 1, 61, 167, 512
-    num_hotwords = 3
+    batch, token_len, enc_len, hidden_dim = 1, 61, 134, 512
+    num_hotwords = 4
 
     acoustic_embeds = torch.randn(batch, token_len, hidden_dim)
     token_num = torch.tensor([token_len], dtype=torch.long)
@@ -322,8 +323,8 @@ def export_bias_encoder(model, output_path: str, opset: int = 17):
     bias_wrapper = BiasEncoderWrapper(model)
     bias_wrapper.eval()
 
-    num_hotwords, max_len = 3, 4
-    hotword = torch.randint(0, 8404, (num_hotwords, max_len), dtype=torch.long)
+    num_hotwords, hw_len = 4, 4
+    hotword = torch.randint(0, 8404, (num_hotwords, hw_len), dtype=torch.long)
 
     torch.onnx.export(
         bias_wrapper,
@@ -333,8 +334,8 @@ def export_bias_encoder(model, output_path: str, opset: int = 17):
         input_names=["hotword"],
         output_names=["hw_embed"],
         dynamic_axes={
-            "hotword": {0: "num_hotwords", 1: "max_len"},
-            "hw_embed": {0: "seq_len", 1: "num_hotwords"},
+            "hotword": {0: "num_hotwords", 1: "hw_len"},
+            "hw_embed": {0: "hw_len", 1: "num_hotwords"},
         },
     )
     size_mb = Path(output_path).stat().st_size / (1024 * 1024)
@@ -346,16 +347,18 @@ def export_bias_encoder(model, output_path: str, opset: int = 17):
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(description="SeACo-Paraformer 分段 ONNX 导出")
-    parser.add_argument("--model-id", default="iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
+    parser.add_argument("--model-id", default="./models/asr/pt",
+                        help="PT 模型本地目录路径（默认 ./models/asr/pt，不联网下载）")
     parser.add_argument("--output-dir", default="./models/asr/split")
     parser.add_argument("--opset", type=int, default=17,
                         help="ONNX opset 版本（默认 17，启用原生 LayerNormalization 算子，"
                              "fp16 推理无需 fp32 fallback）")
-    parser.add_argument("--clamp-value", type=float, default=30000.0,
-                        help="encoder 残差 Add 后 clamp 阈值（默认 30000）。"
-                             "fp16 ONNX 推荐 ≥ PT 真实激活峰值（~7554）且 < fp16 上限 65504。"
-                             "30000 在两者之间，留有充足余量。"
-                             "传 None 或 0 会禁用 clamp（仅用于 fp32 baseline 实验）。")
+    parser.add_argument("--clamp-value", type=float, default=60000.0,
+                        help="encoder 残差 Add 后 clamp 阈值（默认 60000，fp16/int8 标准）。"
+                             "背景：encoder 后段层(32-49)残差累积激活峰值高达 ~48万，远超 fp16 上限 65504。"
+                             "clamp=60000 贴近 fp16 上限、最大化保留信息（仅极少数峰值点被裁，CER 影响极小）；"
+                             "clamp=30000 裁剪过狠（后段裁到3万）导致截断输入解码错乱，已弃用。"
+                             "传 0 禁用 clamp（仅 fp32/ORT 路径用，无损但 fp16 会溢出）。")
     parser.add_argument("--skip", nargs="*", default=[],
                         choices=["encoder", "cif", "decoder", "bias_encoder"],
                         help="跳过指定模块")

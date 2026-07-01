@@ -201,7 +201,7 @@ def export_fp32_onnx(model_id: str, output_dir: Path, opset_version: int = 17):
     main_wrapper.eval()
 
     batch, seq_len, feat_dim = 1, 289, 560
-    num_hotwords = 3
+    num_hotwords = 4
     speech = torch.randn(batch, seq_len, feat_dim)
     speech_lengths = torch.tensor([seq_len], dtype=torch.long)
     bias_embed = torch.randn(batch, num_hotwords, inner_dim)
@@ -228,9 +228,9 @@ def export_fp32_onnx(model_id: str, output_dir: Path, opset_version: int = 17):
     bias_wrapper = BiasEncoderWrapper(pt_model)
     bias_wrapper.eval()
 
-    max_len = 4
-    hotword = torch.randint(1, 8404, (num_hotwords, max_len), dtype=torch.long)
-    hotword_lengths = torch.tensor([max_len] * num_hotwords, dtype=torch.long)
+    hw_len = 4
+    hotword = torch.randint(1, 8404, (num_hotwords, hw_len), dtype=torch.long)
+    hotword_lengths = torch.tensor([hw_len] * num_hotwords, dtype=torch.long)
 
     eb_path = export_dir / "model_eb.onnx"
     torch.onnx.export(
@@ -241,7 +241,7 @@ def export_fp32_onnx(model_id: str, output_dir: Path, opset_version: int = 17):
         input_names=["hotword", "hotword_lengths"],
         output_names=["bias_embed"],
         dynamic_axes={
-            "hotword": {0: "num_hotwords", 1: "max_len"},
+            "hotword": {0: "num_hotwords", 1: "hw_len"},
             "hotword_lengths": {0: "num_hotwords"},
             "bias_embed": {0: "num_hotwords"},
         },
@@ -379,7 +379,8 @@ def _fix_range_inputs(model):
 
 def main():
     parser = argparse.ArgumentParser(description="SeACo-Paraformer ONNX 导出")
-    parser.add_argument("--model-id", default="iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
+    parser.add_argument("--model-id", default="./models/asr/pt",
+                        help="PT 模型本地目录路径（默认 ./models/asr/pt，不联网下载）")
     parser.add_argument("--output-dir", default="./models/asr")
     parser.add_argument("--opset-version", type=int, default=17)
     parser.add_argument("--skip-fp16", action="store_true")

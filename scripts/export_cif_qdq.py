@@ -170,7 +170,7 @@ def quantize_with_modelopt(wrapper, samples, output_path, opset, calib_enc_len,
 def main():
     parser = argparse.ArgumentParser(description="CIF QDQ 量化导出（方案 1）")
     parser.add_argument("--calib-data", default="./calib_data/audio_data")
-    parser.add_argument("--cmvn-path", default="./models/asr/am.mvn")
+    parser.add_argument("--cmvn-path", default="./models/asr/pt/am.mvn")
     parser.add_argument("--encoder-engine", required=True, help="上游 encoder fp16 engine")
     parser.add_argument("--output", default="./models/asr/split/cif_qdq.onnx")
     parser.add_argument("--opset", type=int, default=17)
@@ -181,8 +181,8 @@ def main():
     parser.add_argument("--exclude-patterns", nargs="*", default=[],
                         help="排除量化的模块名模式（保持 fp16）。"
                              "CIF cumsum 路径天然不量化；若精度不达标可加 cif_conv1d/cif_output。")
-    parser.add_argument("--model-id", default=None,
-                        help="PT 模型 ID 或本地目录路径（默认 ModelScope 在线）")
+    parser.add_argument("--model-id", default="./models/asr/pt",
+                        help="PT 模型本地目录路径（默认 ./models/asr/pt，不联网下载）")
     args = parser.parse_args()
 
     backend = detect_backend(args.backend)

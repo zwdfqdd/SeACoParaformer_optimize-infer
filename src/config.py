@@ -99,12 +99,18 @@ class Settings:
     ]
     # TRT profile 优化主力桶（opt point 的 seq_len）；默认取中间桶
     TRT_OPT_SEQ: int = int(os.getenv("TRT_OPT_SEQ", "67"))
+    # TRT profile seq_len 上限（max point）= 最大桶（134 帧 = 8s）。
+    # audio_segment 切段上限 SPLIT_MAX_MS=133帧 < 134，永不越界，故 max 贴合最大桶即可，
+    # 不留额外余量（余量会无谓增大 activation 显存峰值）。
+    TRT_MAX_SEQ: int = int(os.getenv("TRT_MAX_SEQ", "134"))
     # 特征维度（LFR 后）
     FEAT_DIM: int = 560
     # encoder 输出维度
     HIDDEN_DIM: int = 512
     # 热词最大长度（token 数，用于 bias profile）
-    MAX_HOTWORD_LEN: int = int(os.getenv("MAX_HOTWORD_LEN", "8"))
+    # 16：覆盖英文热词 BPE 切分后的较长 subword 序列（seg_dict 集成后英文词可能切 8-16 subword）；
+    #     中文热词逐字 1 字=1 token，16 足够长（如长机构名）。
+    MAX_HOTWORD_LEN: int = int(os.getenv("MAX_HOTWORD_LEN", "16"))
 
     # ============================================================
     # 热词管理参数（路径 A：SeACo 在线热词，单一数据源）
@@ -177,7 +183,7 @@ class Settings:
         profile_type: encoder / cif / decoder / bias
         返回 {input_name: {"min":..., "opt":..., "max":...}}
         """
-        mn, opt, mx = cls.min_seq(), cls.TRT_OPT_SEQ, cls.max_seq()
+        mn, opt, mx = cls.min_seq(), cls.TRT_OPT_SEQ, cls.TRT_MAX_SEQ
         ob, mb = cls.opt_batch(), cls.max_batch()
         fd, hd = cls.FEAT_DIM, cls.HIDDEN_DIM
 
@@ -198,7 +204,7 @@ class Settings:
             return {
                 "acoustic_embeds": {"min": (1, 2, hd), "opt": (ob, opt, hd), "max": (mb, mx, hd)},
                 "encoder_out": {"min": (1, mn, hd), "opt": (ob, opt, hd), "max": (mb, mx, hd)},
-                "bias_embed": {"min": (1, 1, hd), "opt": (1, opt_hw, hd), "max": (mb, max_hw, hd)},
+                "bias_embed": {"min": (1, 1, hd), "opt": (ob, opt_hw, hd), "max": (mb, max_hw, hd)},
             }
         if profile_type == "bias":
             # 热词矩阵行数 = 实际热词数 + 1（[sos] 哨兵），故 max 用 MAX_HOTWORD_NUM + 1

@@ -239,7 +239,7 @@ def quantize_with_modelopt(wrapper, samples, output_path, opset, calib_tok_len, 
         torch.tensor([calib_tok_len], dtype=torch.long),     # token_num
         torch.randn(1, calib_enc_len, 512),                  # encoder_out
         torch.tensor([calib_enc_len], dtype=torch.long),     # encoder_out_lens
-        torch.randn(1, 3, 512),                              # bias_embed
+        torch.randn(1, 4, 512),                              # bias_embed
     )
 
     with torch.no_grad():
@@ -278,7 +278,7 @@ def quantize_with_modelopt(wrapper, samples, output_path, opset, calib_tok_len, 
 def main():
     parser = argparse.ArgumentParser(description="Decoder QDQ 量化导出（方案 1）")
     parser.add_argument("--calib-data", default="./calib_data/audio_data")
-    parser.add_argument("--cmvn-path", default="./models/asr/am.mvn")
+    parser.add_argument("--cmvn-path", default="./models/asr/pt/am.mvn")
     parser.add_argument("--encoder-engine", required=True, help="上游 encoder fp16 engine")
     parser.add_argument("--cif-engine", required=True, help="上游 cif fp16 engine")
     parser.add_argument("--output", default="./models/asr/split/decoder_qdq.onnx")
@@ -293,8 +293,8 @@ def main():
                         help="排除量化的模块名模式（保持 fp16）。"
                              "默认排除 SeACo 热词路径（数值敏感，INT8 会破坏热词修正）。"
                              "传空 [] 则全部量化。")
-    parser.add_argument("--model-id", default=None,
-                        help="PT 模型 ID 或本地目录路径（默认 ModelScope 在线）")
+    parser.add_argument("--model-id", default="./models/asr/pt",
+                        help="PT 模型本地目录路径（默认 ./models/asr/pt，不联网下载）")
     args = parser.parse_args()
 
     backend = detect_backend(args.backend)

@@ -201,17 +201,17 @@ def quantize_with_pytorch_quantization(wrapper, calib_feats, output_path, opset,
 def main():
     parser = argparse.ArgumentParser(description="Encoder QDQ 量化导出（方案 1）")
     parser.add_argument("--calib-data", default="./calib_data/audio_data", help="校准音频目录")
-    parser.add_argument("--cmvn-path", default="./models/asr/am.mvn")
+    parser.add_argument("--cmvn-path", default="./models/asr/pt/am.mvn")
     parser.add_argument("--output", default="./models/asr/split/encoder_qdq.onnx")
     parser.add_argument("--opset", type=int, default=17)
-    parser.add_argument("--clamp-value", type=float, default=30000)
+    parser.add_argument("--clamp-value", type=float, default=60000)
     parser.add_argument("--calib-seq-len", type=int, default=134)
     parser.add_argument("--max-samples", type=int, default=500)
     parser.add_argument("--backend", default=None,
                         choices=["modelopt", "pytorch_quantization"],
                         help="强制指定量化库（默认自动检测）")
-    parser.add_argument("--model-id", default=None,
-                        help="PT 模型 ID 或本地目录路径（默认 ModelScope 在线）")
+    parser.add_argument("--model-id", default="./models/asr/pt",
+                        help="PT 模型本地目录路径（默认 ./models/asr/pt，不联网下载）")
     args = parser.parse_args()
 
     backend = detect_backend(args.backend)

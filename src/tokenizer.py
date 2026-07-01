@@ -38,15 +38,20 @@ class Tokenizer:
     def __init__(self):
         self._token_list: list[str] = []
         self._token_to_id: dict[str, int] = {}
+        self._seg_dict: dict[str, list[str]] = {}  # 英文单词 → BPE subword 序列（来自 seg_dict）
         self._loaded = False
 
-    def load(self, vocab_path: str):
+    def load(self, vocab_path: str, seg_dict_path: str | None = None):
         """
         加载词表文件。
 
         支持格式：
         - tokens.json: JSON 数组 ["<blank>", "<sos>", ...]
         - tokens.txt: 每行格式 "token id" 或仅 "token"（行号为 ID）
+
+        seg_dict_path：可选，FunASR seg_dict 文件（英文单词→BPE subword 映射）。
+            传 None 时自动尝试在 vocab 同目录查找名为 "seg_dict" 的文件。
+            用于英文热词的正确 BPE 切分（见 encode 说明）。
         """
         path = Path(vocab_path)
 
@@ -63,6 +68,13 @@ class Tokenizer:
                 self._load_json(path)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 self._load_txt(path)
+
+        # 加载 seg_dict（英文 BPE 切分表）：显式路径优先，否则同目录自动探测
+        if seg_dict_path is None:
+            auto = path.parent / "seg_dict"
+            seg_dict_path = str(auto) if auto.exists() else None
+        if seg_dict_path:
+            self._load_seg_dict(Path(seg_dict_path))
 
         self._loaded = True
 
@@ -118,20 +130,65 @@ class Tokenizer:
         """
         将文本编码为 token ID 序列（用于 hotwords 编码）。
 
-        简单的贪心最长匹配（最多 4 字符），优先匹配长 token。
+        分两类处理：
+        - 英文单词（连续 ASCII 字母/数字/撇号）：查 seg_dict 得到正确的 BPE subword
+          序列（如 android → a@@ nd@@ ro@@ id），再逐 subword 映射 ID。
+          seg_dict 缺失或未命中时 fallback 到贪心最长匹配。
+        - 中文及其他字符：逐字最长匹配（≤4 字符），与原行为一致。
 
-        说明：本词表为中文字 + 英文 BPE（@@ 后缀）混合。中文热词逐字命中、
-        encode/decode 字符级一致；英文热词因无 BPE merges 规则，贪心匹配可能
-        切成非连接片段（如 android → and/r/o/id），仅影响英文热词的偏置强度，
-        不影响中文热词与正常识别。本项目热词以中文为主，该限制可接受。
+        说明：seg_dict 是 FunASR 官方英文 BPE 切分表，集成后英文热词偏置强度正常；
+        中文热词逐字命中、encode/decode 字符级一致，路径不变。
         """
         if not self._loaded:
             return []
 
         ids: list[int] = []
         i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            # 英文单词：连续 ASCII 字母/数字/撇号
+            if ch.isascii() and (ch.isalnum() or ch == "'"):
+                j = i
+                while j < n and text[j].isascii() and (text[j].isalnum() or text[j] == "'"):
+                    j += 1
+                word = text[i:j]
+                ids.extend(self._encode_english_word(word))
+                i = j
+            else:
+                # 中文/标点/其他：逐字最长匹配（≤4 字符）
+                matched = False
+                for length in range(min(4, n - i), 0, -1):
+                    substr = text[i: i + length]
+                    if substr in self._token_to_id:
+                        ids.append(self._token_to_id[substr])
+                        i += length
+                        matched = True
+                        break
+                if not matched:
+                    i += 1
+
+        return ids
+
+    def _encode_english_word(self, word: str) -> list[int]:
+        """编码单个英文单词为 subword ID 序列。
+
+        优先查 seg_dict（小写键）得到 BPE subword 序列；未命中则 fallback
+        贪心最长匹配。subword 在词表中查不到的跳过。
+        """
+        subwords = self._seg_dict.get(word.lower())
+        if subwords:
+            ids = [self._token_to_id[s] for s in subwords if s in self._token_to_id]
+            if ids:
+                return ids
+        # fallback：贪心最长匹配（原行为）
+        return self._greedy_encode(word)
+
+    def _greedy_encode(self, text: str) -> list[int]:
+        """贪心最长匹配（≤4 字符），用于 seg_dict 未命中的 fallback。"""
+        ids: list[int] = []
+        i = 0
         while i < len(text):
-            # 尝试最长匹配（最多 4 个字符）
             matched = False
             for length in range(min(4, len(text) - i), 0, -1):
                 substr = text[i: i + length]
@@ -140,11 +197,8 @@ class Tokenizer:
                     i += length
                     matched = True
                     break
-
             if not matched:
-                # 未匹配，跳过该字符
                 i += 1
-
         return ids
 
     def _load_json(self, path: Path):
@@ -197,6 +251,34 @@ class Tokenizer:
             for idx, token in enumerate(self._token_list)
             if token
         }
+
+    def _load_seg_dict(self, path: Path):
+        """加载 FunASR seg_dict（英文单词 → BPE subword 序列）。
+
+        格式：每行 "单词<TAB>subword1 subword2 ..."，subword 用 @@ 表示词内连接。
+        例：aachen\\ta@@ ach@@ en
+        解析失败时静默降级（self._seg_dict 保持空，encode 走 fallback）。
+        """
+        if not path.exists():
+            return
+        try:
+            seg: dict[str, list[str]] = {}
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+                    # 第一个 \t 或连续空白前是 key，其余是 subword 序列
+                    parts = line.split("\t") if "\t" in line else line.split(None, 1)
+                    if len(parts) < 2:
+                        continue
+                    word = parts[0].strip()
+                    subwords = parts[1].split()
+                    if word and subwords:
+                        seg[word.lower()] = subwords
+            self._seg_dict = seg
+        except (UnicodeDecodeError, OSError):
+            self._seg_dict = {}
 
     @staticmethod
     def _join_tokens(tokens: list[str]) -> str:
