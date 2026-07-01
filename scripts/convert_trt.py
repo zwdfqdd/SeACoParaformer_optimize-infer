@@ -69,27 +69,29 @@ except Exception:
 # ============================================================
 # Dynamic Shape Profiles
 # 维度按数据流推导：speech → encoder → cif → decoder
-# 输入规格：speech min=(1,8,560) opt=(4,128,560) max=(8,289,560)
+# 全部由 src.config.Settings 动态生成（单一数据源，与 scheduler/导出严格一致）
 # ============================================================
 
-# 完整模型 profile（不拆分时使用）
-ASR_PROFILES = {
-    "speech": {
-        "min": (1, 8, 560),
-        "opt": (1, 128, 560),
-        "max": (8, 289, 560),
-    },
-    "speech_lengths": {
-        "min": (1,),
-        "opt": (1,),
-        "max": (8,),
-    },
-    "bias_embed": {
-        "min": (1, 1, 512),
-        "opt": (1, 4, 512),
-        "max": (8, 8, 512),
-    },
-}
+# 完整模型 profile（--profile asr，整体 model.onnx）：
+# 不在此硬编码，统一由 config 动态生成（与分段 profile 同源，杜绝 batch/seq/热词维度漂移）。
+# 历史硬编码值（batch=8/seq=289/热词=8）已废弃，与 config（batch=12/seq=134/热词=257）冲突。
+def _build_asr_profiles() -> dict:
+    """整体模型 profile：speech + speech_lengths + bias_embed，全部从 config 取值。"""
+    if _Settings is None or not hasattr(_Settings, "get_trt_profiles"):
+        raise RuntimeError(
+            "无法导入 src.config.Settings 或缺少 get_trt_profiles——检测到过时 config.py。\n"
+            "  请在项目根目录运行，并同步最新 src/config.py。"
+        )
+    s = _Settings
+    mn, opt, mx = s.min_seq(), s.TRT_OPT_SEQ, s.TRT_MAX_SEQ
+    ob, mb = s.opt_batch(), s.max_batch()
+    fd, hd = s.FEAT_DIM, s.HIDDEN_DIM
+    max_hw, opt_hw = s.MAX_HOTWORD_NUM + 1, s.OPT_HOTWORD_NUM  # 含 [sos] 哨兵 +1
+    return {
+        "speech": {"min": (1, mn, fd), "opt": (ob, opt, fd), "max": (mb, mx, fd)},
+        "speech_lengths": {"min": (1,), "opt": (ob,), "max": (mb,)},
+        "bias_embed": {"min": (1, 1, hd), "opt": (ob, opt_hw, hd), "max": (mb, max_hw, hd)},
+    }
 
 
 # 分段模型 profile（encoder/cif/decoder/bias）统一由 src.config.Settings.get_trt_profiles
@@ -178,7 +180,7 @@ def build_engine(
             )
         profiles = _Settings.get_trt_profiles(profile_type)
     elif profile_type == "asr":
-        profiles = ASR_PROFILES
+        profiles = _build_asr_profiles()
     else:
         raise ValueError(f"未知 profile_type: {profile_type}")
     min_shapes = []

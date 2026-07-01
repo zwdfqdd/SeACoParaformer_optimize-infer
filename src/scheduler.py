@@ -219,13 +219,13 @@ class GPUScheduler:
 
         for i, req in enumerate(batch):
             padded_feats[i] = req.features
-            lengths[i] = target_seq_len  # 传桶长度（保证 attention mask 匹配）
+            lengths[i] = req.length  # 真实有效帧数（CIF mask 据此排除 padding 帧，避免多 fire token）
             actual_lengths.append(req.length)
 
         # dummy padding（复制最后一条的数据）
         for i in range(actual_count, pad_batch_size):
             padded_feats[i] = batch[-1].features
-            lengths[i] = target_seq_len
+            lengths[i] = batch[-1].length
 
         try:
             t0 = _time.perf_counter()
@@ -292,10 +292,10 @@ class GPUScheduler:
             lengths = np.zeros(pad_size, dtype=np.int32)
             for i, req in enumerate(sub_batch):
                 padded_feats[i] = req.features
-                lengths[i] = target_seq_len  # 传桶长度
+                lengths[i] = req.length  # 真实有效帧数
             for i in range(sub_count, pad_size):
                 padded_feats[i] = sub_batch[-1].features
-                lengths[i] = target_seq_len
+                lengths[i] = sub_batch[-1].length
 
             try:
                 results = await asyncio.get_event_loop().run_in_executor(
@@ -316,7 +316,7 @@ class GPUScheduler:
                     for i, req in enumerate(sub_batch):
                         try:
                             single_feats = req.features[np.newaxis, :, :]
-                            single_lengths = np.array([target_seq_len], dtype=np.int32)  # 传桶长度
+                            single_lengths = np.array([req.length], dtype=np.int32)  # 真实有效帧数
                             result = await asyncio.get_event_loop().run_in_executor(
                                 _gpu_executor,
                                 asr_engine.infer_batch_raw,

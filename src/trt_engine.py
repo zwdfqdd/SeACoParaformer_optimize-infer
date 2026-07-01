@@ -8,7 +8,7 @@ TensorRT 推理引擎（v2 阶段 1：4 段串联架构）
     bias_encoder.engine  — hotword_ids → hw_embed（外部按热词长度切片得到 bias_embed）
 
 精度方案（推荐：纯 fp16）：
-    opset 17 + clamp 30000 + trtexec --fp16
+    opset 17 + clamp 60000 + trtexec --fp16
     详见 docs/README.md 的 v2 推理路径。
 
 对外接口（与 src/asr_engine.py 一致）：
@@ -218,6 +218,14 @@ class TRTEngine:
             raise RuntimeError("TRT engine 未加载")
 
         batch_size = padded_feats.shape[0]
+
+        # 裁剪到 batch 内最大真实帧数（engine dynamic shape，无需 pad 到桶边界），
+        # 但不低于 profile 下界（最小桶），避免 setInputShape 越界。
+        real_max = max(1, int(max(int(L) for L in lengths)))
+        min_seq = min(settings.BUCKET_SEQ_LENS)
+        real_max = max(real_max, min_seq)
+        if real_max < padded_feats.shape[1]:
+            padded_feats = padded_feats[:, :real_max, :]
         seq_len = padded_feats.shape[1]
 
         # ---- 1. Encoder: speech → encoder_out ----
@@ -226,9 +234,11 @@ class TRTEngine:
             enc_inputs["speech_lengths"] = lengths.astype(np.int64)
         enc_out = self._encoder.infer(enc_inputs)
         encoder_out = enc_out["encoder_out"]  # (batch, seq_len, 512)
+        # encoder_out_lens = 真实有效帧数（用于 decoder cross-attention 的 memory mask，
+        # 排除 encoder padding 帧污染；encoder engine 不输出 lens，用传入的真实 lengths）。
         encoder_out_lens = enc_out.get(
             "encoder_out_lens",
-            np.array([seq_len] * batch_size, dtype=np.int64),
+            lengths.astype(np.int64),
         )
 
         # ---- 2. CIF: encoder_out + mask → acoustic_embeds, token_num ----
@@ -257,6 +267,12 @@ class TRTEngine:
             bias_embed_input = np.zeros((1, 1, 512), dtype=np.float32)
         else:
             bias_embed_input = bias_embeddings.astype(np.float32)
+
+        # decoder 的 acoustic_embeds/encoder_out/bias_embed 共享 batch 维（engine 同名维度），
+        # bias_embed 原始 batch=1，需 tile 到 batch_size 保持三者一致，否则
+        # TRT 报 "Dimensions with name batch must be equal"（batch>1 时）。
+        if bias_embed_input.shape[0] != batch_size:
+            bias_embed_input = np.tile(bias_embed_input, (batch_size, 1, 1)).astype(np.float32)
 
         dec_inputs = {}
         if "acoustic_embeds" in self._decoder.input_names:
