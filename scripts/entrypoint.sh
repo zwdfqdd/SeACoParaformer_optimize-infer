@@ -46,7 +46,7 @@ else
 fi
 
 echo ""
-echo "[启动] uvicorn 服务 (workers=${WORKS:-1}, MODEL_PRECISION=${MODEL_PRECISION})"
+echo "[启动] uvicorn 服务 (workers=${WORKERS:-1}, MODEL_PRECISION=${MODEL_PRECISION})"
 # 容器内部端口固定 8080（与 Dockerfile EXPOSE、compose 端口映射 + healthcheck 对齐）；
 # 对外端口由 docker-compose 的 HOST_PORT 映射决定。
-exec python -m uvicorn src.main:app --host 0.0.0.0 --port 8080 --workers "${WORKS:-1}"
+exec python -m uvicorn src.main:app --host 0.0.0.0 --port 8080 --workers "${WORKERS:-1}"

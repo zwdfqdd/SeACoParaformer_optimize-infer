@@ -51,7 +51,7 @@ docker-compose logs -f seaco-asr
 ```bash
 # .env 示例
 HOST_PORT=8099
-WORKS=1
+WORKERS=1
 BATCH=12
 BATCH_TIMEOUT=10
 LOG_LEVEL=INFO
@@ -63,7 +63,7 @@ VERBOSE=0
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | HOST_PORT | 8099 | 宿主机映射端口 |
-| WORKS | 1 | uvicorn workers（默认 1，最小启动成本；可按显存调大） |
+| WORKERS | 1 | uvicorn workers（默认 1，最小启动成本；可按显存调大） |
 | BATCH | 12 | 最大 batch size（合法值：1,2,4,8,12） |
 | BATCH_TIMEOUT | 10 | batch 等待超时（毫秒） |
 | LOG_LEVEL | INFO | 日志级别（DEBUG/INFO/WARNING/ERROR） |
@@ -71,10 +71,10 @@ VERBOSE=0
 | MODEL_PRECISION | auto | 模型精度选择（见 README MODEL_PRECISION 取值表） |
 | VERBOSE | 0 | 详细日志输出（1=开启，输出各阶段耗时） |
 
-> **WORKS 默认 1**：单进程靠 asyncio + CPU 线程池实现并发，启动成本与显存占用最小。
+> **WORKERS 默认 1**：单进程靠 asyncio + CPU 线程池实现并发，启动成本与显存占用最小。
 > 代码已按多 worker 安全设计——词表热更新通过容器本地文件 + 版本轮询在各 worker 间收敛
-> （见 API.md 词表热更新）。运维可按 GPU 显存调大 WORKS，但每个 worker 进程独立加载
-> 一份 engine + CUDA context，显存随 WORKS 线性增长，需确认显存充足。
+> （见 API.md 词表热更新）。运维可按 GPU 显存调大 WORKERS，但每个 worker 进程独立加载
+> 一份 engine + CUDA context，显存随 WORKERS 线性增长，需确认显存充足。
 
 ### MODEL_PRECISION 说明
 
@@ -120,7 +120,7 @@ spec:
           ports:
             - containerPort: 8080
           env:
-            - name: WORKS
+            - name: WORKERS
               value: "1"
             - name: BATCH
               value: "12"
@@ -211,14 +211,14 @@ spec:
 
 ## 扩缩容建议
 
-| 场景 | WORKS | BATCH | 副本数 | GPU |
+| 场景 | WORKERS | BATCH | 副本数 | GPU |
 |------|-------|-------|--------|-----|
 | 开发测试 | 1 | 1 | 1 | 0-1 |
 | 小规模（QPS<10） | 1 | 8 | 1 | 1 |
 | 中规模（QPS 10-50） | 1 | 12 | 2 | 2 |
 | 大规模（QPS>50） | 1 | 12 | 4+ | 4+ |
 
-> GPU 推理服务每个 Pod 固定 WORKS=1，通过增加副本数（Pod 数量）水平扩展。
+> GPU 推理服务每个 Pod 固定 WORKERS=1，通过增加副本数（Pod 数量）水平扩展。
 > 每个 Pod 绑定一张 GPU，不共享。
 
 ### 关键调优参数
@@ -247,7 +247,7 @@ kill -HUP $(pgrep -f "uvicorn src.main:app")
 - `BATCH_TIMEOUT`：batch 等待超时
 - `LOG_LEVEL`：日志级别
 
-> 仅在单进程模式（WORKS=1）下有效。
+> 仅在单进程模式（WORKERS=1）下有效。
 
 ---
 

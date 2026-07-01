@@ -14,7 +14,7 @@
    - 原子切换引用（GIL 保证），在途请求零中断
    - 保留上一版引用，支持回滚
 
-部署形态：单机单容器多 worker（WORKS=N），所有 worker 共享容器本地
+部署形态：单机单容器多 worker（WORKERS=N），所有 worker 共享容器本地
 hotwords.txt + hotwords.version 文件，无需挂载/NFS/K8s。
 """
 

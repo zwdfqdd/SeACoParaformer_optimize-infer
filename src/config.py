@@ -50,7 +50,7 @@ class Settings:
     """服务配置。运行时可调参数从环境变量读取，固定参数硬编码。"""
 
     # 运行时可调
-    WORKS: int = int(os.getenv("WORKS", "1"))
+    WORKERS: int = int(os.getenv("WORKERS", "1"))
     BATCH: int = int(os.getenv("BATCH", "12"))
     PORT: int = int(os.getenv("PORT", "8080"))  # 容器内部固定端口（entrypoint 硬编码 8080，对外由 HOST_PORT 映射）
     BATCH_TIMEOUT: int = int(os.getenv("BATCH_TIMEOUT", "10"))  # 毫秒
@@ -75,7 +75,7 @@ class Settings:
     ORT_INTER_OP_THREADS: int = int(os.getenv("ORT_INTER_OP_THREADS", "1"))
 
     # CPU 流水线线程池大小（Stage1 VAD + Stage2 特征提取）。0=自动取 cpu_count。
-    # 多 worker（WORKS>1）时务必显式设小，避免每 worker 各开满核导致线程超额订阅。
+    # 多 worker（WORKERS>1）时务必显式设小，避免每 worker 各开满核导致线程超额订阅。
     CPU_THREAD_POOL_SIZE: int = int(os.getenv("CPU_THREAD_POOL_SIZE", "0"))
 
     # 固定参数（模型已打包进镜像）

@@ -10,7 +10,7 @@ services:
     ports:
       - "${HOST_PORT:-8099}:8080"
     environment:
-      - WORKS=${WORKS:-1}
+      - WORKERS=${WORKERS:-1}
       - BATCH=${BATCH:-12}
       - BATCH_TIMEOUT=${BATCH_TIMEOUT:-10}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}

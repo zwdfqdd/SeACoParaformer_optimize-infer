@@ -51,7 +51,7 @@ COPY models/ models/
 COPY calib_data/ calib_data/
 
 # 环境变量默认值
-ENV WORKS=1
+ENV WORKERS=1
 ENV BATCH=12
 ENV PORT=8080
 ENV BATCH_TIMEOUT=10

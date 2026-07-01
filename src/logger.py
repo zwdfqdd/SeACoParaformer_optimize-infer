@@ -71,7 +71,7 @@ def setup_logger() -> logging.Logger:
     logger.addHandler(stdout_handler)
 
     # Handler 2: 本地文件（按天轮转，保留 7 天）
-    # 多 worker（WORKS>1）场景：每个 worker 进程写独立文件 asr_{pid}.log，
+    # 多 worker（WORKERS>1）场景：每个 worker 进程写独立文件 asr_{pid}.log，
     # 避免多进程并发轮转同一文件竞争导致日志丢失/损坏。
     # 单 worker 时文件名仍是 asr_{pid}.log（pid 唯一），stdout 始终汇总。
     try:

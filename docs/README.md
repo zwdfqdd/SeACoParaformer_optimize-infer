@@ -273,7 +273,7 @@ if (top1.faiss_score > 0.85
 
 ### 词表热更新（运行时不中断，多 worker 安全）
 
-部署形态：单机单容器、指定 GPU、`WORKS=N`（默认 1，运维按显存调大）。所有 worker 进程共享容器本地文件 `models/asr/hotwords.txt`，无需挂载/NFS/K8s。
+部署形态：单机单容器、指定 GPU、`WORKERS=N`（默认 1，运维按显存调大）。所有 worker 进程共享容器本地文件 `models/asr/hotwords.txt`，无需挂载/NFS/K8s。
 
 ```
 models/asr/hotwords.txt          词表内容（原子写）
@@ -358,7 +358,7 @@ docker-compose up -d
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | HOST_PORT | 8099 | 宿主机映射端口 |
-| WORKS | 1 | uvicorn workers（默认 1，最小启动成本；可按显存调大） |
+| WORKERS | 1 | uvicorn workers（默认 1，最小启动成本；可按显存调大） |
 | BATCH | 12 | 最大 batch size（合法值：1,2,4,8,12） |
 | BATCH_TIMEOUT | 10 | batch 等待超时（毫秒） |
 | LOG_LEVEL | INFO | 日志级别 |
@@ -368,10 +368,10 @@ docker-compose up -d
 | MODEL_PRECISION | auto | 模型精度（见下表） |
 
 > 容器内部固定端口 8080，通过 HOST_PORT 映射到宿主机。
-> WORKS 默认 1（单进程靠 asyncio + 线程池并发，最小启动成本与显存占用）。
+> WORKERS 默认 1（单进程靠 asyncio + 线程池并发，最小启动成本与显存占用）。
 > 代码已按多 worker 安全设计（词表热更新经文件轮询跨 worker 收敛），
-> 运维可按 GPU 显存调大 WORKS——但每个 worker 进程独立加载一份 engine + CUDA context，
-> 显存占用随 WORKS 线性增长，需自行确认显存充足。
+> 运维可按 GPU 显存调大 WORKERS——但每个 worker 进程独立加载一份 engine + CUDA context，
+> 显存占用随 WORKERS 线性增长，需自行确认显存充足。
 
 ### MODEL_PRECISION 取值
 

@@ -52,7 +52,7 @@
     3.构建fastapi服务
         1).环境变量：
             变量（运行时可调）：
-                WORKS：uvicorn workers 数量（GPU 服务必须 1）
+                WORKERS：uvicorn workers 数量（GPU 服务必须 1）
                 BATCH：最大 batch size（合法值：1,2,4,8,12）
                 PORT：容器内部端口
                 BATCH_TIMEOUT：batch 等待超时（毫秒）
@@ -66,7 +66,7 @@
                 fp32：强制 fp32（GPU/CPU 均可）
                 int8：强制 int8 动态量化模型（仅 CPU）
             默认配置：
-                WORKS=1
+                WORKERS=1
                 BATCH=12
                 PORT=8080
                 BATCH_TIMEOUT=10 # 毫秒
@@ -789,7 +789,7 @@ if (top1.faiss_score > 0.85
 
 ## 四、词表热更新（运行时不中断，多 worker 安全）
 
-部署形态：单机单容器、指定 GPU、WORKS=N（默认 1，运维按显存调大）。
+部署形态：单机单容器、指定 GPU、WORKERS=N（默认 1，运维按显存调大）。
 所有 worker 共享容器本地文件，无需挂载/NFS/K8s。
 ```
 models/asr/hotwords.txt        词表内容（原子写）
