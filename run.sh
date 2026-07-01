@@ -15,66 +15,66 @@
 # ============================================================
 
 # ─── 模型精度（核心，逐个测试时改这里）───
-MODEL_PRECISION=trt_int8_enc        # 可选: auto onnx_fp32 onnx_int8 trt_fp32 trt_fp16 trt_int8 trt_int8_enc
+MODEL_PRECISION=${MODEL_PRECISION:-trt_int8_enc}   # 可选: auto onnx_fp32 onnx_int8 trt_fp32 trt_fp16 trt_int8 trt_int8_enc
 
 # 单段精度覆盖（可选，优先级高于 MODEL_PRECISION；留空 "" 表示不覆盖）
-ENCODER_PRECISION=""                # 可选: "" fp32 fp16 int8
-CIF_PRECISION=""                    # 可选: "" fp32 fp16 int8
-DECODER_PRECISION=""                # 可选: "" fp32 fp16 int8
-BIAS_PRECISION=""                   # 可选: "" fp32 fp16 int8
+ENCODER_PRECISION=${ENCODER_PRECISION:-}           # 可选: "" fp32 fp16 int8
+CIF_PRECISION=${CIF_PRECISION:-}                   # 可选: "" fp32 fp16 int8
+DECODER_PRECISION=${DECODER_PRECISION:-}           # 可选: "" fp32 fp16 int8
+BIAS_PRECISION=${BIAS_PRECISION:-}                 # 可选: "" fp32 fp16 int8
 
 # ─── 服务运行参数 ───
-WORKS=1                             # uvicorn worker 进程数；可选: 1 2 4...（GPU 显存够才调大）
-BATCH=12                            # 最大 batch；合法值: 1 2 4 8 12
-BATCH_TIMEOUT=10                    # batch 等待超时（毫秒）；可选: 5 10 20 50
-MAX_CONCURRENT_REQUESTS=2000        # 最大并发请求数
-ACQUIRE_TIMEOUT=5                   # 过载拒绝等待超时（秒）；0=不拒绝（无限排队）
-MAX_AUDIO_DURATION_MS=7200000       # 音频时长上限（ms）；默认 2 小时；0=不限
-LOG_LEVEL=INFO                      # 可选: DEBUG INFO WARNING ERROR
-VERBOSE=0                           # 可选: 0 1（1=输出各阶段耗时）
+WORKS=${WORKS:-1}                             # uvicorn worker 进程数；可选: 1 2 4...（GPU 显存够才调大）
+BATCH=${BATCH:-12}                            # 最大 batch；合法值: 1 2 4 8 12
+BATCH_TIMEOUT=${BATCH_TIMEOUT:-10}            # batch 等待超时（毫秒）；可选: 5 10 20 50
+MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-2000}   # 最大并发请求数
+ACQUIRE_TIMEOUT=${ACQUIRE_TIMEOUT:-5}         # 过载拒绝等待超时（秒）；0=不拒绝（无限排队）
+MAX_AUDIO_DURATION_MS=${MAX_AUDIO_DURATION_MS:-7200000}   # 音频时长上限（ms）；默认 2 小时；0=不限
+LOG_LEVEL=${LOG_LEVEL:-INFO}                  # 可选: DEBUG INFO WARNING ERROR
+VERBOSE=${VERBOSE:-0}                         # 可选: 0 1（1=输出各阶段耗时，需配合 LOG_LEVEL=DEBUG）
 
 # ─── CPU 推理线程数（仅 onnx_int8/onnx_fp32 走 CPU 时生效）───
 # 高并发务必按经验法则设小，避免线程超额订阅（越并发越慢）：
 #   ORT_INTRA_OP_THREADS × WORKS × 预期并发 ≈ 物理核数
 #   低延迟单请求: WORKS=1 + ORT_INTRA_OP_THREADS=全核
 #   高并发吞吐:  ORT_INTRA_OP_THREADS = 总核数 / 并发数
-ORT_INTRA_OP_THREADS=0              # 单 session 算子并行线程数；0=自动取全核
-ORT_INTER_OP_THREADS=1             # session 间并行线程数；可选: 1 2
-CPU_THREAD_POOL_SIZE=0              # CPU 流水线线程池(VAD+特征提取)；0=自动全核；多 worker 务必设小
+ORT_INTRA_OP_THREADS=${ORT_INTRA_OP_THREADS:-0}    # 单 session 算子并行线程数；0=自动取全核
+ORT_INTER_OP_THREADS=${ORT_INTER_OP_THREADS:-1}    # session 间并行线程数；可选: 1 2
+CPU_THREAD_POOL_SIZE=${CPU_THREAD_POOL_SIZE:-0}    # CPU 流水线线程池(VAD+特征提取)；0=自动全核；多 worker 务必设小
 
 # ─── Bucket / Batch（改动后需重新转 engine）───
-BUCKET_SEQ_LENS=34,67,134           # 桶边界 LFR 帧数（2s/4s/8s）
-VALID_BATCH_SIZES=1,2,4,8,12        # 合法 batch size 列表
-TRT_OPT_SEQ=67                      # TRT profile opt 主力桶；可选: 34 67 134
-TRT_OPT_BATCH=4                     # TRT profile opt batch；可选: 1 2 4 8 12
+BUCKET_SEQ_LENS=${BUCKET_SEQ_LENS:-34,67,134}      # 桶边界 LFR 帧数（2s/4s/8s）
+VALID_BATCH_SIZES=${VALID_BATCH_SIZES:-1,2,4,8,12} # 合法 batch size 列表
+TRT_OPT_SEQ=${TRT_OPT_SEQ:-67}                # TRT profile opt 主力桶；可选: 34 67 134
+TRT_OPT_BATCH=${TRT_OPT_BATCH:-4}             # TRT profile opt batch；可选: 1 2 4 8 12
 
 # ─── 热词参数（改 MAX/OPT 后需重新转 bias/decoder engine）───
-MAX_HOTWORD_NUM=256                 # 热词硬上限 / 路径切换点（≤走 SeACo，>走 Faiss）
-OPT_HOTWORD_NUM=64                  # TRT profile opt 热词数
-NFILTER=50                          # ASF 过滤注入 decoder 的 top-K
-MAX_HOTWORD_LEN=8                   # 单热词最大 token 数
+MAX_HOTWORD_NUM=${MAX_HOTWORD_NUM:-256}       # 热词硬上限 / 路径切换点（≤走 SeACo，>走 Faiss）
+OPT_HOTWORD_NUM=${OPT_HOTWORD_NUM:-64}        # TRT profile opt 热词数
+NFILTER=${NFILTER:-50}                        # ASF 过滤注入 decoder 的 top-K
+MAX_HOTWORD_LEN=${MAX_HOTWORD_LEN:-16}        # 单热词最大 token 数（英文 BPE 后可达 ~12）
 
 # ─── 词表热更新 ───
-DEFAULT_HOTWORD_PATH=models/asr/hotwords.txt
-HOTWORD_RELOAD_ENABLED=true         # 可选: true false
-HOTWORD_POLL_INTERVAL=5             # 各 worker 轮询 version 间隔（秒）
+DEFAULT_HOTWORD_PATH=${DEFAULT_HOTWORD_PATH:-models/asr/hotwords.txt}
+HOTWORD_RELOAD_ENABLED=${HOTWORD_RELOAD_ENABLED:-true}   # 可选: true false
+HOTWORD_POLL_INTERVAL=${HOTWORD_POLL_INTERVAL:-5}        # 各 worker 轮询 version 间隔（秒）
 
 # ─── 路径 B：Faiss 大词库纠错（默认词表 >MAX_HOTWORD_NUM 时启用）───
-FAISS_WINDOW_SIZES=2,3,4            # 滑窗大小
-FAISS_TOPK=30                       # 召回数
-FAISS_PINYIN_WEIGHT=0.75            # 拼音权重
-FAISS_EDIT_WEIGHT=0.25             # 编辑距离权重
-FAISS_SCORE_THRESHOLD=0.85          # Faiss 检索分门槛
-GAP_THRESHOLD=0.05                  # top1-top2 区分度门槛
-FINAL_SCORE_THRESHOLD=0.88          # 融合分门槛
+FAISS_WINDOW_SIZES=${FAISS_WINDOW_SIZES:-2,3,4}    # 滑窗大小
+FAISS_TOPK=${FAISS_TOPK:-30}                       # 召回数
+FAISS_PINYIN_WEIGHT=${FAISS_PINYIN_WEIGHT:-0.75}   # 拼音权重
+FAISS_EDIT_WEIGHT=${FAISS_EDIT_WEIGHT:-0.25}       # 编辑距离权重
+FAISS_SCORE_THRESHOLD=${FAISS_SCORE_THRESHOLD:-0.85}   # Faiss 检索分门槛
+GAP_THRESHOLD=${GAP_THRESHOLD:-0.05}               # top1-top2 区分度门槛
+FINAL_SCORE_THRESHOLD=${FINAL_SCORE_THRESHOLD:-0.88}   # 融合分门槛
 
 # ─── 本地 PT 权重目录 + 校准数据 ───
-PT_MODEL_DIR=models/asr/pt
-CALIB_DATA=calib_data/audio_data
+PT_MODEL_DIR=${PT_MODEL_DIR:-models/asr/pt}
+CALIB_DATA=${CALIB_DATA:-calib_data/audio_data}
 
 # ─── UTF-8 locale（中文日志/文件安全）───
-LC_ALL=C.UTF-8                      # 可选: C.UTF-8 en_US.UTF-8
-LANG=C.UTF-8
+LC_ALL=${LC_ALL:-C.UTF-8}                     # 可选: C.UTF-8 en_US.UTF-8
+LANG=${LANG:-C.UTF-8}
 
 # ============================================================
 # 以下为执行逻辑，一般无需修改

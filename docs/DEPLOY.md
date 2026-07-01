@@ -8,21 +8,23 @@
 docker build -t seaco-asr:latest .
 ```
 
-> 默认构建最后一个 stage（inference），无需指定 `--target`。
+> 转换推理合一镜像，无需 `--target`。
 
-### 构建转换镜像（仅模型导出时使用）
+### 镜像方案：转换推理合一（单镜像）
 
-```bash
-docker build --target converter -t seaco-asr-converter:latest .
-```
+基础镜像 `nvcr.io/nvidia/tensorrt:24.11-py3` 已内置 TensorRT 10.6 + CUDA 12.6 +
+cuDNN 9 + Python 3.10 + PyTorch 2.5。镜像在此基础上：
 
-### 镜像分层策略
+- 安装业务 + 转换依赖（`requirements-infer.txt`：onnxruntime-gpu / fastapi /
+  nvidia-modelopt 等）
+- 打包 `src/` `scripts/` `seaco_paraformer/` `models/`（含 PT 权重 + 配置）+ 校准数据
+- 启动时由 `entrypoint.sh → prepare_model.py` 按 `MODEL_PRECISION` 从本地 PT 权重
+  **现场逐级转换**出所需产物（PT → ONNX → TRT engine），无需独立转换镜像
 
-Dockerfile 采用多阶段构建：
-- **Stage 1 (converter)**：包含 PyTorch + FunASR，用于模型 ONNX 导出
-- **Stage 2 (inference)**：仅包含 ONNX Runtime + FastAPI，轻量化推理
-
-推理镜像不包含 PyTorch/FunASR，体积更小、启动更快。
+> 设计取舍：转换与推理用同一镜像，省去跨镜像传递模型产物的复杂度；代价是镜像含
+> torch/modelopt（体积较大）。如需精简纯推理镜像，可在镜像构建期预生成 engine 后
+> 用 `.dockerignore` 排除 `seaco_paraformer/`、`calib_data/`，并改用不含转换依赖的
+> requirements（当前未提供，需自行裁剪）。
 
 ---
 
@@ -54,7 +56,7 @@ BATCH=12
 BATCH_TIMEOUT=10
 LOG_LEVEL=INFO
 MAX_CONCURRENT_REQUESTS=2000
-MODEL_PRECISION=auto
+MODEL_PRECISION=trt_int8_enc
 VERBOSE=0
 ```
 
@@ -76,11 +78,18 @@ VERBOSE=0
 
 ### MODEL_PRECISION 说明
 
-| 值 | 行为 |
-|------|------|
-| auto | GPU 环境自动选 fp32，CPU 环境优先选 int8（若存在） |
-| fp32 | 强制使用 fp32 模型（GPU/CPU 均可） |
-| int8 | 强制使用 int8 量化模型（仅 CPU） |
+完整精度矩阵见 README「MODEL_PRECISION 取值」表。常用值：
+
+| 值 | 各段精度(enc/cif/dec/bias) | 适用 |
+|------|------|------|
+| auto | 自动探测 | GPU: trt_int8_enc→trt_fp16→trt_fp32→onnx_fp32；CPU: onnx_int8→onnx_fp32 |
+| **trt_int8_enc** | int8/fp16/fp16/fp16 | **线上推荐**（encoder 显存减半，CER≈0，热词精度保留） |
+| trt_fp16 | fp16×4 | GPU 通用 |
+| trt_fp32 | fp32×4 | GPU 无损基线 |
+| onnx_fp32 | ORT 整体 fp32 | CPU / 兜底 |
+| onnx_int8 | ORT 整体 int8 动态量化 | CPU |
+
+单段精度可用 `ENCODER_PRECISION`/`CIF_PRECISION`/`DECODER_PRECISION`/`BIAS_PRECISION` 覆盖。
 
 ---
 

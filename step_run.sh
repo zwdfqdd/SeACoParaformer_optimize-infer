@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # SeACo-Paraformer v2 阶段 1 完整执行流程
-# 最终方案：opset 17 + clamp 30000 + 纯 fp16
+# 最终方案：opset 17 + clamp 60000 + 纯 fp16
 # ============================================================
 
 step 1:
@@ -11,10 +11,10 @@ step 1:
 step 2:
     # PT → ONNX 分段导出
     #   --opset 17：原生 LayerNormalization 单节点（TRT 内部 fp32 累加）
-    #   --clamp-value 30000：encoder 残差 Add clamp，防 fp16 上限 65504 溢出
-    #     - 阈值 ≫ PT 真实峰值 ~7554（不影响 PT 数学）
-    #     - 阈值 ≪ fp16 上限 65504（保证 fp16 不 inf）
-    python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 30000
+    #   --clamp-value 60000：encoder 残差 Add clamp，防 fp16 上限 65504 溢出
+    #     - encoder 后段层残差激活峰值高达 ~48万 >> fp16 上限 65504
+    #     - 60000 贴近上限最大化保留信息（clamp=30000 裁剪过狠致截断输入解码错乱，已弃用）
+    python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 60000
 
     # ORT 验证（无热词 + 含热词）
     python tests/test_split_onnx_pipeline.py --audio test_data/audio_16000_10s.wav --device cuda
@@ -61,7 +61,7 @@ step 3:
 #    - TRT 10.6 对该算子内部自动 fp32 累加（mean/var/Pow 都用 fp32 计算）
 #    - 不需要任何 fp32 fallback
 #
-# 2. encoder 残差 Add 后 clamp 30000（在 seaco_paraformer/encoder.py 实现）：
+# 2. encoder 残差 Add 后 clamp 60000（在 seaco_paraformer/encoder.py 实现）：
 #    - 通过 EncoderLayerSANM(clamp_value=...) 构造参数控制
 #    - PT 推理时不传（保持数学等价）
 #    - 导出 ONNX 时由 export_onnx_split.py 注入
@@ -89,14 +89,20 @@ step 3:
 #     encoder 337MB → 187MB，decoder 159MB → 112MB
 #
 # 环境依赖（仅 INT8 导出需要，转换容器内）：
-#   pip install nvidia-modelopt==0.21.0 torchprofile --extra-index-url https://pypi.nvidia.com
+#   pip install nvidia-modelopt==0.21.0 torchprofile pulp regex --extra-index-url https://pypi.nvidia.com
 #   注意：不要装 nvidia-modelopt[torch]！0.44+ 会把 torch 顶到 2.12+cu130 破坏环境
+#   pulp/regex：modelopt 0.21 隐性依赖，缺失会报误导性的 "Please install optional [torch] dependencies"
+#   验证安装：python -c "import modelopt.torch.quantization as mtq; print('modelopt OK')"
 
 step 4:
     # ─── 步骤 1：encoder QDQ 量化 ─────────────────────────────────
     # modelopt INT8 量化 + 校准 → 导出含 QDQ 节点的 ONNX
+    # --model-id 指向本地 PT 目录（避免联网下载，转换/推理容器均无 modelscope）
+    # --cmvn-path 指向 models/asr/pt/am.mvn（配置文件实际位置）
     python scripts/export_encoder_qdq.py \
         --calib-data ./calib_data/audio_data \
+        --model-id ./models/asr/pt \
+        --cmvn-path ./models/asr/pt/am.mvn \
         --output ./models/asr/split/encoder_qdq.onnx
 
     # QDQ ONNX → INT8 engine（QDQ 自带 scale，不需要 calibrator）
@@ -119,6 +125,8 @@ step 4:
     python scripts/export_decoder_qdq.py \
         --encoder-engine ./models/asr/trt/2080_ti_encoder_fp16.engine \
         --cif-engine ./models/asr/trt/2080_ti_cif_fp16.engine \
+        --model-id ./models/asr/pt \
+        --cmvn-path ./models/asr/pt/am.mvn \
         --output ./models/asr/split/decoder_qdq.onnx
 
     python scripts/convert_trt.py \
@@ -158,6 +166,8 @@ step 5:
     python scripts/export_cif_qdq.py \
         --calib-data ./calib_data/audio_data \
         --encoder-engine ./models/asr/trt/2080_ti_encoder_fp16.engine \
+        --model-id ./models/asr/pt \
+        --cmvn-path ./models/asr/pt/am.mvn \
         --output ./models/asr/split/cif_qdq.onnx
     python scripts/convert_trt.py \
         --input ./models/asr/split/cif_qdq.onnx \
@@ -167,6 +177,8 @@ step 5:
     # bias QDQ（自包含，用词表编码 token 校准）
     python scripts/export_bias_qdq.py \
         --hotword-file ./models/asr/hotwords.txt \
+        --model-id ./models/asr/pt \
+        --tokens-path ./models/asr/pt/tokens.json \
         --output ./models/asr/split/bias_encoder_qdq.onnx
     python scripts/convert_trt.py \
         --input ./models/asr/split/bias_encoder_qdq.onnx \
@@ -224,12 +236,15 @@ step 6:
     # ─── 模型直推全链路（跳过服务，特征→ONNX→解码） ─────────────
     # fp32（GPU）
     python tests/test_model.py --audio test_data/audio_16000_30s.wav \
+        --config-dir ./models/asr/pt \
         --model-dir ./models/asr/fp32 --device cuda
     python tests/test_model.py --audio test_data/audio_16000_10s.wav \
-        --model-dir ./models/asr/fp32 --device cuda --hotwords 埃文 账号
+        --model-dir ./models/asr/fp32 --config-dir ./models/asr/pt \
+        --device cuda --hotwords 埃文 账号
+
     # int8（CPU）
     python tests/test_model.py --audio test_data/audio_16000_30s.wav \
-        --model-dir ./models/asr/int8 --device cpu
+        --model-dir ./models/asr/int8 --config-dir ./models/asr/pt --device cpu
 
 step 7:
     # ─── VAD 单独测试（语音段时间戳） ───────────────────────────

@@ -48,8 +48,8 @@ PT 权重 → 分段 ONNX（export_onnx_split.py）→ TRT fp32/fp16 engine（co
 完整流程见 `step_run.sh`，关键命令：
 
 ```bash
-# 分段 ONNX 导出（opset 17 + clamp 30000，纯 fp16 关键）
-python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 30000
+# 分段 ONNX 导出（opset 17 + clamp 60000，fp16 关键）
+python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 60000
 
 # TRT fp16（纯 fp16，无 fp32 fallback）
 python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp16 --profile encoder
@@ -91,27 +91,74 @@ python scripts/evaluate_cer.py --audio-dir calib_data/audio_data --csv report_ce
 
 | 子模型 | 功能 | 推荐精度 | 说明 |
 |--------|------|----------|------|
-| encoder.onnx | 语音编码 | fp16 | opset 17 + clamp 30000，纯 fp16 不崩溃 |
+| encoder.onnx | 语音编码 | fp16 | opset 17 + clamp 60000，纯 fp16 不崩溃 |
 | cif.onnx | CIF 预测器 | fp16 | 向量化实现（cumsum+bmm），TRT 兼容 |
 | decoder.onnx | 解码器+SeACo | fp16 | 含 ASF + SeACo decoder + 热词合并 |
 | bias_encoder.onnx | 热词编码器 | fp16 | LSTM 编码热词 token IDs |
 
 > 历史问题：早期 encoder/decoder 全 fp16 会精度崩溃（残差 Add 溢出 inf）。
-> 现已通过 **opset 17 原生 LayerNormalization + encoder 残差 Add clamp 30000**
+> 现已通过 **opset 17 原生 LayerNormalization + encoder 残差 Add clamp 60000**
 > 实现纯 fp16，无需任何 fp32 fallback（详见 docs/README.md）。
 
 ### 纯 fp16 三大关键技术
 
 1. **opset 17 LayerNormalization 单节点**：TRT 10.6 内部对该算子自动 fp32 累加
-2. **encoder 残差 Add 后 clamp 30000**：≫ PT 真实峰值 ~7554，≪ fp16 上限 65504
+2. **encoder 残差 Add 后 clamp 60000**：后段层激活峰值 ~48万 >> fp16 上限 65504，60000 贴近上限最大化保留
 3. **纯 trtexec --fp16**：无需 Python TRT API / OBEY_PRECISION_CONSTRAINTS / 手动 fallback
+
+### 已知问题与排查经验（重要）
+
+> 以下是分段 ONNX/TRT 导出中踩过的坑，重新导出或改模型代码时务必注意。
+
+**1. encoder 残差激活峰值高达 ~48万，clamp 值直接影响精度**
+
+- encoder 后段层（约 29-49 层）残差累积激活峰值达 **~48万**（用
+  `tests/test_pt_inference_v2.py --dump-act` 实测），远超 fp16 上限 65504。
+- fp16/int8 路径**必须 clamp**（否则溢出 inf）；fp32/ORT 路径**必须不 clamp**
+  （`--clamp-value 0`，否则 Clip 算子引入误差）。
+- clamp 值取舍：**60000**（贴近 fp16 上限，仅极少数峰值点被裁，CER 影响极小）。
+  早期 30000 把后段 ~48万 狠裁到 3万，导致 **VAD 切段产生的非满桶输入**（如 125 帧）
+  解码中段重复乱码——整段 167 帧因边界帧占比小不易暴露，极具迷惑性。
+
+**2. SinusoidalPositionEncoder 不能用 `torch.arange(timesteps)` 构造 position**
+
+- `torch.arange(1, x.size(1)+1)` 在 ONNX trace 时会把 timesteps 固化成 dummy 长度常量，
+  非 dummy 长度输入时位置编码错位 → encoder_out 系统性偏差。
+- 已改用 `cumsum(ones_like(x))` 生成动态长度的 position 序列（`layers.py`）。
+
+**3. cif_v1_export 必须与 PT `cif`（for 循环软分配）数学等价**
+
+- 旧实现用 `floor(cum/thr)` one-hot 硬分配，把跨 token 边界的帧整帧分给单个 token，
+  丢失边界拆分；短/截断输入下 acoustic 偏差累积致解码乱码。
+- 已改用**区间重叠软分配**（帧累积区间 [cum-α, cum) 与 token 区间 [j·thr,(j+1)·thr)
+  的重叠长度，min/max/clamp+bmm，无 Loop/scatter，TRT 兼容）。
+- `python -m seaco_paraformer.predictor` 自检：新版 vs PT 误差 1e-5，ORT 导出保真。
+
+**4. token_num 取整用 round 不是 int（floor）**
+
+- PT 用 `torch.round(alphas.sum())`，下游脚本/服务取 token_num 也必须 round，
+  用 `int()`（截断）会在小数 >0.5 时少算 1 个 token，导致 decoder 对齐错位。
+
+**5. 逐层定位工具**
+
+- `tests/test_split_onnx_pipeline.py --compare-pt`：逐段对比 PT vs ONNX
+  （encoder_out / token_num / acoustic / 最终 argmax 分叉位置 + 交叉验证）。
+- `scripts/export_encoder_truncated.py --num-layers N --compare`：导出前 N 层 encoder
+  并对比 PT vs ORT，二分定位误差出现的层。
+- `tests/test_pt_inference_v2.py --dump-act`：dump 每层残差激活峰值（定 clamp 下限）。
 
 ### INT8 量化（QDQ Explicit）
 
 - 量化库：`nvidia-modelopt==0.21.0`（必须钉版本，0.44+ 破坏 torch 环境）
+  - 隐性依赖：`pulp`、`regex`（缺失报误导性的 "Please install optional [torch] dependencies"）
+  - 安装：`pip install nvidia-modelopt==0.21.0 torchprofile pulp regex --extra-index-url https://pypi.nvidia.com`
+  - 验证：`python -c "import modelopt.torch.quantization as mtq; print('modelopt OK')"`
 - 方案：QDQ Explicit（插入 Q/DQ 节点显式标记量化边界），Calibrator Implicit 在 SeACo 架构上无效
 - encoder QDQ：`export_encoder_qdq.py`；decoder QDQ：`export_decoder_qdq.py`（默认排除 SeACo 路径保 fp16）
 - cif QDQ：`export_cif_qdq.py`（trt_int8 用）；bias QDQ：`export_bias_qdq.py`（trt_int8 用）
+- 所有 QDQ 导出脚本需传 `--model-id ./models/asr/pt`（本地 PT 目录，避免联网下载）；
+  涉及特征的脚本（encoder/cif/decoder）还需 `--cmvn-path ./models/asr/pt/am.mvn`，
+  bias 脚本需 `--tokens-path ./models/asr/pt/tokens.json`（配置文件实际在 `models/asr/pt`）
 
 ### 热词推理流程
 
@@ -127,6 +174,35 @@ SeACo 内部：
 3. SeACo decoder × 2（query=acoustic_embeds / hidden，memory=filtered_hotwords）
 4. merged → hotword_output_layer → dha_logits
 5. NO_BIAS mask 合并：`logits * mask + dha_logits * (1-mask)`
+
+### 热词维度规格（bias_encoder 输出 ↔ decoder 输入对齐）
+
+数据流维度（H=热词数含哨兵，L=hw_len token 长度，D=512）：
+
+```
+bias_encoder 输入 hotword:  (num_hotwords=H, hw_len=L)
+bias_encoder 输出 hw_embed: (hw_len=L, num_hotwords=H, D)   ← L 在前
+  → 中间处理：transpose→(H,L,D)→按热词长度取最后时间步→ bias_embed (1, H, D)
+decoder 输入 bias_embed:    (batch=1, num_hotwords=H, D)    ← decoder 用 H 作热词数
+```
+
+两个维度的单一数据源（`src/config.py`）：
+
+| 维度 | 参数 | profile opt / max | 说明 |
+|---|---|---|---|
+| 热词数量 num_hotwords | MAX_HOTWORD_NUM=256, OPT_HOTWORD_NUM=64 | opt=64 / max=257 | +1 为 `[sos]` 哨兵行 |
+| 热词长度 hw_len | MAX_HOTWORD_LEN=16 | opt=4 / max=16 | 中文逐字 / 英文 seg_dict BPE 后可达 ~12 |
+
+- bias profile（`hotword`）与 decoder profile（`bias_embed`）的数量维度都用 opt=64/max=257，**全程一致**。
+- 各导出脚本 dummy 统一 num_hotwords=4、轴名统一 `num_hotwords`/`hw_len`（均动态轴示例值，不限制 engine 范围）。
+- bias QDQ 校准长度 `--calib-hw-len` = 16（与 MAX_HOTWORD_LEN 对齐，覆盖长英文热词）。
+
+### 英文热词支持（seg_dict BPE）
+
+- `tokenizer.encode` 中英混合切分：中文逐字最长匹配；英文单词查 `models/asr/pt/seg_dict`
+  （FunASR 官方英文 BPE 表，31 万词）得正确 subword 序列，未命中 fallback 贪心匹配。
+- `tokenizer.load` 自动探测同目录 `seg_dict`，缺失时降级为纯贪心（向后兼容）。
+- 中文热词逐字命中、encode↔decode 字符级一致，路径不变。
 
 Engine 产物（按 GPU 命名）：
 ```

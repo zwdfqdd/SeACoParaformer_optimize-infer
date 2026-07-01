@@ -202,8 +202,12 @@
             词表文件格式：
                 tokens.json: JSON 数组 ["<blank>", "<sos>", ...]
                 tokens.txt: 每行 "token id" 或仅 "token"（行号为 ID）
-            decode：token_ids → 过滤特殊 token → 拼接（▁ 替换为空格）
-            encode：文本 → 最长匹配 → token_id 列表（用于 hotwords 编码）
+            decode：token_ids → 过滤特殊 token → 拼接（▁ 替换为空格，@@ 表词内连接）
+            encode：文本 → 中英混合切分 → token_id 列表（用于 hotwords 编码）
+                - 中文/标点：逐字最长匹配（≤4 字符）
+                - 英文单词：查 seg_dict（FunASR 官方英文 BPE 表，models/asr/pt/seg_dict）
+                  得到正确 subword 序列（如 android→a@@ nd@@ ro@@ id），未命中 fallback 贪心匹配
+                - seg_dict 同目录自动探测；缺失时降级为纯贪心（向后兼容）
         19).推理服务依赖
             推理环境 requirements-infer.txt 包含：
                 onnxruntime-gpu — ONNX 模型推理
@@ -473,7 +477,7 @@ v2 阶段 1（更新）— 全 fp16 已完成 ✓✓
 v2 阶段 1（最终）— opset 17 + clamp + 全 fp16 ✓✓✓
     三大关键技术：
         1. opset 17：导出原生 LayerNormalization 单节点（替代 opset 16 的 9 算子分解）
-        2. encoder 残差 Add clamp 60000：避免 fp16 上限 65504 溢出，对 PT 真实激活峰值 ~7554 无影响
+        2. encoder 残差 Add clamp 30000：避免 fp16 上限 65504 溢出，对 PT 真实激活峰值 ~7554 无影响
         3. layer.type == NORMALIZATION 自动识别 + OBEY_PRECISION_CONSTRAINTS：
            仅 LN 节点 fp32，其余全 fp16，cast 链最短化
 
@@ -483,7 +487,7 @@ v2 阶段 1（最终）— opset 17 + clamp + 全 fp16 ✓✓✓
         - scripts/convert_trt_fp16_with_norm_fp32.py：layer.type == NORMALIZATION 自动 fp32
 
     导出命令：
-        python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 60000
+        python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 30000
 
     转换命令：
         python scripts/convert_trt_fp16_with_norm_fp32.py \
@@ -512,18 +516,18 @@ v2 阶段 1（最终突破）— opset 17 + clamp + 纯 fp16 ✓✓✓✓
     重大发现：
         TRT 10.6 对 opset 17 的 LayerNormalization 算子内部自动用 fp32 累加，
         所以只要保证进入 LN 的 fp16 输入不溢出（|x| < 65504），LN 自己内部就安全。
-        clamp=60000 在 encoder 残差 Add 后限值，正好满足这个条件。
+        clamp=30000 在 encoder 残差 Add 后限值，正好满足这个条件。
         不需要任何 fp32 fallback。
 
     精简后的两大关键技术：
         1. opset 17：导出原生 LayerNormalization 单节点（替代 9 算子分解）
            TRT 10.6 对该算子内部 fp32 累加，无需外部 fallback
-        2. encoder 残差 Add 后 clamp 60000（在 seaco_paraformer/encoder.py 注入）
+        2. encoder 残差 Add 后 clamp 30000（在 seaco_paraformer/encoder.py 注入）
            阈值 >> PT 真实激活峰值 ~7554，对 PT 数学无影响
 
     转换流程（极简化）：
         # 导出（注入 clamp）
-        python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 60000
+        python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 30000
 
         # 转 fp16（纯 trtexec，无任何 fp32 fallback）
         python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp16 --profile encoder
@@ -547,7 +551,7 @@ v2 阶段 1（最终突破）— opset 17 + clamp + 纯 fp16 ✓✓✓✓
         - convert_trt_encoder_fp16.py：可删除（已被通用版替代）
 
     下一阶段任务 — v2 阶段 2 INT8 量化：
-        基于 opset 17 ONNX + clamp 60000 模型做 INT8 校准
+        基于 opset 17 ONNX + clamp 30000 模型做 INT8 校准
 
 
 # ============================================================
@@ -758,7 +762,7 @@ Faiss "检索命中 + 三重阈值才替换" 更适合大规模词库。
 | 数量上限 / 切换点 MAX_HOTWORD_NUM | 256（客户端超限截断 Top256 + 告警） |
 | profile opt OPT_HOTWORD_NUM | 64 |
 | ASF 过滤 NFILTER | 50 |
-| 编码 | tokenizer.encode → 追加 [sos] 哨兵 → padding → bias_encoder |
+| 编码 | tokenizer.encode（中文逐字 / 英文查 seg_dict BPE）→ 追加 [sos] 哨兵 → padding → bias_encoder |
 | 显存 | bias 维度固定 ≤256（engine profile max=256+1=257 含哨兵），永不重建 |
 | 默认词表优化 | 静态，启动预编码 bias_embed 缓存，命中默认路径直接复用 |
 
@@ -811,6 +815,7 @@ tokenizer 可编码(剔 OOV) → 试跑 bias_encoder 验 nan/inf。
 |---|---|---|
 | MAX_HOTWORD_NUM | 256 | A（硬上限/切换点，engine profile=257 含哨兵） |
 | OPT_HOTWORD_NUM | 64 | A |
+| MAX_HOTWORD_LEN | 16 | A（单热词最大 token 数；英文 seg_dict BPE 后可达 ~12，bias profile 长度维度上限） |
 | NFILTER | 50 | A |
 | DEFAULT_HOTWORD_PATH | models/asr/hotwords.txt | A/B |
 | HOTWORD_RELOAD_ENABLED | true | — |
@@ -879,4 +884,112 @@ tokenizer 可编码(剔 OOV) → 试跑 bias_encoder 验 nan/inf。
 - MAX_HOTWORD_NUM=256 改了 bias/decoder profile，需重新转 engine
 - 容器内 src/config.py 需同步最新（含 get_trt_profiles），否则 convert_trt 报错
 
+# ============================================================
+
+# ============================================================
+# 参数对齐 + 英文热词支持（2026-06-29）
+# ============================================================
+
+## 一、TRT shape profile 优化（省显存）
+- TRT_MAX_SEQ：167 → 134（贴合最大桶 8s=134 帧）
+  - 原 167 是防越界余量，但 audio_segment 切段上限 SPLIT_MAX_MS=133帧 < 134，永不越界
+  - profile max 直接决定 activation 显存峰值，134 比 167 省约 20%
+  - TRT_OPT_SEQ 维持 67（中间桶 4s，主力工作点）
+- export_onnx_split.py：encoder/cif/decoder dummy 167 → 134（与 profile 对齐）
+- ★需重新导出 ONNX + 重转所有 engine 生效
+
+## 二、convert_trt.py ASR_PROFILES 硬编码消除
+- 整体模型 profile（--profile asr）原硬编码 batch=8/seq=289/热词=8，与 config 漂移
+- 改为 _build_asr_profiles() 从 config 动态生成（与分段 profile 同源）
+
+## 三、英文热词支持（tokenizer seg_dict 集成）
+- 背景：原 encode 对英文纯贪心匹配（≤4字符，无 BPE merges），切分不准（android→and/r/o/id）
+- 方案：集成 FunASR seg_dict（models/asr/pt/seg_dict，31万英文词→BPE subword 映射）
+  - load() 自动探测同目录 seg_dict 文件
+  - encode() 中英混合切分：英文单词查 seg_dict 走正确 BPE，中文逐字（不变），未命中 fallback 贪心
+  - 新增 _load_seg_dict / _encode_english_word / _greedy_encode
+- MAX_HOTWORD_LEN：8 → 16（英文 BPE 后 token 数可达 ~12，覆盖长英文词）
+- 本地验证：android→3 tokens、apple→2 tokens、长词 internationalization→12 tokens、
+  中文"埃文"逐字不变、encode↔decode 回环正确
+- ★MAX_HOTWORD_LEN 进 bias/decoder profile，需重转 engine 生效
+- 定位：业务热词以中文为主、英文为辅；中文路径零改动，英文偏置强度从此正常
+
+## 四、配置文件路径统一（models/asr/pt）
+- am.mvn / tokens.json / seg_dict 实际在 models/asr/pt 下（ModelScope PT 包自带）
+- 统一各脚本 --config-dir / --cmvn-path / --tokens-path 默认值 → models/asr/pt
+  - tests：test_model/test_trt_pipeline/test_split_onnx_pipeline/test_pt_inference_v2
+  - scripts：evaluate_cer / export_{encoder,cif,decoder}_qdq(--cmvn-path) /
+    export_bias_qdq(--tokens-path) / verify_onnx（config_dir 推导 + PT 推理硬编码路径）
+- QDQ 导出脚本统一加 --model-id ./models/asr/pt（本地 PT，避免联网下载 modelscope）
+- prepare_model.py：新增 _cmvn_args/_tokens_args，容器构建显式传路径
+
+## 五、modelopt 隐性依赖补全
+- requirements-infer.txt 补 pulp + regex（modelopt 0.21 import 全量加载子模块需要，
+  缺失报误导性的 "Please install optional [torch] dependencies"）
+- 验证：python -c "import modelopt.torch.quantization as mtq; print('modelopt OK')"
+
+# ============================================================
+
+# ============================================================
+# clamp 值最终修正：30000 → 60000（2026-06-30）★权威结论，覆盖上文所有 30000 表述
+# ============================================================
+
+## 根因（--compare-pt + --dump-act 逐层诊断确认）
+- encoder 后段层(32-49)残差累积激活峰值高达 ~48万（PT fp32 实测，3条音频一致）
+  layer0-28: 1300→13000；layer31: 45365；layer32: 101838(超fp16)；layer38-49: ~48万
+- 之前误判"激活峰值 ~7554"：7554 是 after_norm 最终输出量级，不是层间残差中间值
+- clamp=30000 把后段 ~48万 狠裁到 3万 → 严重失真，截断输入(VAD切段非满桶)解码中段乱码
+
+## 最终方案
+- clamp=60000（贴近 fp16 上限 65504，最大化保留信息）
+  - fp16/int8 路径：必须 clamp（48万 >> 65504 否则溢出 inf），用 60000
+  - fp32/ORT 路径：clamp=0（无 clamp 无损；compare-pt 实测 PT=ONNX 完全一致）
+- 实测 clamp=60000 vs 30000（125帧截断输入，TRT fp16）：
+  误差 0.255 vs 0.295；误差token 4/125(集中) vs 89/125(分散)；识别基本正确(仅叠字微抖)
+
+## 附带修复（本轮一并解决，均已验证）
+- cif_v1_export：硬分配(floor one-hot)→软分配(区间重叠 min/max/clamp+bmm)，与PT cif误差1e-5
+- token_num 取整：int(floor)→round（与 PT torch.round 一致）
+- 注：上述两项是正确改进，但 125帧乱码主因是 clamp，非它们
+
+## 默认值（已落地代码）
+- export_onnx_split.py / export_encoder_qdq.py / prepare_model.py：clamp 默认 60000
+- seaco_paraformer/encoder.py：clamp_value 注入 encoders0 + encoders 全部 50 层
+- 上文所有 "clamp 30000" 历史表述以本节 60000 为准
+
+## fp16 本质局限说明
+- 此 encoder 后段激活天然 ~48万，fp16(65504) 无法无损表示，clamp 60000 仍裁极少数峰值点
+- 追求无损：用 trt_fp32 / onnx_fp32（clamp=0，已验证完全正确）
+- 极致精度场景可考虑后段层 fp32 混合精度（未实施，备选）
+# ============================================================
+
+# ============================================================
+# 热词维度规格统一（2026-06-30）★bias_encoder 输出 ↔ decoder 输入 维度对齐
+# ============================================================
+
+## 数据流维度（H=热词数含哨兵, L=hw_len, D=512）
+1. bias_encoder 输入 hotword:  (num_hotwords=H, hw_len=L)
+2. bias_encoder 输出 hw_embed: (hw_len=L, num_hotwords=H, D)   ← L 在前（transpose 过）
+3. 中间处理(trt_engine/test)：transpose→(H,L,D)→按热词长度取最后时间步→bias_embed (1, H, D)
+4. decoder 输入 bias_embed:    (batch=1, num_hotwords=H, D)
+   decoder 内部 B,H,D=bias_embed.shape，用 H 作热词数 → 与 bias 输出 H 完全一致 ✓
+
+## 两个维度的统一标准（单一数据源 = config）
+- 热词数量维度 num_hotwords：MAX_HOTWORD_NUM=256，profile opt=64/max=257(含哨兵)
+  - bias profile hotword 第0维、decoder profile bias_embed 第1维 都用 opt=64/max=257 ✓
+- 热词长度维度 hw_len：MAX_HOTWORD_LEN=16
+  - bias profile hotword 第1维 opt=4/max=16
+  - bias QDQ calib-hw-len=16（本轮 8→16，覆盖最大长度）
+  - decoder 不涉及 hw_len（bias_embed 已是取最后时间步后的 (1,H,D)）
+
+## 本轮统一项
+- 轴命名：hw_embed 第0维 seq_len→hw_len；hotword 第1维 max_len→hw_len（split 与 qdq 一致）
+- dummy num_hotwords：各导出统一为 4（split/decoder/bias_qdq/decoder_qdq/whole 一致，均动态轴示例值）
+- bias QDQ calib-hw-len：8→16（与 MAX_HOTWORD_LEN 对齐，覆盖长英文热词）
+- 变量名 max_len→hw_len（export_bias_encoder）
+
+## 结论
+bias_encoder 输出 H 维 = decoder 输入 H 维，全程一致正确（功能从来对，本轮统一了
+表面的轴命名/dummy 值/QDQ 校准长度）。dummy 值是动态轴示例，不限制 engine 范围
+（范围由 config profile opt/max 决定）。
 # ============================================================

@@ -29,7 +29,7 @@ pip install -r requirements-infer.txt
 | # | 技术点 | 实现位置 | 作用 |
 |---|---|---|---|
 | 1 | **opset 17 LayerNormalization 单节点** | `scripts/export_onnx_split.py` 默认 `--opset 17` | PyTorch 2.5 trace 自动识别 `nn.LayerNorm`，导出为单节点；TRT 10.6 内部对该节点自动 fp32 累加，避免 fp16 LayerNorm 内 `(x-mean)²` 溢出 |
-| 2 | **encoder 残差 Add 后 clamp 30000** | `seaco_paraformer/encoder.py` 的 `EncoderLayerSANM(clamp_value=30000)` | 30000 ≫ PT 真实激活峰值 ~7554（不影响 PT 数学），≪ fp16 上限 65504（fp16 残差 Add 不溢出 inf） |
+| 2 | **encoder 残差 Add 后 clamp 60000** | `seaco_paraformer/encoder.py` 的 `EncoderLayerSANM(clamp_value=60000)` | encoder 后段层残差激活峰值高达 ~48万（远超 fp16 上限 65504）；60000 贴近 fp16 上限最大化保留信息，防溢出 inf。clamp=30000 裁剪过狠致截断输入解码错乱，已弃用 |
 | 3 | **纯 trtexec --fp16 转换** | `scripts/convert_trt.py --precision fp16` | 不需要 Python TRT API、不需要 OBEY_PRECISION_CONSTRAINTS、不需要任何手动 fp32 fallback |
 
 ### 完整执行流程
@@ -40,10 +40,10 @@ python tests/test_pt_inference_v2.py \
     --audio test_data/audio_16000_10s.wav \
     --hotwords 埃文 账号
 
-# Step 2：导出分段 ONNX（注入 clamp=30000）
+# Step 2：导出分段 ONNX（注入 clamp=60000）
 python scripts/export_onnx_split.py \
     --output-dir ./models/asr/split \
-    --clamp-value 30000
+    --clamp-value 60000
 
 # Step 3：ORT 验证 ONNX 等价性
 python tests/test_split_onnx_pipeline.py \
@@ -78,11 +78,15 @@ python tests/test_trt_pipeline.py \
 
 | 指标 | 期望值 | 含义 |
 |---|---|---|
-| token_num | 与 PT baseline 一致（=61） | CIF predictor 数值稳定 |
-| encoder max | ~0.37（PT baseline 0.3716） | 数值量级一致 |
+| token_num | 与 PT baseline 一致 | CIF predictor 数值稳定 |
+| encoder max | ~0.4（与 PT baseline 同量级） | 数值量级一致 |
 | nan/inf | False | 无溢出 |
-| 识别文本 | 字符级与 PT baseline 一致 | 推理完整等价 |
-| RTX | ~96-100x | 性能符合预期（2080 Ti） |
+| 识别文本 | 与 PT baseline 一致（fp16 仅极少数边缘 token 微抖） | 推理等价 |
+| RTX | ~80-100x | 性能符合预期（2080 Ti） |
+
+> **fp16 本质局限**：encoder 后段激活天然 ~48万，fp16(65504) 无法无损表示，
+> clamp=60000 仍裁极少数峰值点（单条样本偶见叠字微抖，CER 影响极小）。
+> 追求完全无损用 `trt_fp32` / `onnx_fp32`（clamp=0）。
 
 ### 备选方案（追求最高速度）
 
@@ -110,7 +114,12 @@ python tests/test_trt_pipeline.py \
 
 ```bash
 # 必须钉版本！0.44+ 会把 torch 顶到 2.12+cu130 破坏 torchaudio/TRT 环境
-pip install nvidia-modelopt==0.21.0 torchprofile --extra-index-url https://pypi.nvidia.com
+pip install nvidia-modelopt==0.21.0 torchprofile pulp regex --extra-index-url https://pypi.nvidia.com
+
+# pulp/regex 为 modelopt 0.21 隐性依赖，缺失会报误导性的
+#   "Please install optional [torch] dependencies"（实为缺这两个纯工具库）
+# 验证安装：
+python -c "import modelopt.torch.quantization as mtq; print('modelopt OK')"
 ```
 
 ### 量化范围
@@ -137,10 +146,14 @@ pip install nvidia-modelopt==0.21.0 torchprofile --extra-index-url https://pypi.
 
 ```bash
 # 校准数据：calib_data/audio_data 下放 16kHz 单声道 WAV（300 条）
+# 注：QDQ 导出脚本统一加 --model-id ./models/asr/pt（本地 PT，避免联网下载）
+#     涉及特征的脚本加 --cmvn-path ./models/asr/pt/am.mvn；bias 加 --tokens-path ./models/asr/pt/tokens.json
 
 # 1. encoder QDQ 量化导出 + 转 engine
 python scripts/export_encoder_qdq.py \
     --calib-data ./calib_data/audio_data \
+    --model-id ./models/asr/pt \
+    --cmvn-path ./models/asr/pt/am.mvn \
     --output ./models/asr/split/encoder_qdq.onnx
 python scripts/convert_trt.py --input ./models/asr/split/encoder_qdq.onnx \
     --precision int8 --profile encoder \
@@ -150,6 +163,8 @@ python scripts/convert_trt.py --input ./models/asr/split/encoder_qdq.onnx \
 python scripts/export_decoder_qdq.py \
     --encoder-engine ./models/asr/trt/2080_ti_encoder_fp16.engine \
     --cif-engine ./models/asr/trt/2080_ti_cif_fp16.engine \
+    --model-id ./models/asr/pt \
+    --cmvn-path ./models/asr/pt/am.mvn \
     --output ./models/asr/split/decoder_qdq.onnx
 python scripts/convert_trt.py --input ./models/asr/split/decoder_qdq.onnx \
     --precision int8 --profile decoder \
@@ -159,19 +174,24 @@ python scripts/convert_trt.py --input ./models/asr/split/decoder_qdq.onnx \
 python scripts/export_cif_qdq.py \
     --calib-data ./calib_data/audio_data \
     --encoder-engine ./models/asr/trt/2080_ti_encoder_fp16.engine \
+    --model-id ./models/asr/pt \
+    --cmvn-path ./models/asr/pt/am.mvn \
     --output ./models/asr/split/cif_qdq.onnx
 python scripts/convert_trt.py --input ./models/asr/split/cif_qdq.onnx \
     --precision int8 --profile cif \
     --output ./models/asr/trt/2080_ti_cif_int8_qdq.engine
 python scripts/export_bias_qdq.py \
     --hotword-file ./models/asr/hotwords.txt \
+    --model-id ./models/asr/pt \
+    --tokens-path ./models/asr/pt/tokens.json \
     --output ./models/asr/split/bias_encoder_qdq.onnx
 python scripts/convert_trt.py --input ./models/asr/split/bias_encoder_qdq.onnx \
     --precision int8 --profile bias \
     --output ./models/asr/trt/2080_ti_bias_encoder_int8_qdq.engine
 
 # 4. 数据集级 CER 评测（基准 fp16 vs 待测 int8，阈值 3%）
-python scripts/evaluate_cer.py --audio-dir calib_data/audio_data --csv report_cer.csv
+python scripts/evaluate_cer.py --audio-dir calib_data/audio_data \
+    --config-dir ./models/asr/pt --csv report_cer.csv
 ```
 
 ### 诊断工具
@@ -225,7 +245,7 @@ python scripts/inspect_engine_precision.py --engine models/asr/trt/2080_ti_encod
 | 数量上限 / 切换点 MAX_HOTWORD_NUM | 256（客户端超限截断 Top256 + 告警；engine profile=256+1 含哨兵） |
 | profile opt OPT_HOTWORD_NUM | 64 |
 | ASF 过滤 NFILTER | 50 |
-| 编码 | tokenizer + `[sos]` 哨兵 → bias_encoder |
+| 编码 | tokenizer（中文逐字 / 英文查 seg_dict BPE）+ `[sos]` 哨兵 → bias_encoder |
 | 显存 | bias 维度 ≤256，engine profile max 固定不重建 |
 | 默认词表优化 | 静态，启动预编码 bias_embed 缓存，命中默认路径直接复用 |
 
@@ -461,7 +481,9 @@ SeACoParaformer/
 │   ├── test_model.py                 # 整体 ONNX 推理
 │   ├── test_service.py               # 服务压测
 │   ├── test_single.py                # 单次请求测试
-│   ├── test_asr_api.py               # HTTP API 测试
+│   ├── test_asr_api.py               # HTTP ASR API 测试
+│   ├── test_hotword_api.py           # 热词热更新接口测试
+│   ├── test_error_api.py             # 错误码路径测试
 │   └── test_vad.py                   # VAD 单独测试
 ├── models/                   # 模型文件（不纳入版本控制）
 │   ├── asr/
