@@ -152,7 +152,7 @@ def main():
     parser = argparse.ArgumentParser(description="TRT 分段模型推理测试（含热词支持，各部分独立精度）")
     parser.add_argument("--audio", required=True, help="WAV 16kHz 单声道音频")
     parser.add_argument("--engine-dir", default="./models/asr/trt", help="TRT engine 目录")
-    parser.add_argument("--config-dir", default="./models/asr", help="配置文件目录")
+    parser.add_argument("--config-dir", default="./models/asr/pt", help="配置文件目录")
     parser.add_argument("--encoder-precision", default="fp32", choices=["fp32", "fp16", "int8"])
     parser.add_argument("--cif-precision", default="fp32", choices=["fp32", "fp16", "int8"])
     parser.add_argument("--decoder-precision", default="fp32", choices=["fp32", "fp16", "int8"])
@@ -162,6 +162,9 @@ def main():
     parser.add_argument("--decoder-engine", default=None, help="直接指定 decoder engine 路径")
     parser.add_argument("--bias-engine", default=None, help="直接指定 bias engine 路径")
     parser.add_argument("--hotwords", nargs="*", default=None, help="热词列表")
+    parser.add_argument("--max-frames", type=int, default=0,
+                        help="截取特征前 N 帧（0=不截取）。用于把超长特征裁到 ≤134 "
+                             "（encoder profile 上限），复刻服务单 chunk 输入做对照。")
     args = parser.parse_args()
 
     if not Path(args.audio).exists():
@@ -198,6 +201,9 @@ def main():
     t0 = time.perf_counter()
     features = extract_features(pcm, sample_rate=sr, cmvn_mean=cmvn_mean, cmvn_istd=cmvn_istd)
     feat_ms = (time.perf_counter() - t0) * 1000
+    if args.max_frames and features.shape[0] > args.max_frames:
+        features = features[:args.max_frames]
+        print(f"  截取前 {args.max_frames} 帧")
     print(f"  shape: {features.shape}, 耗时: {feat_ms:.1f}ms")
 
     # 加载 engines

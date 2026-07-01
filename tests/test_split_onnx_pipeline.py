@@ -51,9 +51,13 @@ def main():
     parser = argparse.ArgumentParser(description="分段 ONNX 模型推理测试（含热词支持）")
     parser.add_argument("--audio", required=True, help="WAV 16kHz 单声道音频")
     parser.add_argument("--split-dir", default="./models/asr/split", help="分段 ONNX 模型目录")
-    parser.add_argument("--config-dir", default="./models/asr", help="配置文件目录")
+    parser.add_argument("--config-dir", default="./models/asr/pt", help="配置文件目录")
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"], help="推理设备")
     parser.add_argument("--hotwords", nargs="*", default=None, help="热词列表")
+    parser.add_argument("--max-frames", type=int, default=0, help="截取特征前 N 帧（0=不截取）")
+    parser.add_argument("--compare-pt", action="store_true",
+                        help="诊断：用 PT 模型对同一 features 推理，逐段对比 encoder/CIF/decoder 定位分叉点")
+    parser.add_argument("--model-id", default="./models/asr/pt", help="PT 模型本地目录（--compare-pt 用）")
     args = parser.parse_args()
 
     if not Path(args.audio).exists():
@@ -85,6 +89,9 @@ def main():
     print("\n[3/5] 特征提取...")
     t0 = time.perf_counter()
     features = extract_features(pcm, sample_rate=sr, cmvn_mean=cmvn_mean, cmvn_istd=cmvn_istd)
+    if args.max_frames and features.shape[0] > args.max_frames:
+        features = features[:args.max_frames]
+        print(f"  截取前 {args.max_frames} 帧")
     feat_ms = (time.perf_counter() - t0) * 1000
     print(f"  shape: {features.shape}, 耗时: {feat_ms:.1f}ms")
 
@@ -162,7 +169,9 @@ def main():
     cif_ms = (time.perf_counter() - t1) * 1000
 
     acoustic_embeds = cif_out["acoustic_embeds"]
-    token_num = int(cif_out["token_num"].flatten()[0])
+    # token_num 取整必须用 round（与 PT cif 的 torch.round(alphas.sum()) 一致）。
+    # 用 int()（截断=floor）会在小数部分 >0.5 时少算 1 个 token，导致 decoder 对齐错位、中段重复。
+    token_num = int(round(float(cif_out["token_num"].flatten()[0])))
     acoustic_embeds = acoustic_embeds[:, :token_num, :]
     print(f"  [CIF] → {acoustic_embeds.shape} (token_num={token_num}), {cif_ms:.1f}ms")
 
@@ -219,6 +228,106 @@ def main():
     rtx = audio_duration / (total_ms / 1000)
     print(f"  RTF:       {rtf:.4f}")
     print(f"  RTX:       {rtx:.1f}x")
+
+    # ============================================================
+    # --compare-pt 诊断：PT 对同一 features 推理，逐段对比定位分叉点
+    # ============================================================
+    if args.compare_pt:
+        print(f"\n{'='*60}")
+        print("【--compare-pt】PT vs ONNX 逐段对比")
+        print(f"{'='*60}")
+        import torch
+        from seaco_paraformer.load_model import load_model
+
+        model = load_model(model_id=args.model_id, device="cpu")
+        feat_t = torch.from_numpy(features).unsqueeze(0).float()
+        feat_len = torch.tensor([features.shape[0]], dtype=torch.long)
+
+        with torch.no_grad():
+            # 1. PT encoder
+            pt_enc_out, pt_enc_lens = model.encode(feat_t, feat_len)
+            pt_enc = pt_enc_out.cpu().numpy()
+            d_enc = np.abs(pt_enc[:, :encoder_out.shape[1]] - encoder_out[:, :pt_enc.shape[1]]).max()
+            print(f"\n[Encoder] PT {pt_enc.shape} vs ONNX {encoder_out.shape}")
+            print(f"  encoder_out 最大绝对误差: {d_enc:.6f}  "
+                  f"{'✓ 一致' if d_enc < 1e-2 else '✗ 分叉点在 encoder'}")
+            # 诊断：PT/ONNX 激活峰值（看是否触及 clamp=60000）+ 误差分布
+            print(f"  PT  encoder_out  abs max={np.abs(pt_enc).max():.2f}, mean={np.abs(pt_enc).mean():.4f}")
+            print(f"  ONNX encoder_out abs max={np.abs(encoder_out).max():.2f}, mean={np.abs(encoder_out).mean():.4f}")
+            err_per_tok = np.abs(pt_enc[0] - encoder_out[0]).max(axis=-1)  # (T,) 每 token 最大误差
+            big = np.where(err_per_tok > 0.05)[0]
+            print(f"  误差>0.05 的 token 数: {len(big)}/{len(err_per_tok)}"
+                  f"{'（集中）' if 0 < len(big) <= 5 else '（分散）' if len(big) > 5 else ''}")
+            if len(big) > 0:
+                print(f"  误差最大的前5个token位置: {big[np.argsort(err_per_tok[big])[-5:]].tolist()}")
+
+            # 2. PT predictor（CIF）—— 喂 PT 自己的 encoder_out
+            pt_mask = (~_make_pad_mask(pt_enc_lens, maxlen=pt_enc_out.shape[1])[:, None, :]).to(pt_enc_out.device)
+            pred_out = model.predictor(pt_enc_out, mask=pt_mask)
+            pt_acoustic = pred_out[0].cpu().numpy()
+            pt_token_num = pred_out[1].cpu().numpy()
+            pt_tn = int(round(float(pt_token_num.flatten()[0])))
+            print(f"\n[CIF] PT token_num={pt_tn} (raw={float(pt_token_num.flatten()[0]):.4f}) "
+                  f"vs ONNX token_num={token_num} (raw={float(cif_out['token_num'].flatten()[0]):.4f})")
+            # 对齐 token 数比较 acoustic
+            onnx_acoustic_full = cif_out["acoustic_embeds"]
+            ncmp = min(pt_tn, token_num, pt_acoustic.shape[1], onnx_acoustic_full.shape[1])
+            d_ac = np.abs(pt_acoustic[:, :ncmp] - onnx_acoustic_full[:, :ncmp]).max()
+            print(f"  前 {ncmp} token acoustic_embeds 最大绝对误差: {d_ac:.6f}  "
+                  f"{'✓ 一致' if d_ac < 1e-2 else '✗ 分叉点在 CIF acoustic'}")
+
+            # 3. PT 完整推理（含 decoder + SeACo）对比最终识别
+            if args.hotwords:
+                hw_list = [tokenizer.encode(hw) for hw in args.hotwords if hw]
+                hw_list.append([model.sos])
+                pt_logits, pt_tn2 = model.inference(feat_t, feat_len, hw_list=hw_list, nfilter=50)
+            else:
+                pt_logits, pt_tn2 = model(feat_t, feat_len)
+            pt_text = tokenizer.decode(pt_logits[0].argmax(dim=-1).cpu().numpy())
+            print(f"\n[最终识别对比]")
+            print(f"  PT  : {pt_text}")
+            print(f"  ONNX: {text}")
+            # 逐 token argmax 对比，找第一个分叉位置
+            pt_ids = pt_logits[0].argmax(dim=-1).cpu().numpy()
+            onnx_ids = np.argmax(logits[0], axis=-1)
+            nmin = min(len(pt_ids), len(onnx_ids))
+            diff_pos = -1
+            for k in range(nmin):
+                if pt_ids[k] != onnx_ids[k]:
+                    diff_pos = k
+                    break
+            print(f"  token 数: PT={len(pt_ids)}, ONNX={len(onnx_ids)}")
+            print(f"  第一个 argmax 分叉位置: {'无（完全一致）' if diff_pos < 0 else diff_pos}")
+
+            # 4. 交叉验证：PT encoder_out → ONNX cif+decoder，定位 encoder vs cif/decoder
+            print(f"\n[交叉验证] 用 PT encoder_out 喂 ONNX cif+decoder：")
+            pt_enc_np = pt_enc.astype(np.float32)
+            mask_x = np.ones((1, 1, pt_enc_np.shape[1]), dtype=np.float32)
+            cif_x = cif.infer({"encoder_out": pt_enc_np, "mask": mask_x})
+            tn_x = int(round(float(cif_x["token_num"].flatten()[0])))
+            ac_x = cif_x["acoustic_embeds"][:, :tn_x, :].astype(np.float32)
+            print(f"  ONNX-cif(PT enc) token_num={tn_x} (raw={float(cif_x['token_num'].flatten()[0]):.4f})")
+            dec_x = {}
+            if "acoustic_embeds" in decoder.input_names:
+                dec_x["acoustic_embeds"] = ac_x
+            if "token_num" in decoder.input_names:
+                dec_x["token_num"] = np.array([tn_x], dtype=np.int64)
+            if "encoder_out" in decoder.input_names:
+                dec_x["encoder_out"] = pt_enc_np
+            if "encoder_out_lens" in decoder.input_names:
+                dec_x["encoder_out_lens"] = np.array([pt_enc_np.shape[1]], dtype=np.int64)
+            if "bias_embed" in decoder.input_names:
+                dec_x["bias_embed"] = dec_bias
+            logits_x = decoder.infer(dec_x)["logits"]
+            text_x = tokenizer.decode(np.argmax(logits_x[0], axis=-1))
+            print(f"  识别(PT enc → ONNX cif/dec): {text_x}")
+            print(f"  → 若此结果正确：问题在 ONNX encoder；若仍乱：问题在 ONNX cif/decoder")
+
+
+def _make_pad_mask(lengths, maxlen):
+    import torch
+    from seaco_paraformer.utils import make_pad_mask
+    return make_pad_mask(lengths, maxlen=maxlen)
 
 
 if __name__ == "__main__":

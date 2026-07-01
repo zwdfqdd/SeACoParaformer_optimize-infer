@@ -63,7 +63,7 @@ def main():
     parser = argparse.ArgumentParser(description="模型直接推理测试")
     parser.add_argument("--audio", required=True, help="WAV 16kHz 单声道音频路径")
     parser.add_argument("--model-dir", default="./models/asr/fp32", help="ONNX 模型目录（fp32 或 int8）")
-    parser.add_argument("--config-dir", default="./models/asr", help="配置文件目录（am.mvn, tokens.json）")
+    parser.add_argument("--config-dir", default="./models/asr/pt", help="配置文件目录（am.mvn, tokens.json）")
     parser.add_argument("--hotwords", nargs="*", default=None, help="热词列表")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"], help="推理设备")
     args = parser.parse_args()
@@ -149,7 +149,7 @@ def main():
 
     # 构建输入
     batch_features = features[np.newaxis, :, :]  # (1, T, 560)
-    batch_lengths = np.array([features.shape[0]], dtype=np.int32)
+    batch_lengths = np.array([features.shape[0]], dtype=np.int64)
 
     feed_dict = {}
     for name in input_names:
@@ -162,6 +162,9 @@ def main():
             if args.hotwords and os.path.exists(bias_model_path):
                 bias_embed = _encode_hotwords(bias_model_path, tokenizer, args.hotwords)
                 if bias_embed is not None:
+                    # model_eb.onnx 输出 (H, D)，主模型要 (1, H, D)，补 batch 维
+                    if bias_embed.ndim == 2:
+                        bias_embed = bias_embed[np.newaxis, :, :]
                     feed_dict[name] = bias_embed.astype(np.float32)
                     print(f"  热词 bias: shape={bias_embed.shape}")
                 else:
@@ -184,11 +187,24 @@ def main():
     print(f"  输出 logits shape: {logits.shape}")
     if len(outputs) > 1:
         print(f"  其他输出: {[o.shape for o in outputs[1:]]}")
+
+    # 按 token_num 截断（CIF 输出 acoustic_embeds 长度=帧数，decoder 输出含 token_num
+    # 之后的垃圾位置，必须按 token_num 截断，否则解码出大量乱码尾巴）
+    token_num = None
+    for j, oname in enumerate(output_names):
+        if "token_num" in oname.lower():
+            token_num = int(round(float(np.asarray(outputs[j]).flatten()[0])))
+            break
+    if token_num is not None:
+        print(f"  token_num（有效 token 数）: {token_num}")
     print()
 
     # ====== Step 5: 解码 ======
     print("[5/5] 解码结果...")
-    token_ids = np.argmax(logits[0], axis=-1)  # (time,)
+    token_logits = logits[0]
+    if token_num is not None and 0 < token_num <= token_logits.shape[0]:
+        token_logits = token_logits[:token_num]
+    token_ids = np.argmax(token_logits, axis=-1)  # (token_num,)
     text = tokenizer.decode(token_ids)
 
     print(f"  Token 序列长度: {len(token_ids)}")
@@ -228,11 +244,15 @@ def _encode_hotwords(bias_model_path: str, tokenizer: Tokenizer, hotwords: list[
 
     # 编码热词为 token IDs
     encoded = [tokenizer.encode(hw) for hw in hotwords if hw]
+    encoded = [ids for ids in encoded if ids]
     if not encoded:
         return None
 
+    # 追加 [sos]=[1] 哨兵（SeACo NO_BIAS 占位，缺失会导致热词输出乱码）
+    encoded.append([1])
+
     max_len = max(len(ids) for ids in encoded)
-    padded = np.zeros((len(encoded), max_len), dtype=np.int32)
+    padded = np.zeros((len(encoded), max_len), dtype=np.int64)
     for i, ids in enumerate(encoded):
         padded[i, :len(ids)] = ids
 
@@ -240,7 +260,7 @@ def _encode_hotwords(bias_model_path: str, tokenizer: Tokenizer, hotwords: list[
     bias_input_names = [i.name for i in bias_session.get_inputs()]
     feed = {bias_input_names[0]: padded}
     if len(bias_input_names) >= 2:
-        lengths = np.array([(row != 0).sum() for row in padded], dtype=np.int32)
+        lengths = np.array([(row != 0).sum() for row in padded], dtype=np.int64)
         feed[bias_input_names[1]] = lengths
 
     try:

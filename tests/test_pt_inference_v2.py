@@ -28,10 +28,17 @@ from src.tokenizer import Tokenizer
 def main():
     parser = argparse.ArgumentParser(description="SeACo-Paraformer PT 推理验证（独立包）")
     parser.add_argument("--audio", required=True, help="WAV 16kHz 单声道音频")
-    parser.add_argument("--config-dir", default="./models/asr", help="配置文件目录")
+    parser.add_argument("--config-dir", default="./models/asr/pt", help="配置文件目录")
+    parser.add_argument("--model-id", default="./models/asr/pt",
+                        help="PT 模型本地目录或 ModelScope ID（默认本地 ./models/asr/pt，避免联网下载）")
     parser.add_argument("--hotwords", nargs="*", default=None, help="热词列表")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
                         help="auto: 有 GPU 用 GPU，否则用 CPU")
+    parser.add_argument("--max-frames", type=int, default=0,
+                        help="截取特征前 N 帧（0=不截取）。用于复现非完整长度输入下的 encoder 行为，"
+                             "与 test_trt_pipeline 的 --max-frames 对照。")
+    parser.add_argument("--dump-act", action="store_true",
+                        help="dump 每个 EncoderLayerSANM 输出的 abs max（残差累积峰值），用于确定 clamp 安全下限")
     args = parser.parse_args()
 
     # 自动选择设备
@@ -58,12 +65,15 @@ def main():
     if len(pcm.shape) > 1:
         pcm = pcm[:, 0]
     features = extract_features(pcm, sample_rate=sr, cmvn_mean=cmvn_mean, cmvn_istd=cmvn_istd)
+    if args.max_frames and features.shape[0] > args.max_frames:
+        features = features[:args.max_frames]
+        print(f"  截取前 {args.max_frames} 帧")
     audio_duration = len(pcm) / sr
     print(f"\n音频: {args.audio}, 时长: {audio_duration:.2f}s, 特征: {features.shape}")
 
     # 加载模型
     print("\n加载模型...")
-    model = load_model(device=args.device)
+    model = load_model(model_id=args.model_id, device=args.device)
     print(f"  encoder: {type(model.encoder).__module__}.{type(model.encoder).__name__}")
     print(f"  predictor: {type(model.predictor).__module__}.{type(model.predictor).__name__}")
     print(f"  decoder: {type(model.decoder).__module__}.{type(model.decoder).__name__}")
@@ -71,6 +81,33 @@ def main():
 
     speech = torch.from_numpy(features).unsqueeze(0).float().to(args.device)
     speech_lengths = torch.tensor([features.shape[0]], dtype=torch.long).to(args.device)
+
+    # --dump-act：hook 每个 EncoderLayerSANM 输出，统计残差累积峰值（确定 clamp 下限）
+    if args.dump_act:
+        from seaco_paraformer.encoder import EncoderLayerSANM
+        _act_stats = []
+
+        def _hook(module, inp, out):
+            # EncoderLayerSANM 返回 (x, mask)
+            x = out[0] if isinstance(out, tuple) else out
+            _act_stats.append(float(x.detach().abs().max().cpu()))
+
+        handles = []
+        idx = 0
+        for m in model.modules():
+            if isinstance(m, EncoderLayerSANM):
+                handles.append(m.register_forward_hook(_hook))
+                idx += 1
+        with torch.no_grad():
+            model.encode(speech, speech_lengths)
+        for h in handles:
+            h.remove()
+        print(f"\n[--dump-act] {idx} 个 EncoderLayerSANM 输出 abs max（残差累积峰值）:")
+        for i, v in enumerate(_act_stats):
+            print(f"  layer {i:2d}: {v:.2f}")
+        print(f"  >>> 全局峰值 = {max(_act_stats):.2f}")
+        print(f"  >>> 建议 clamp 下限 ≈ 峰值 × 1.5 = {max(_act_stats)*1.5:.0f}（既不裁剪正常值，又防异常溢出）")
+        return
 
     # 1. 不含热词推理
     print("\n[1] 不含热词推理...")
