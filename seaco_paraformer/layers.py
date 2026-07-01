@@ -32,8 +32,12 @@ class SinusoidalPositionEncoder(nn.Module):
         return encoding.type(dtype)
 
     def forward(self, x):
-        batch_size, timesteps, input_dim = x.size()
-        positions = torch.arange(1, timesteps + 1, device=x.device)[None, :]
+        # 用 cumsum(ones) 生成 position 序列 [1,2,...,T]，长度随 x 动态变化，
+        # 避免 torch.arange(1, timesteps+1) 的 timesteps 被 trace 固化成 dummy 常量
+        # （固化会导致非 dummy 长度输入时位置编码错位 → encoder_out 偏差 → 解码乱码）。
+        input_dim = x.size(2)
+        positions = torch.cumsum(torch.ones_like(x[:, :, 0]), dim=1)  # (B, T) = [1,2,...,T]
+        positions = positions[0:1, :]  # (1, T)，与原 arange[None,:] 等价
         position_encoding = self.encode(positions, input_dim, x.dtype).to(x.device)
         return x + position_encoding
 

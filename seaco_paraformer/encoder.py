@@ -6,7 +6,8 @@ SANMEncoder + EncoderLayerSANM（从 FunASR 训练源码抽取）
 - 输入 560 维 → 输出 512 维（encoders0 兼做投影）
 - 残差 Add 后可选 clamp（fp16 安全），通过 SANMEncoder(clamp_value=...) 控制
   - PT 推理：clamp_value=None（默认），保持原版数学等价
-  - fp16 ONNX 导出：建议 30000（远大于 PT 峰值 ~7554，远小于 fp16 上限 65504）
+  - fp16/int8 ONNX 导出：60000（后段层残差激活峰值高达 ~48万 >> fp16 上限 65504，
+    60000 贴近上限最大化保留信息；clamp=30000 裁剪过狠已弃用）
 - 最终 after_norm
 """
 
@@ -16,7 +17,7 @@ from typing import Optional, Tuple
 
 from .layers import LayerNorm, SinusoidalPositionEncoder, PositionwiseFeedForward
 from .attention import MultiHeadedAttentionSANM
-from .utils import repeat
+from .utils import repeat, sequence_mask
 
 
 class EncoderLayerSANM(nn.Module):
@@ -66,8 +67,8 @@ class SANMEncoder(nn.Module):
     Args:
         clamp_value: 残差 Add 后的 clamp 阈值。
             - None（默认）：不 clamp，PT 推理与原版数学等价
-            - 30000：fp16 ONNX 导出推荐值（防 fp16 残差 Add 溢出 inf，
-                     对 PT 真实激活峰值 ~7554 无影响）
+            - 60000：fp16/int8 ONNX 导出推荐值（后段层残差激活峰值高达 ~48万，
+                     远超 fp16 上限 65504；60000 贴近上限最大化保留信息，仅极少数峰值点被裁）
     """
 
     def __init__(
