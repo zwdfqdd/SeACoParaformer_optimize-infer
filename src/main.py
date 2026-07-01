@@ -433,19 +433,23 @@ async def asr_recognize(req: ASRRequest):
             t2 = time.time()
             chunks = segment_to_chunks(vad_segments, audio_duration_ms)
             t3 = time.time()
+            sub_ms = {"decode": t1 - t0, "vad": t2 - t1, "segment": t3 - t2}
             if settings.VERBOSE:
                 logger.debug(
-                    f"[Stage1] 解码={int((t1-t0)*1000)}ms, "
-                    f"VAD={int((t2-t1)*1000)}ms({len(vad_segments)}段), "
-                    f"切段={int((t3-t2)*1000)}ms({len(chunks)}chunks)"
+                    f"[Stage1] 解码={int(sub_ms['decode']*1000)}ms, "
+                    f"VAD={int(sub_ms['vad']*1000)}ms({len(vad_segments)}段), "
+                    f"切段={int(sub_ms['segment']*1000)}ms({len(chunks)}chunks)"
                 )
-            return pcm, sample_rate, audio_duration_ms, vad_segments, chunks
+            return pcm, sample_rate, audio_duration_ms, vad_segments, chunks, sub_ms
 
         _t_s1 = time.time()
-        pcm, sample_rate, audio_duration_ms, vad_segments, chunks = (
-            await loop.run_in_executor(_cpu_executor, _stage1_cpu)
-        )
+        (
+            pcm, sample_rate, audio_duration_ms, vad_segments, chunks, _s1_sub,
+        ) = await loop.run_in_executor(_cpu_executor, _stage1_cpu)
         asr_stage_duration.labels(stage="stage1_decode_vad_seg").observe(time.time() - _t_s1)
+        # Stage1 内部拆分打点（定位 decode/vad/segment 哪个是主导）
+        for _k, _v in _s1_sub.items():
+            asr_stage_duration.labels(stage=f"stage1_{_k}").observe(_v)
 
         # ====== Stage 2: 特征提取（CPU 线程池） ======
         # 热词路由（按生效词表大小三路分流）：
