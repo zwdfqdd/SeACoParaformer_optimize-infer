@@ -42,8 +42,14 @@ MAX_BATCH_SIZE = max(VALID_BATCH_SIZES)  # 满 batch 触发阈值（工业标准
 # TRT engine 会按 batch max(lengths) 二次裁剪，只算真实有效范围（无 GPU 浪费）
 # 消除桶分组 → group_key 与 bucket 无关，跨请求大合并 → avg_batch 显著提升
 
-# GPU 专用线程池（单线程串行推理）
-_gpu_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
+# GPU 专用线程池：与 TRT stream 池大小对齐，允许多个 batch 并发提交到不同 stream。
+# 每个线程从 _TRTInferencer 的 round-robin 池中获取独立 (context, stream)，真正并行执行。
+# 主推理和热词编码共用同一池，但热词编码是低频操作（词表 reload 或客户端热词提交），
+# 不会与主推理形成持续争用。
+_gpu_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=settings.GPU_STREAM_POOL_SIZE,
+    thread_name_prefix="gpu",
+)
 
 
 def encode_hotwords_on_gpu(hotword_token_ids: np.ndarray) -> np.ndarray | None:

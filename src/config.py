@@ -81,6 +81,15 @@ class Settings:
     # 多 worker（WORKERS>1）时务必显式设小，避免每 worker 各开满核导致线程超额订阅。
     CPU_THREAD_POOL_SIZE: int = int(os.getenv("CPU_THREAD_POOL_SIZE", "0"))
 
+    # GPU 多 stream 多 execution_context 池大小（单卡榨干利用率）。
+    # 每个 TRT engine 共享 weights，创建 N 个 execution_context + N 个 CUDA stream，
+    # scheduler 提交推理时 round-robin 分配 context/stream，不同 stream 上的 batch
+    # 可在 GPU SM 上真正并行执行（GPU 分时调度）。
+    # 压测发现 GPU sm-util 只有 13-15%，开 4 stream 预期提升到 40-60%，QPS 翻倍。
+    # 显存开销：每 stream × 每段 activation ≈ 200-300MB × 4段 × 4 stream ≈ 1.5-2GB。
+    # 建议值：3-6，超过后收益递减且显存吃紧。
+    GPU_STREAM_POOL_SIZE: int = int(os.getenv("GPU_STREAM_POOL_SIZE", "4"))
+
     # VAD ORT session 池大小（round-robin 分配，多请求真正并行）。
     # 单一全局 session 在并发场景下会被 ORT 内部串行化，需要多 session 才能真正并行。
     # 20 并发 × 30s 音频压测扫描结果（OMP_NUM_THREADS=1）：

@@ -71,7 +71,7 @@ class SileroVAD:
         try:
             self._sessions = [self._new_session(model_path) for _ in range(pool_size)]
             logger.info(
-                f"VAD 模型加载成功: {model_path}（session 池大小={pool_size}）"
+                f"VAD 模型加载成功: {model_path}（session 池大小={pool_size}, CPU）"
             )
         except Exception as e:
             raise ASRException(
@@ -90,6 +90,9 @@ class SileroVAD:
         # 单调用略慢 5-10%，但消除多线程调 session 的并发竞态。
         sess_options.enable_cpu_mem_arena = False
         sess_options.enable_mem_pattern = False
+        # Silero VAD 固定在 CPU：模型极小 (<10MB)，单次调用只处理 (1,576) tensor，
+        # 30s 音频 937 次 session.run。压测验证过：上 GPU 反而慢 4x（PCIe 往返开销
+        # 远大于 GPU kernel 计算），且 GPU sm-util 假高（大部分是 memory 等待）。
         return ort.InferenceSession(
             model_path,
             sess_options,

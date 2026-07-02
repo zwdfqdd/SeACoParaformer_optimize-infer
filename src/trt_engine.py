@@ -16,6 +16,7 @@ TensorRT 推理引擎（v2 阶段 1：4 段串联架构）
     encode_hotwords(hotword_token_ids) → bias_embed (1, num_hw, 512)
 """
 
+import itertools
 import os
 
 import numpy as np
@@ -41,19 +42,38 @@ if TRT_AVAILABLE:
 
 
 # ============================================================
-# 单个 TRT engine 推理器
+# 单个 TRT engine 推理器（多 stream 多 context）
 # ============================================================
 class _TRTInferencer:
-    """单个 TRT engine 推理器（dynamic shape 支持）。"""
+    """
+    单个 TRT engine 推理器（dynamic shape + 多 stream 并发）。
 
-    def __init__(self, engine_path: str):
+    - 一份 engine（weights 共享，加载一次）
+    - N 个 execution_context（各自独立 activation memory）
+    - N 个 CUDA stream（真正并行）
+    - round-robin 分配：不同调用落到不同 (context, stream)，可在 GPU SM 上并行
+
+    TRT 10.x 要求：
+    - 同一 context 不能被两个线程同时 execute（我们按 counter 分配，天然独占）
+    - 不同 context 可以并发（这就是我们利用的能力）
+    """
+
+    def __init__(self, engine_path: str, pool_size: int = 1):
         self.engine_path = engine_path
+        self.pool_size = max(1, pool_size)
         runtime = trt.Runtime(TRT_LOGGER)
         with open(engine_path, "rb") as f:
             self.engine = runtime.deserialize_cuda_engine(f.read())
         if self.engine is None:
             raise RuntimeError(f"Engine 反序列化失败: {engine_path}")
-        self.context = self.engine.create_execution_context()
+
+        # 池：N 个 execution_context + N 个 stream
+        self.contexts = [
+            self.engine.create_execution_context() for _ in range(self.pool_size)
+        ]
+        self.streams = [torch.cuda.Stream() for _ in range(self.pool_size)]
+        # 无锁 round-robin 计数器
+        self._counter = itertools.count()
 
         self.input_names: list[str] = []
         self.output_names: list[str] = []
@@ -65,39 +85,54 @@ class _TRTInferencer:
             else:
                 self.output_names.append(name)
 
+    # 兼容旧代码里可能访问 self.context（如预热或调试）：返回第一个 context
+    @property
+    def context(self):
+        return self.contexts[0]
+
+    def _acquire_slot(self) -> tuple[int, "trt.IExecutionContext", "torch.cuda.Stream"]:
+        """无锁 round-robin 取一个 (context, stream) 槽位。"""
+        idx = next(self._counter) % self.pool_size
+        return idx, self.contexts[idx], self.streams[idx]
+
     def infer(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """同步推理（输入 numpy → 输出 numpy）。"""
-        # 输入
-        d_inputs = {}
-        for name in self.input_names:
-            data = inputs[name]
-            self.context.set_input_shape(name, data.shape)
-            t = torch.from_numpy(data).cuda().contiguous()
-            d_inputs[name] = t
-            self.context.set_tensor_address(name, t.data_ptr())
+        """同步推理（输入 numpy → 输出 numpy），使用池中一个 context/stream。"""
+        _idx, ctx, stream = self._acquire_slot()
 
-        # 输出（按 context 推断的真实 shape 分配）
-        d_outputs = {}
-        for name in self.output_names:
-            shape = list(self.context.get_tensor_shape(name))
-            for i, s in enumerate(shape):
-                if s <= 0:
-                    # dynamic 维度：用第一个输入的 batch 维兜底
-                    if i == 0:
-                        shape[i] = list(inputs.values())[0].shape[0]
-                    else:
-                        shape[i] = 300
-            t = torch.zeros(shape, dtype=torch.float32, device="cuda")
-            d_outputs[name] = t
-            self.context.set_tensor_address(name, t.data_ptr())
+        # 让本次调用的 H2D/kernel/D2H 全部走这个 stream
+        with torch.cuda.stream(stream):
+            # 输入
+            d_inputs = {}
+            for name in self.input_names:
+                data = inputs[name]
+                ctx.set_input_shape(name, data.shape)
+                t = torch.from_numpy(data).cuda(non_blocking=True).contiguous()
+                d_inputs[name] = t
+                ctx.set_tensor_address(name, t.data_ptr())
 
-        stream = torch.cuda.current_stream()
-        self.context.execute_async_v3(stream_handle=stream.cuda_stream)
+            # 输出（按 context 推断的真实 shape 分配）
+            d_outputs = {}
+            for name in self.output_names:
+                shape = list(ctx.get_tensor_shape(name))
+                for i, s in enumerate(shape):
+                    if s <= 0:
+                        # dynamic 维度：用第一个输入的 batch 维兜底
+                        if i == 0:
+                            shape[i] = list(inputs.values())[0].shape[0]
+                        else:
+                            shape[i] = 300
+                t = torch.zeros(shape, dtype=torch.float32, device="cuda")
+                d_outputs[name] = t
+                ctx.set_tensor_address(name, t.data_ptr())
+
+            ctx.execute_async_v3(stream_handle=stream.cuda_stream)
+
+        # 只等这个 stream 完成，不影响其他 stream
         stream.synchronize()
 
         results = {}
         for name, t in d_outputs.items():
-            actual_shape = tuple(self.context.get_tensor_shape(name))
+            actual_shape = tuple(ctx.get_tensor_shape(name))
             if all(s > 0 for s in actual_shape):
                 slices = tuple(slice(0, s) for s in actual_shape)
                 results[name] = t[slices].cpu().numpy()
@@ -147,19 +182,22 @@ class TRTEngine:
             if not os.path.exists(path):
                 raise FileNotFoundError(f"{label} engine 不存在: {path}")
 
-        logger.info(f"TRT engines 加载中:")
+        pool_size = max(1, settings.GPU_STREAM_POOL_SIZE)
+        logger.info(f"TRT engines 加载中（stream 池大小={pool_size}）:")
+
         logger.info(f"  encoder: {encoder_path}")
-        self._encoder = _TRTInferencer(encoder_path)
+        self._encoder = _TRTInferencer(encoder_path, pool_size=pool_size)
 
         logger.info(f"  cif:     {cif_path}")
-        self._cif = _TRTInferencer(cif_path)
+        self._cif = _TRTInferencer(cif_path, pool_size=pool_size)
 
         logger.info(f"  decoder: {decoder_path}")
-        self._decoder = _TRTInferencer(decoder_path)
+        self._decoder = _TRTInferencer(decoder_path, pool_size=pool_size)
 
         if bias_encoder_path and os.path.exists(bias_encoder_path):
             logger.info(f"  bias_encoder: {bias_encoder_path}")
-            self._bias_encoder = _TRTInferencer(bias_encoder_path)
+            # bias_encoder 调用频率低（热词编码），单 context 即可
+            self._bias_encoder = _TRTInferencer(bias_encoder_path, pool_size=1)
         else:
             logger.info("  bias_encoder: 未加载（热词功能不可用）")
 
