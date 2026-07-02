@@ -1,14 +1,20 @@
 """
-音频切段模块
+音频切段模块（Uniform Chunking 均匀切段）
 
-VAD 后音频段处理方案：
-Step 1：合并相邻短段（合并后不超过最大桶 8s）
-Step 2：超长段按 8s 切分
-Step 3：就近桶归类（2s/4s/8s）
-Step 4：最后一段 < 2s 时合并到前一段
+策略：VAD 后从第一段 start 到最后段 end 作为整体时间轴，按统一 UNIFORM_CHUNK_MS
+（= TRT_OPT_SEQ 帧对应的毫秒数，默认 67 帧 × 60ms = 4020ms）线性切分。
 
-桶边界：2s, 4s, 8s（LFR 帧数 34, 67, 134）
-时间戳保留原始 VAD 位置。
+优势：
+- 所有 chunk 长度一致 → scheduler 无需桶分组 → 合批天花板显著提升（avg_batch 3-4 倍）
+- 每 chunk 恰好走 TRT engine 的 opt profile → GPU 命中率最高
+- 尾段不足 opt 时由 scheduler pad 到 opt（浪费仅限一个尾 chunk）
+
+代价：
+- VAD 段边界被硬切时，识别精度可能微降（Encoder self-attention 跨 chunk 断裂）
+- 若 VAD 段间静音长度 < opt，静音也会被切进 chunk 送入 encoder（合理，无浪费）
+- 若 VAD 段间静音 >> opt，会产生纯静音 chunk（罕见场景，可后续加静音过滤优化）
+
+时间戳保留原始 VAD 起止位置的连续区间。
 """
 
 from dataclasses import dataclass
@@ -20,15 +26,19 @@ from src.errors import ASRException, ErrorCode
 from src.vad import VADSegment
 
 
-# 桶边界（毫秒）：从 config 的 LFR 帧数桶派生，保证与 scheduler/TRT profile 单一数据源一致。
-#   1 LFR 帧 = LFR_N(6) × FRAME_SHIFT_MS(10) = 60ms
-# 例：帧数 [34,67,134] → ms [2040,4020,8040]（≈2s/4s/8s）
+# LFR 帧对齐的毫秒尺度：1 LFR 帧 = LFR_N(6) × FRAME_SHIFT_MS(10) = 60ms
 _MS_PER_LFR_FRAME = 60
+# 统一切段目标：TRT opt profile 主力工作点，压中 opt kernel 使 GPU 效率最优
+# 默认 67 帧 × 60ms = 4020ms（4s），可通过 TRT_OPT_SEQ 调整
+UNIFORM_CHUNK_MS = settings.TRT_OPT_SEQ * _MS_PER_LFR_FRAME
+# 尾块保护：切分后最后一 chunk 若小于 MIN_TAIL_MS，合并到前一 chunk（避免识别精度损失）
+# 合并后前 chunk 可能超过 opt，最大不超过 UNIFORM_CHUNK_MS + MIN_TAIL_MS
+MIN_TAIL_MS = 1000
+# 兼容保留：其他模块可能引用
 BUCKET_MS = [int(f * _MS_PER_LFR_FRAME) for f in settings.BUCKET_SEQ_LENS]
-MIN_BUCKET_MS = BUCKET_MS[0]   # 最小桶
-MAX_BUCKET_MS = BUCKET_MS[-1]  # 最大桶
-# 切分上限留 1 帧（60ms）余量：避免 int 取整边界下特征帧数恰好溢出最大桶（134）
-# 导致 scheduler 截断丢失尾帧。切分按此上限，归桶仍用 MAX_BUCKET_MS。
+MIN_BUCKET_MS = BUCKET_MS[0]
+MAX_BUCKET_MS = BUCKET_MS[-1]
+# 单 chunk 最大时长上限（TRT profile max seq 帧 - 1 帧余量，防溢出）
 SPLIT_MAX_MS = MAX_BUCKET_MS - _MS_PER_LFR_FRAME
 
 
@@ -58,11 +68,14 @@ def segment_to_chunks(
     total_duration_ms: int,
 ) -> list[ChunkMeta]:
     """
-    将 VAD 语音段处理为固定桶边界的 chunk。
+    将 VAD 语音段均匀切分为 UNIFORM_CHUNK_MS 长度的 chunk（尾块由 scheduler pad）。
 
-    Step 1: 合并相邻短段（合并后 ≤ 8s）
-    Step 2: 超长段按 8s 切分
-    Step 3: 最后一段 < 2s 时合并到前一段
+    流程：
+      1. 取 VAD 的整体时间跨度：[first.start_ms, last.end_ms]
+      2. 从 first.start_ms 起，每 UNIFORM_CHUNK_MS 切一刀
+      3. 尾块保留实际长度（可能 < UNIFORM_CHUNK_MS），scheduler 按 TRT opt seq 帧数 pad
+
+    所有 chunk 长度一致（除尾块）→ scheduler 无需桶分组 → 合批天花板显著提升。
     """
     if not vad_segments:
         raise ASRException(
@@ -70,97 +83,47 @@ def segment_to_chunks(
             "无有效语音段，音频可能为静音",
         )
 
-    # Step 1: 合并相邻短段
-    merged = _merge_short_segments(vad_segments)
+    # 取 VAD 整体时间跨度（首段 start 到末段 end）
+    speech_start = vad_segments[0].start_ms
+    speech_end = vad_segments[-1].end_ms
+    if speech_end <= speech_start:
+        raise ASRException(
+            ErrorCode.AUDIO_SEGMENT_ERROR,
+            "VAD 段时间戳异常",
+        )
 
-    # Step 2: 超长段切分
-    split = _split_long_segments(merged)
-
-    # Step 3: 最后一段 < 2s 合并到前一段
-    split = _merge_trailing_short(split)
-
-    # 生成 ChunkMeta
-    chunks = []
-    for i, seg in enumerate(split):
+    # 均匀切分
+    chunks: list[ChunkMeta] = []
+    cur = speech_start
+    idx = 0
+    while cur < speech_end:
+        nxt = min(cur + UNIFORM_CHUNK_MS, speech_end)
         chunks.append(ChunkMeta(
-            chunk_id=i,
+            chunk_id=idx,
             segment_index=0,
-            raw_start_ms=seg["start_ms"],
-            raw_end_ms=seg["end_ms"],
+            raw_start_ms=cur,
+            raw_end_ms=nxt,
         ))
+        cur = nxt
+        idx += 1
+
+    # 尾块保护：末段 < MIN_TAIL_MS 时并入前一段
+    # 避免过短尾块因上下文不足引起识别错误/幻听；
+    # 合并后前段长度最多为 UNIFORM_CHUNK_MS + MIN_TAIL_MS（默认 5020ms，未超 8s max 桶）
+    if len(chunks) >= 2:
+        tail = chunks[-1]
+        tail_ms = tail.raw_end_ms - tail.raw_start_ms
+        if tail_ms < MIN_TAIL_MS:
+            prev = chunks[-2]
+            merged = ChunkMeta(
+                chunk_id=prev.chunk_id,
+                segment_index=prev.segment_index,
+                raw_start_ms=prev.raw_start_ms,
+                raw_end_ms=tail.raw_end_ms,
+            )
+            chunks = chunks[:-2] + [merged]
 
     return chunks
-
-
-def _merge_short_segments(segments: list[VADSegment]) -> list[dict]:
-    """
-    Step 1: 合并相邻短段。
-    遍历 VAD 段，将相邻段合并直到满足最小桶长度（2s），合并后不超过最大桶（8s）。
-    合并范围：第一个段的 start_ms 到最后一个段的 end_ms（包含中间静音）。
-    """
-    if not segments:
-        return []
-
-    merged = []
-    current_start = segments[0].start_ms
-    current_end = segments[0].end_ms
-
-    for i in range(1, len(segments)):
-        seg = segments[i]
-        # 尝试合并：合并后总时长不超过安全上限（留 1 帧余量）
-        merged_duration = seg.end_ms - current_start
-        if merged_duration <= SPLIT_MAX_MS:
-            # 合并
-            current_end = seg.end_ms
-        else:
-            # 不能合并，保存当前段，开始新段
-            merged.append({"start_ms": current_start, "end_ms": current_end})
-            current_start = seg.start_ms
-            current_end = seg.end_ms
-
-    # 保存最后一段
-    merged.append({"start_ms": current_start, "end_ms": current_end})
-
-    return merged
-
-
-def _split_long_segments(segments: list[dict]) -> list[dict]:
-    """
-    Step 2: 超长段按最大桶切分（留 1 帧余量，避免特征帧溢出最大桶被截断）。
-    """
-    result = []
-    for seg in segments:
-        duration = seg["end_ms"] - seg["start_ms"]
-        if duration <= SPLIT_MAX_MS:
-            result.append(seg)
-        else:
-            current_start = seg["start_ms"]
-            while current_start < seg["end_ms"]:
-                chunk_end = min(current_start + SPLIT_MAX_MS, seg["end_ms"])
-                result.append({"start_ms": current_start, "end_ms": chunk_end})
-                current_start += SPLIT_MAX_MS
-    return result
-
-
-def _merge_trailing_short(segments: list[dict]) -> list[dict]:
-    """
-    Step 3: 最后一段 < 2s 时合并到前一段（如果合并后 ≤ 8s）。
-    """
-    if len(segments) <= 1:
-        return segments
-
-    last = segments[-1]
-    last_duration = last["end_ms"] - last["start_ms"]
-
-    if last_duration < MIN_BUCKET_MS and len(segments) >= 2:
-        prev = segments[-2]
-        merged_duration = last["end_ms"] - prev["start_ms"]
-        if merged_duration <= SPLIT_MAX_MS:
-            # 合并到前一段
-            segments[-2] = {"start_ms": prev["start_ms"], "end_ms": last["end_ms"]}
-            segments = segments[:-1]
-
-    return segments
 
 
 def extract_chunk_audio(

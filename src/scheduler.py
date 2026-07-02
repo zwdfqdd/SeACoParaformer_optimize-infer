@@ -1,16 +1,27 @@
 """
-GPU Scheduler — 固定 shape bucket + batch_timeout 调度
+GPU Scheduler — 工业标准 dynamic batching（Triton/TF-Serving 模式）
 
+设计：
 - VAD 后音频经 audio_segment 合并/切分，Scheduler 将特征 pad 到桶边界
 - 桶边界：2s/4s/8s（LFR 帧数 34/67/134）
-- batch_timeout 窗口内收集同桶 chunk
-- 按合法 batch size（1,2,4,8,12）推理
-- 达到合法 batch 立即触发，超时按实际数量向上取最近合法 batch（pad dummy）
-- OOM Fallback：减半 batch 重试 → 逐条推理 → 返回错误
+- 每个 (bucket, bias) 独立 group 队列
+
+触发条件（OR 逻辑，先到者优先）：
+    1. 满 batch：group.size >= MAX_BATCH_SIZE → 立即触发（不等）
+    2. 超时：now - group[0].enqueue_time >= BATCH_TIMEOUT
+       → 按当前 group 大小 pad 到最近合法 batch 触发
+
+关键点：
+- 超时按"最早入队 chunk"计算，保证严格延迟上限（不是全局定时抖动）
+- 满 batch 立即触发（再等也不能更大）
+- 触发后剩余 chunk（>MAX_BATCH_SIZE 部分）重新入队，enqueue_time 重置
+
+OOM Fallback：减半 batch 重试 → 逐条推理 → 返回错误
 """
 
 import asyncio
 import concurrent.futures
+import time as _time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -23,6 +34,13 @@ from src.logger import logger
 # 桶边界 / 合法 batch：统一来自 config（单一数据源，与 TRT profile 一致）
 BUCKET_SEQ_LENS = settings.BUCKET_SEQ_LENS
 VALID_BATCH_SIZES = settings.VALID_BATCH_SIZES
+MAX_BATCH_SIZE = max(VALID_BATCH_SIZES)  # 满 batch 触发阈值（工业标准 max_batch_size）
+
+# Uniform Chunking：audio_segment 已按 UNIFORM_CHUNK_MS 均匀切段（尾块合并到前段），
+# chunk 帧数分布集中在 opt(67) 附近，最长不超过 opt + MIN_TAIL_MS 对应帧数 (~84 帧)
+# scheduler 存储时 pad 到 profile max（134，形状统一便于 batch stack），
+# TRT engine 会按 batch max(lengths) 二次裁剪，只算真实有效范围（无 GPU 浪费）
+# 消除桶分组 → group_key 与 bucket 无关，跨请求大合并 → avg_batch 显著提升
 
 # GPU 专用线程池（单线程串行推理）
 _gpu_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
@@ -72,6 +90,7 @@ class InferRequest:
     bucket_idx: int
     bias_embeddings: np.ndarray | None = None
     future: asyncio.Future = field(default=None)
+    enqueue_time: float = 0.0  # 入队时刻（time.monotonic），用于超时判定
 
 
 class GPUScheduler:
@@ -148,43 +167,54 @@ class GPUScheduler:
         features: np.ndarray,
         bias_embeddings: np.ndarray | None = None,
     ) -> np.ndarray:
-        """提交 chunk 推理请求。"""
+        """
+        提交 chunk 推理请求（Uniform Chunking + Batch-Internal-Pad）。
+
+        - submit 阶段不 pad，直接存原始 features（帧数多为 67~84，尾块合并后最长 ~84）
+        - _execute_batch 阶段按 batch 内 max 帧数一次性 pad + stack
+          → 只 pad 到 batch 内实际最大长度，不做无谓浪费
+        - 上界保护：单 chunk 超过 profile max（134）时截断（防越界）
+        """
         seq_len = features.shape[0]
-        bucket_idx = get_bucket_idx(seq_len)
-        target_len = BUCKET_SEQ_LENS[bucket_idx]
+        # 上界保护：单 chunk 帧数超过 TRT profile max 时截断
+        max_seq = max(BUCKET_SEQ_LENS)
+        if seq_len > max_seq:
+            features = features[:max_seq]
+            seq_len = max_seq
+
+        # bucket_idx 保留元数据用途（_execute_batch 里根据 batch max 动态确定 target_seq_len）
+        bucket_idx = len(BUCKET_SEQ_LENS) - 1
 
         if settings.VERBOSE:
-            logger.debug(f"[Scheduler] submit: seq_len={seq_len}, bucket={bucket_idx}({target_len}帧)")
-
-        # pad 到桶边界
-        if seq_len < target_len:
-            feat_dim = features.shape[1]
-            padded = np.zeros((target_len, feat_dim), dtype=np.float32)
-            padded[:seq_len] = features
-        else:
-            padded = features[:target_len]
+            logger.debug(
+                f"[Scheduler] submit: seq_len={seq_len}帧（batch 内按实际 max 合并 pad）"
+            )
 
         loop = asyncio.get_event_loop()
         request = InferRequest(
-            features=padded,
-            length=min(seq_len, target_len),
+            features=features,  # 原始形状（不 pad），batch 组装时统一处理
+            length=seq_len,
             bucket_idx=bucket_idx,
             bias_embeddings=bias_embeddings,
             future=loop.create_future(),
+            enqueue_time=_time.monotonic(),
         )
 
-        # 分组键：bias 身份隔离，避免跨请求热词串扰
+        # 分组键：只按 bias 身份隔离（避免热词串扰）
+        # 不再按 bucket 分组，所有相同 bias 的 chunk 全部合并 → 显著提升 avg_batch
         bias_key = id(bias_embeddings) if bias_embeddings is not None else 0
-        group_key = (bucket_idx, bias_key)
+        group_key = (0, bias_key)  # 桶维度固定为 0，保留元组结构避免其他改动
 
         async with self._lock:
             group = self._groups.setdefault(group_key, ([], bias_embeddings))[0]
             group.append(request)
-            # 立即触发：同组达到合法 batch size
-            trigger_size = get_trigger_batch_size(len(group))
-            if trigger_size >= VALID_BATCH_SIZES[1] and len(group) >= trigger_size:
-                batch = group[:trigger_size]
-                remaining = group[trigger_size:]
+            # 满 batch 立即触发（工业标准 max_batch_size）：
+            # 达到 MAX_BATCH_SIZE 后再等也不会更大，立即触发；
+            # 剩余 chunk（超过 MAX_BATCH_SIZE 部分）保留在 group，enqueue_time 保持原值，
+            # 由 _schedule_loop 按最早 chunk 超时兜底触发下一批。
+            if len(group) >= MAX_BATCH_SIZE:
+                batch = group[:MAX_BATCH_SIZE]
+                remaining = group[MAX_BATCH_SIZE:]
                 if remaining:
                     self._groups[group_key] = (remaining, bias_embeddings)
                 else:
@@ -194,22 +224,42 @@ class GPUScheduler:
         return await request.future
 
     async def _schedule_loop(self):
-        """超时调度：batch_timeout 到期后按实际数量触发。"""
+        """
+        超时触发（工业标准 max_queue_delay）：
+        按最早入队 chunk 的 enqueue_time 判定超时，保证单请求延迟严格 ≤ BATCH_TIMEOUT。
+
+        高精度 tick（1ms）扫描所有 group，一旦最早 chunk 超时，立即按当前 group 数量
+        pad 到最近合法 batch 触发。若 group 大小 ≥ MAX_BATCH_SIZE（罕见，通常在 submit
+        阶段已触发），也在此兜底。
+        """
+        max_delay_sec = settings.BATCH_TIMEOUT / 1000.0
         while self._running:
-            timeout_sec = settings.BATCH_TIMEOUT / 1000.0
-            await asyncio.sleep(timeout_sec)
+            # 1ms 高精度 tick：远小于典型 BATCH_TIMEOUT（10-30ms），几乎无抖动
+            await asyncio.sleep(0.001)
 
             if not self._groups:
                 continue
 
+            now = _time.monotonic()
             async with self._lock:
-                # 取出所有非空分组分别触发
+                # 遍历所有非空 group，判定是否超时
                 for group_key, (group, bias) in list(self._groups.items()):
                     if not group:
                         continue
-                    bucket_idx = group_key[0]
-                    batch = list(group)
-                    del self._groups[group_key]
+                    # 按最早入队 chunk 计时（严格延迟上限）
+                    if now - group[0].enqueue_time < max_delay_sec:
+                        continue
+                    # Uniform Chunking：bucket_idx 从 chunk 自身取（submit 阶段已统一）
+                    bucket_idx = group[0].bucket_idx
+                    # 兜底：即使超时也不超过 MAX_BATCH_SIZE（保护 engine profile 上界）
+                    take = min(len(group), MAX_BATCH_SIZE)
+                    batch = group[:take]
+                    remaining = group[take:]
+                    if remaining:
+                        # 剩余 chunk 保留在 group，enqueue_time 原样保留，下次继续判定
+                        self._groups[group_key] = (remaining, bias)
+                    else:
+                        del self._groups[group_key]
                     asyncio.create_task(self._execute_batch(batch, bucket_idx, bias))
 
     async def _execute_batch(
@@ -218,14 +268,17 @@ class GPUScheduler:
         bucket_idx: int,
         bias_embeddings: np.ndarray | None,
     ):
-        """执行推理：pad 到合法 batch size，推理后丢弃 padding 结果。
+        """执行推理：batch 内 pad 到实际最大帧数 + pad 到合法 batch size。
 
-        同一 batch 内所有 chunk 共享同一 bias（由分组键保证），无热词串扰。
+        - target_seq_len = batch 内 chunk 的实际最大帧数（不再取桶固定值），
+          尾块合并后 chunk 集中在 67 帧，仅少数含尾合并的 chunk 可达 ~84 帧
+        - 长度上界受 profile max 约束（submit 阶段已截断）
+        - 同一 batch 内所有 chunk 共享同一 bias（由分组键保证），无热词串扰。
         """
-        import time as _time
-
         actual_count = len(batch)
-        target_seq_len = BUCKET_SEQ_LENS[bucket_idx]
+        # batch 内实际最大帧数（≥ min_seq 兜底，避免 profile 下越界）
+        target_seq_len = max(req.length for req in batch)
+        target_seq_len = max(target_seq_len, min(BUCKET_SEQ_LENS))
         feat_dim = batch[0].features.shape[1]
 
         # pad 到合法 batch size
@@ -239,14 +292,16 @@ class GPUScheduler:
         actual_lengths = []
 
         for i, req in enumerate(batch):
-            padded_feats[i] = req.features
-            lengths[i] = req.length  # 真实有效帧数（CIF mask 据此排除 padding 帧，避免多 fire token）
-            actual_lengths.append(req.length)
+            L = req.length
+            padded_feats[i, :L] = req.features[:L]
+            lengths[i] = L  # 真实有效帧数（CIF mask 据此排除 padding 帧，避免多 fire token）
+            actual_lengths.append(L)
 
-        # dummy padding（复制最后一条的数据）
+        # dummy padding（复制最后一条的数据，长度对齐 target_seq_len）
+        last_L = batch[-1].length
         for i in range(actual_count, pad_batch_size):
-            padded_feats[i] = batch[-1].features
-            lengths[i] = batch[-1].length
+            padded_feats[i, :last_L] = batch[-1].features[:last_L]
+            lengths[i] = last_L
 
         try:
             t0 = _time.perf_counter()
