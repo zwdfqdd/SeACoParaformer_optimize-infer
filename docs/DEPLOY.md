@@ -390,10 +390,15 @@ docker-compose logs -f seaco-asr
 | Uniform Chunking | audio_segment 均匀 4020ms 切段 + 尾块<1s 并入前段 | 4.21 | 崩溃 | **8.14** | 合批目标达成，但 CPU 侧被打满 |
 | VAD Session 池 | pool=8 round-robin + arena off | 10.13 | 崩溃 150/400 | 8+ | 多 session 并发，但 OMP 线程爆炸 |
 | **OMP_NUM_THREADS=1** | 固化 OMP/MKL/BLAS 单线程 | 12.32 | 12.32 | 8+ | 消除 libgomp 崩溃 |
-| **Pool Size 扫描收敛** | pool=2 最快, pool=4 平衡 | ~13 | **12.88（pool=2）/ 12.67（pool=4）** | 8+ | 最终最优 |
+| **Pool Size 扫描收敛** | pool=2 最快, pool=4 平衡 | ~13 | **12.88（pool=2）/ 12.67（pool=4）** | 8+ | 单进程最优 |
+| **多 stream 多 context** | GPU_STREAM_POOL_SIZE=4，engine 共享 weights + 4 context/stream | ~13 | 13.15 | 9.09 | Stage3 GPU -47%，P99 -22% |
+| **★多进程 WORKERS=11** | 大 GPU 上多进程隔离 CPU 竞争（模式 B） | — | — | 9+ | **conc=120 QPS 93.92** ★峰值 |
 
-**累计 QPS 提升**：4.79 → 12.67（**+164%**）  
-**P99 延迟**：3454ms → 1941ms（**-44%**）
+**累计 QPS 提升**：
+- 单进程模式：4.79 → 13.15（**+174%**，conc=20）
+- 多进程模式：4.79 → **93.92**（**+1861%**，conc=120，大 GPU）
+
+**P99 延迟**：3454ms → 1640ms（单进程，**-53%**）
 
 ### VAD Session Pool 扫描结果（20 并发 × 30s 音频 × 400 请求）
 
@@ -427,6 +432,17 @@ docker-compose logs -f seaco-asr
 - 关闭 OMP 内部并行反而降低系统开销
 
 ### 关键参数说明
+
+#### `WORKERS`（部署形态的核心决策）
+- 作用：uvicorn worker 进程数，每 worker 独立加载模型 + 独立 CUDA context
+- 建议值：
+  - **小 GPU（<12GB）或低并发（<20）**：**1**（模式 A）
+  - **大 GPU（≥24GB）+ 高并发（>50）**：**11**（模式 B，实测最优）
+- 显存约束：`WORKERS × 1.5GB` ≤ GPU 显存
+- 调参路径：
+  - 从 WORKERS=1 起步验证单进程性能
+  - 显存和并发都充足时逐步扫描 4/6/8/11 找 QPS 拐点
+- **反直觉**：大 GPU 上 WORKERS>1 反而更快（进程隔离消除 CPU 竞争）
 
 #### `OMP_NUM_THREADS`（强烈建议保持 1）
 - 作用：控制 libgomp 每进程 OpenMP 线程数
@@ -463,22 +479,69 @@ docker-compose logs -f seaco-asr
 
 ### 生产环境推荐配置
 
-**GPU 场景（2080 Ti / A10 / T4 类）**：
+按流量规模分为两种部署模式，**多进程模式在大 GPU + 高并发下 QPS 提升 7 倍**。
+
+#### 模式 A：单进程（低-中并发 <20，2080 Ti 类小 GPU）
+
 ```bash
-MODEL_PRECISION=trt_int8_enc  # 或 trt_fp16
-WORKERS=1                     # GPU 服务必须 1（多 worker 抢 GPU 反而慢）
-BATCH_TIMEOUT=30              # 合批+延迟平衡
-VAD_SESSION_POOL_SIZE=4       # 20 并发以内够用
-OMP_NUM_THREADS=1             # ★必须
+MODEL_PRECISION=trt_int8_enc     # 或 trt_fp16
+WORKERS=1                        # 单进程独占 GPU
+BATCH_TIMEOUT=30
+VAD_SESSION_POOL_SIZE=4
+GPU_STREAM_POOL_SIZE=4
+OMP_NUM_THREADS=1
 MKL_NUM_THREADS=1
 OPENBLAS_NUM_THREADS=1
 ```
 
-**预期性能（2080 Ti + trt_fp16）**：
-- 单 GPU QPS：12+（30s 音频）/ 25+（10s 音频）
-- 单请求平均延迟：<2s（30s 音频，conc=20）
-- P99 延迟：<2.5s
-- 显存占用：~1.5GB（余量充足）
+实测性能（2080 Ti + trt_fp16，30s 音频）：
+- QPS：13.15（conc=20）
+- 平均延迟：1500ms
+- P99：1640ms
+- 显存：~1.5GB
+- 适用：小规模服务、开发调试、显存受限
+
+#### 模式 B：★多进程高并发（>50 并发，大 GPU / A10 24GB+）
+
+```bash
+MODEL_PRECISION=trt_fp16
+WORKERS=11                       # ★关键：多进程隔离 CPU 竞争
+BATCH_TIMEOUT=30
+VAD_SESSION_POOL_SIZE=4
+GPU_STREAM_POOL_SIZE=4
+OMP_NUM_THREADS=1
+MKL_NUM_THREADS=1
+OPENBLAS_NUM_THREADS=1
+```
+
+实测性能（大 GPU + trt_fp16，30s 音频 concurrency=120，total=2500）：
+- **QPS：93.92**（较模式 A 提升 614%）
+- **吞吐量：2823 audio_s/s**（每秒处理 47 分钟音频）
+- 平均延迟：1226ms
+- P99：2785ms
+- 成功率：100%
+- 显存：~15-20GB
+- 适用：大流量生产环境
+
+**为什么 WORKERS=11 反直觉地更快**：
+- 之前 plan.md 记录"GPU 服务必须 WORKERS=1"是基于 2080 Ti 小 GPU 场景
+- 大 GPU 显存充足时，多进程隔离 CPU 竞争的收益 > CUDA context 切换开销
+- 每 worker 分摊约 10-11 并发，正好命中单进程最优点（模式 A）
+- 11 进程并行 → 总 QPS ≈ 单进程 QPS × 7-8 倍
+
+**WORKERS 调参经验**：
+- 显存充足：WORKERS = 目标并发数 / 10 附近
+- 显存紧张：以显存除以单 engine 大小算上限（如 24GB / 1.5GB ≈ 16）
+- 未验证过 WORKERS>11，可根据实际显存扫描 4/6/8/11/16 找拐点
+
+#### 重要发现：VAD 保持 CPU 是最优（不要上 GPU）
+
+`VAD_PROVIDER=cuda` 曾被尝试作为优化选项，实测**反而慢 4x**（WORKERS=1 场景）
+或**无收益**（WORKERS=11 场景，2823 vs 2700 audio_s/s）。
+
+根因：Silero VAD 单次调用只处理 (1,576) 小 tensor，30s 音频 937 次 session.run。
+PCIe H2D+D2H 传输开销（~60μs/次）远大于 GPU kernel 计算（~5μs/次），
+GPU sm-util 假高（大部分是 memory 等待）。因此代码固定使用 CPUExecutionProvider。
 
 ### 崩溃故障排查
 
