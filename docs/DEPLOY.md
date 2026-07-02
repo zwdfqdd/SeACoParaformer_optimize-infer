@@ -374,3 +374,127 @@ docker-compose logs -f seaco-asr
 [Stage2] 特征提取=45ms, chunks=8, shapes=[(34,560),(67,560),...]
 [Stage3] bucket=67, batch=4, 推理=85ms
 ```
+
+---
+
+## 高并发性能调优（2026-07 阶段沉淀）
+
+本节记录从初始基线到当前最优配置的完整性能演进路径与关键参数含义，供后续运维/迭代参考。
+
+### 性能演进路径
+
+| 阶段 | 关键改动 | QPS(conc10,30s) | QPS(conc20,30s) | avg_batch | 说明 |
+|---|---|---|---|---|---|
+| 基线 | 桶分组 + EAGER=4 触发 | 4.79 | 4.21 | 2.04 | 起点 |
+| Scheduler 工业标准 | max_batch_size + max_queue_delay | 4.21 | — | 2.10 | 桶分组阻碍合批，触发方式改无效 |
+| Uniform Chunking | audio_segment 均匀 4020ms 切段 + 尾块<1s 并入前段 | 4.21 | 崩溃 | **8.14** | 合批目标达成，但 CPU 侧被打满 |
+| VAD Session 池 | pool=8 round-robin + arena off | 10.13 | 崩溃 150/400 | 8+ | 多 session 并发，但 OMP 线程爆炸 |
+| **OMP_NUM_THREADS=1** | 固化 OMP/MKL/BLAS 单线程 | 12.32 | 12.32 | 8+ | 消除 libgomp 崩溃 |
+| **Pool Size 扫描收敛** | pool=2 最快, pool=4 平衡 | ~13 | **12.88（pool=2）/ 12.67（pool=4）** | 8+ | 最终最优 |
+
+**累计 QPS 提升**：4.79 → 12.67（**+164%**）  
+**P99 延迟**：3454ms → 1941ms（**-44%**）
+
+### VAD Session Pool 扫描结果（20 并发 × 30s 音频 × 400 请求）
+
+固定 `OMP_NUM_THREADS=1`，扫描 `VAD_SESSION_POOL_SIZE`：
+
+| Pool Size | QPS | 平均延迟 | P99 | 稳定性 | 备注 |
+|---|---|---|---|---|---|
+| 1 | 12.76 | 1542ms | 2141ms | ✓ | 单 session 反而不差 |
+| **2** | **12.88** | **1529ms** | **1951ms** | ✓ | **★峰值** |
+| 4 | 12.67 | 1556ms | 1941ms | ✓ | 推荐默认（留余量） |
+| 8 | 12.48 | 1579ms | 2004ms | ✓ | — |
+| 16 | 12.32 | 1598ms | 2168ms | ✓ | — |
+| 32 | 12.08 | 1631ms | 2052ms | ✓ | — |
+
+**反直觉现象**：Pool 越大 QPS 反而略降。
+- 原因：OMP=1 后单 session 已高效，多 session 增加内存分配 / 缓存 miss / 上下文切换开销
+- 结论：Pool=2 QPS 最高但太紧；**Pool=4 留 2 个余量应对突发，性能仅差 1.6%**
+
+### OMP_NUM_THREADS 扫描（20 并发，Pool=32 固定）
+
+| OMP | QPS | 平均延迟 | 稳定性 |
+|---|---|---|---|
+| **1** | **12.08** | **1631ms** | ✓ |
+| 2 | 11.51 | 1711ms | ✓ |
+| 4 | 11.51 | 1712ms | ✓ |
+| 8 | 11.06 | 1781ms | ✓ |
+
+**OMP=1 最优**，因为：
+- VAD（Silero）是串行 LSTM，OMP 内部并行无收益
+- 高并发下多 session × 多 OMP 线程 = 线程爆炸，触发 `libgomp thread creation failed`
+- 关闭 OMP 内部并行反而降低系统开销
+
+### 关键参数说明
+
+#### `OMP_NUM_THREADS`（强烈建议保持 1）
+- 作用：控制 libgomp 每进程 OpenMP 线程数
+- 影响范围：ORT / numpy / torch / MKL / OpenBLAS 内部算子并行
+- 建议值：**1**（默认）
+- 什么时候可以尝试 >1：非 VAD 场景、CPU 未跑满、有大矩阵密集计算
+- 相关：`MKL_NUM_THREADS` `OPENBLAS_NUM_THREADS` 一并设为 1（若上层库走不同 BLAS）
+
+#### `VAD_SESSION_POOL_SIZE`（推荐 4，可调 2-8）
+- 作用：Silero VAD ORT session 池大小，多请求 round-robin 分配
+- 影响范围：仅 Stage1 VAD
+- 建议值：**4**（默认）
+- 调优场景：
+  - 低并发（<10）：可降到 2 省内存
+  - 高并发（>30）：可升到 8，但收益递减
+  - 观测 `stage1_vad_sum/count` 均值：>800ms 时考虑增大 pool
+- **注意**：与 OMP 相关：`OMP × Pool ≈ 有效线程数`，OMP=1 时 Pool 数直接对应真实并发
+
+#### `BATCH_TIMEOUT`（推荐 30ms）
+- 作用：GPU Scheduler 单个 chunk 最长排队时间（工业标准 max_queue_delay）
+- 影响：单请求 GPU 侧延迟严格上限 ≤ BATCH_TIMEOUT + 1ms tick
+- 建议值：**30ms**（默认）
+- 调优场景：
+  - 追求最低延迟：15-20ms（合批变弱）
+  - 追求最高吞吐：50-100ms（合批更强，延迟略升）
+- 与 `VALID_BATCH_SIZES[-1]=12` 配合：满 12 立即触发，未满按 timeout 兜底
+
+#### `MODEL_PRECISION`（推荐 trt_int8_enc）
+- 精度矩阵见 README，简要：
+  - `trt_int8_enc`：encoder int8 + 其余 fp16，最快，CER≈0 ★线上推荐
+  - `trt_fp16`：全 fp16，稳定，CER 与 baseline 一致
+  - `trt_fp32`：全 fp32，无损但最慢
+  - `onnx_int8` / `onnx_fp32`：CPU 兜底
+
+### 生产环境推荐配置
+
+**GPU 场景（2080 Ti / A10 / T4 类）**：
+```bash
+MODEL_PRECISION=trt_int8_enc  # 或 trt_fp16
+WORKERS=1                     # GPU 服务必须 1（多 worker 抢 GPU 反而慢）
+BATCH_TIMEOUT=30              # 合批+延迟平衡
+VAD_SESSION_POOL_SIZE=4       # 20 并发以内够用
+OMP_NUM_THREADS=1             # ★必须
+MKL_NUM_THREADS=1
+OPENBLAS_NUM_THREADS=1
+```
+
+**预期性能（2080 Ti + trt_fp16）**：
+- 单 GPU QPS：12+（30s 音频）/ 25+（10s 音频）
+- 单请求平均延迟：<2s（30s 音频，conc=20）
+- P99 延迟：<2.5s
+- 显存占用：~1.5GB（余量充足）
+
+### 崩溃故障排查
+
+**症状 1：`libgomp: Thread creation failed: Resource temporarily unavailable`**
+- 原因：OMP 线程池爆炸
+- 解决：`OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1`
+
+**症状 2：`free(): corrupted unsorted chunks` / `Segmentation fault`**
+- 原因：ORT session 并发调用时 mem arena 竞态
+- 解决：`src/vad.py` 已 `enable_cpu_mem_arena=False` + `enable_mem_pattern=False`
+
+**症状 3：`avg_actual_batch < 3`（合批目标未达成）**
+- 原因：桶分组把 chunk 摊薄
+- 解决：确认 `src/audio_segment.py` 已启用 Uniform Chunking
+
+**症状 4：`stage1_vad` 均值 >1s（VAD 阻塞）**
+- 原因：session pool 太小 or OMP 争用
+- 解决：`VAD_SESSION_POOL_SIZE=8` 或检查 OMP_NUM_THREADS=1
+
