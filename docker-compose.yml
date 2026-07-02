@@ -10,9 +10,13 @@ services:
     ports:
       - "${HOST_PORT:-8099}:8080"
     environment:
+      # ─── 部署形态（详见 docs/DEPLOY.md 高并发性能调优）───
+      # 模式 A（默认）：WORKERS=1，小 GPU/低并发场景，QPS ~13（conc=20）
+      # 模式 B（大 GPU 生产）：WORKERS=11，需 24GB+ 显存，QPS 93.92（conc=120）
       - WORKERS=${WORKERS:-1}
       - BATCH=${BATCH:-12}
-      - BATCH_TIMEOUT=${BATCH_TIMEOUT:-10}
+      # BATCH_TIMEOUT：工业标准 dynamic batching 的 max_queue_delay（ms）
+      - BATCH_TIMEOUT=${BATCH_TIMEOUT:-30}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-2000}
       # 音频最大时长（ms），超出返回 1005；默认 2 小时，0=不限
@@ -21,9 +25,17 @@ services:
       - ACQUIRE_TIMEOUT=${ACQUIRE_TIMEOUT:-5}
       # 精度方案：
       #   线上推荐 trt_int8_enc = encoder int8(QDQ) + cif/decoder/bias fp16
-      #   可选 trt_fp16 / trt_fp32 / trt_int8 /
-      #        onnx_fp32 / onnx_int8 / auto
+      #   可选 trt_fp16 / trt_fp32 / trt_int8 / onnx_fp32 / onnx_int8 / auto
       - MODEL_PRECISION=${MODEL_PRECISION:-trt_int8_enc}
+      # ─── 稳定性/性能池化参数（★必须显式设，防 libgomp 崩溃 + 榨干 GPU）───
+      # VAD ORT session 池（round-robin 让多请求 VAD 真正并行）
+      - VAD_SESSION_POOL_SIZE=${VAD_SESSION_POOL_SIZE:-4}
+      # TRT engine 多 stream 多 execution_context 池（weights 共享，activation 独立）
+      - GPU_STREAM_POOL_SIZE=${GPU_STREAM_POOL_SIZE:-4}
+      # OMP/BLAS 单线程：★必须，Silero VAD 是串行 LSTM 无 OMP 收益，多线程反致 libgomp 崩溃
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+      - OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
       # 单段精度覆盖（可选，优先级高于 MODEL_PRECISION）
       # - ENCODER_PRECISION=int8
       # - CIF_PRECISION=fp16
