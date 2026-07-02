@@ -358,20 +358,26 @@ docker-compose up -d
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | HOST_PORT | 8099 | 宿主机映射端口 |
-| WORKERS | 1 | uvicorn workers（默认 1，最小启动成本；可按显存调大） |
+| WORKERS | 1 | uvicorn workers；小 GPU 保持 1，大 GPU（≥24GB）可设 11 见 DEPLOY.md 模式 B |
 | BATCH | 12 | 最大 batch size（合法值：1,2,4,8,12） |
-| BATCH_TIMEOUT | 10 | batch 等待超时（毫秒） |
+| BATCH_TIMEOUT | 30 | batch 等待超时（毫秒），工业标准 dynamic batching 的 max_queue_delay |
 | LOG_LEVEL | INFO | 日志级别 |
 | MAX_CONCURRENT_REQUESTS | 2000 | 最大并发请求数 |
 | MAX_AUDIO_DURATION_MS | 7200000 | 音频最大时长（ms），超出返回 1005；默认 2 小时，0=不限 |
 | ACQUIRE_TIMEOUT | 5 | 过载并发等待超时（秒），超时返回 1007；0=无限等待 |
 | MODEL_PRECISION | auto | 模型精度（见下表） |
+| VAD_SESSION_POOL_SIZE | 4 | Silero VAD ORT session 池大小，round-robin 分配 |
+| GPU_STREAM_POOL_SIZE | 4 | TRT engine 多 stream 多 execution_context 池 |
+| OMP_NUM_THREADS | 1 | ★必须保持 1，防 libgomp 崩溃（run.sh 已固化） |
+| MKL_NUM_THREADS | 1 | 同上 |
+| OPENBLAS_NUM_THREADS | 1 | 同上 |
 
 > 容器内部固定端口 8080，通过 HOST_PORT 映射到宿主机。
-> WORKERS 默认 1（单进程靠 asyncio + 线程池并发，最小启动成本与显存占用）。
-> 代码已按多 worker 安全设计（词表热更新经文件轮询跨 worker 收敛），
-> 运维可按 GPU 显存调大 WORKERS——但每个 worker 进程独立加载一份 engine + CUDA context，
-> 显存占用随 WORKERS 线性增长，需自行确认显存充足。
+> **两种部署形态**（详见 DEPLOY.md 高并发性能调优）：
+> - **模式 A 单进程**（默认）：WORKERS=1，任何硬件都能跑，QPS ~13
+> - **模式 B 多进程**（大 GPU 生产）：WORKERS=11，QPS 93.92，需 24GB+ 显存
+> 代码已按多 worker 安全设计（词表热更新经文件轮询跨 worker 收敛）。
+> 每个 worker 独立加载 engine + CUDA context，显存占用随 WORKERS 线性增长。
 
 ### MODEL_PRECISION 取值
 
@@ -443,7 +449,7 @@ SeACoParaformer/
 │   └── load_model.py         # 加载本地 PT 权重（PT_MODEL_DIR，不依赖 FunASR）
 ├── src/                      # 推理服务源代码
 │   ├── main.py               # FastAPI 入口（三级流水线 + 热词路由 + 热更新接口）
-│   ├── config.py             # 精度矩阵 + bucket/batch + 热词/Faiss 参数（单一数据源）
+│   ├── config.py             # 精度矩阵 + batch/timeout + VAD/GPU 池 + 热词/Faiss 参数（单一数据源）
 │   ├── errors.py             # 业务错误码
 │   ├── schemas.py            # 请求/响应 schema
 │   ├── logger.py             # 结构化日志（多 worker 按 PID 分文件）
@@ -524,12 +530,27 @@ SeACoParaformer/
 - 单请求延迟 ≈ max(Stage1, Stage2, Stage3)
 - 吞吐量随并发线性增长直至 GPU 饱和
 
-### GPU Scheduler 调度策略
+### GPU Scheduler 调度策略（工业标准 dynamic batching）
 
-- VAD 后段经合并/切分处理，强制归入固定桶：2s / 4s / 8s（LFR 帧数 34 / 67 / 134）
-- `audio_segment.py` 按桶边界合并和切分 VAD 段（桶边界从 `config.BUCKET_SEQ_LENS` 派生）
-- Scheduler 将 chunk 特征 pad 到桶边界，按 bias 身份分组（避免跨请求热词串扰）
-- 在 `BATCH_TIMEOUT` 窗口内持续收集同桶同 bias 的 chunk
-- 达到合法 batch size（1, 2, 4, 8, 12）立即触发推理
-- 超时后按实际数量 pad 到最近合法 batch size 推理
+**Uniform Chunking 均匀切段**（`audio_segment.py`）：
+- VAD 后取整体时间跨度 [first.start_ms, last.end_ms]，按 UNIFORM_CHUNK_MS
+  （=TRT_OPT_SEQ × 60 = 4020ms）均匀切分，所有 chunk 长度统一到 opt=67 帧
+- 尾块 <MIN_TAIL_MS（1000ms）合并到前段，避免过短尾块识别精度损失
+- 消除桶分组把 chunk 摊薄到 3 个独立队列的合批瓶颈
+
+**Scheduler 触发逻辑**（`scheduler.py`）：
+- 按 bias 身份分组（避免跨请求热词串扰），去掉桶维度分组
+- **满触发**：group 累计 ≥ MAX_BATCH_SIZE (=12) 立即推理
+- **超时触发**：按最早入队 chunk 的 enqueue_time 计时，超过 BATCH_TIMEOUT 兜底
+- 1ms 高精度 tick 扫描，保证严格延迟上限
+- 触发后剩余 chunk 保留 group，enqueue_time 不变，下轮继续判定
+
+**GPU 多 stream 多 execution_context**（`trt_engine.py`）：
+- 每段 engine 一份 weights + GPU_STREAM_POOL_SIZE (=4) 个 context + stream
+- 无锁 round-robin 分配 (context, stream) 槽位
+- `_gpu_executor` max_workers=GPU_STREAM_POOL_SIZE，多 batch 真正并行 GPU
+
+**Batch 组装**：
+- submit 时不 pad，_execute_batch 按 batch 内 max(lengths) 动态 pad
+- pad 到最近合法 batch size (1/2/4/8/12)，dummy pad 用 batch[-1] 复制
 - OOM Fallback：减半 batch 重试 → 逐条推理 → 返回 `ASR_INFER_FAILED` 错误

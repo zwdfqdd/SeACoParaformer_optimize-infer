@@ -49,32 +49,51 @@ docker-compose logs -f seaco-asr
 通过 `.env` 文件或环境变量覆盖默认配置：
 
 ```bash
-# .env 示例
+# .env 示例（默认 = 模式 A 单进程，任何硬件都能跑）
 HOST_PORT=8099
 WORKERS=1
 BATCH=12
-BATCH_TIMEOUT=10
+BATCH_TIMEOUT=30
 LOG_LEVEL=INFO
 MAX_CONCURRENT_REQUESTS=2000
 MODEL_PRECISION=trt_int8_enc
 VERBOSE=0
+
+# 稳定性/性能相关（run.sh 已固化默认值）
+VAD_SESSION_POOL_SIZE=4
+GPU_STREAM_POOL_SIZE=4
+OMP_NUM_THREADS=1
+MKL_NUM_THREADS=1
+OPENBLAS_NUM_THREADS=1
+
+# 大 GPU 生产环境（模式 B，需要 24GB+ 显存）
+# WORKERS=11
+# MODEL_PRECISION=trt_fp16
 ```
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | HOST_PORT | 8099 | 宿主机映射端口 |
-| WORKERS | 1 | uvicorn workers（默认 1，最小启动成本；可按显存调大） |
+| WORKERS | 1 | uvicorn workers；小 GPU 保持 1，大 GPU 可设 11 见「高并发调优 模式 B」 |
 | BATCH | 12 | 最大 batch size（合法值：1,2,4,8,12） |
-| BATCH_TIMEOUT | 10 | batch 等待超时（毫秒） |
+| BATCH_TIMEOUT | 30 | batch 等待超时（毫秒），工业标准 dynamic batching 的 max_queue_delay |
 | LOG_LEVEL | INFO | 日志级别（DEBUG/INFO/WARNING/ERROR） |
 | MAX_CONCURRENT_REQUESTS | 2000 | 最大并发请求数 |
 | MODEL_PRECISION | auto | 模型精度选择（见 README MODEL_PRECISION 取值表） |
+| VAD_SESSION_POOL_SIZE | 4 | Silero VAD ORT session 池大小，round-robin 分配 |
+| GPU_STREAM_POOL_SIZE | 4 | TRT engine 多 stream 多 execution_context 池 |
+| OMP_NUM_THREADS | 1 | ★必须 1，防 libgomp 崩溃（run.sh 已固化） |
+| MKL_NUM_THREADS | 1 | 同上 |
+| OPENBLAS_NUM_THREADS | 1 | 同上 |
 | VERBOSE | 0 | 详细日志输出（1=开启，输出各阶段耗时） |
 
-> **WORKERS 默认 1**：单进程靠 asyncio + CPU 线程池实现并发，启动成本与显存占用最小。
+> **两种部署形态**（详见「高并发性能调优」章节）：
+> - **模式 A（默认）**：`WORKERS=1`，任何硬件都能跑，QPS ~13（conc=20）
+> - **模式 B 高并发**：`WORKERS=11`，需 24GB+ GPU，QPS 93.92（conc=120）
+>
 > 代码已按多 worker 安全设计——词表热更新通过容器本地文件 + 版本轮询在各 worker 间收敛
-> （见 API.md 词表热更新）。运维可按 GPU 显存调大 WORKERS，但每个 worker 进程独立加载
-> 一份 engine + CUDA context，显存随 WORKERS 线性增长，需确认显存充足。
+> （见 API.md 词表热更新）。每个 worker 独立加载一份 engine + CUDA context，
+> 显存随 WORKERS 线性增长，需确认显存充足。
 
 ### MODEL_PRECISION 说明
 
@@ -120,16 +139,24 @@ spec:
           ports:
             - containerPort: 8080
           env:
+            # 模式 A 默认；大 GPU（24GB+）改为 "11" 进入模式 B（QPS 93.92）
             - name: WORKERS
               value: "1"
             - name: BATCH
               value: "12"
             - name: BATCH_TIMEOUT
-              value: "10"
+              value: "30"
             - name: LOG_LEVEL
               value: "INFO"
             - name: MAX_CONCURRENT_REQUESTS
               value: "2000"
+            # ★必须显式设为 1，防止 libgomp 线程池爆炸
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: MKL_NUM_THREADS
+              value: "1"
+            - name: OPENBLAS_NUM_THREADS
+              value: "1"
           resources:
             requests:
               memory: "2Gi"
@@ -211,23 +238,31 @@ spec:
 
 ## 扩缩容建议
 
-| 场景 | WORKERS | BATCH | 副本数 | GPU |
-|------|-------|-------|--------|-----|
-| 开发测试 | 1 | 1 | 1 | 0-1 |
-| 小规模（QPS<10） | 1 | 8 | 1 | 1 |
-| 中规模（QPS 10-50） | 1 | 12 | 2 | 2 |
-| 大规模（QPS>50） | 1 | 12 | 4+ | 4+ |
+按 GPU 显存和目标 QPS 选择两种部署模式（详见「高并发性能调优」章节）。
 
-> GPU 推理服务每个 Pod 固定 WORKERS=1，通过增加副本数（Pod 数量）水平扩展。
-> 每个 Pod 绑定一张 GPU，不共享。
+| 场景 | 目标 QPS | WORKERS | BATCH | 副本数 | 单卡显存 | 单卡 GPU |
+|---|---|---|---|---|---|---|
+| 开发测试 | <5 | 1 | 1 | 1 | 2GB | 任意 |
+| 小规模（模式 A） | <15 | 1 | 12 | 1-2 | ~1.5GB | 8-12GB 类（2080 Ti/T4） |
+| 中规模（模式 A 多副本） | 15-50 | 1 | 12 | 2-4 | ~1.5GB × 副本 | 每 Pod 一张 8-12GB 卡 |
+| 大规模（模式 B） | 50-100 | **11** | 12 | 1-2 | ~15-20GB | A10 24GB / A100 |
+| 超大规模（模式 B 多副本） | >100 | 11 | 12 | 2+ | 20GB × 副本 | A10/A100 集群 |
+
+**两种模式的选择依据**：
+- **模式 A（WORKERS=1）**：显存少、启动快、任何硬件都能跑，多 Pod 水平扩展
+- **模式 B（WORKERS=11）**：大 GPU 单卡榨到极限，单 Pod QPS 93.92，减少 Pod 数量
 
 ### 关键调优参数
 
 | 参数 | 调优建议 |
 |------|----------|
+| WORKERS | **1** 或 **11**（详见「WORKERS 参数说明」），中间值不推荐 |
 | BATCH | 增大可提高 GPU 利用率，但增加单请求延迟。合法值：1,2,4,8,12 |
-| BATCH_TIMEOUT | 减小可降低延迟，但降低 batch 填充率。默认 10ms |
+| BATCH_TIMEOUT | 减小可降低延迟，但降低 batch 填充率。默认 30ms |
 | MAX_CONCURRENT_REQUESTS | 控制最大并发，防止内存溢出。默认 2000 |
+| VAD_SESSION_POOL_SIZE | 默认 4；单进程 20+ 并发可调 8 |
+| GPU_STREAM_POOL_SIZE | 默认 4；显存充足可扩到 8 |
+| OMP_NUM_THREADS | ★必须 1，防 libgomp 崩溃 |
 | VERBOSE | 开启后输出各阶段详细耗时，便于性能分析 |
 
 ---
@@ -253,17 +288,21 @@ kill -HUP $(pgrep -f "uvicorn src.main:app")
 
 ## 启动时间说明
 
-服务启动时会执行模型预热（bucket × batch 全组合），确保线上首次请求不会因 CUDA kernel 编译而变慢：
+服务启动时会执行模型预热（bucket × batch 全组合），确保线上首次请求不会因 CUDA kernel
+编译而变慢。Uniform Chunking 后主要工作点是 opt=67 帧，最大桶 134 帧仍保留兜底：
 
 | 阶段 | 耗时 |
 |------|------|
 | 模型加载 | ~10s |
-| ASR 预热（3 bucket × 5 batch = 15 组合） | ~5-6min |
+| ASR 预热（3 bucket × 5 batch × 热词维度组合） | ~5-6min |
 | 特征提取预热 | <1s |
 | 端到端预热 | <1s |
 | **总计** | **~6min** |
 
 K8s 部署时需确保 `initialDelaySeconds` 大于预热时间，避免 Pod 被误判为不健康而重启。
+
+> 若显式设 `WORKERS>1`（如模式 B），预热在**每个 worker 进程各执行一次**（并行），
+> 不影响墙钟时间（多进程同时预热），但每个进程仍需消耗独立显存。
 
 ---
 
@@ -370,9 +409,9 @@ docker-compose logs -f seaco-asr
 设置 `VERBOSE=1` 后，输出各阶段详细耗时：
 
 ```
-[Stage1] 解码=5ms, VAD=120ms(6段), 切段=1ms(8chunks)
-[Stage2] 特征提取=45ms, chunks=8, shapes=[(34,560),(67,560),...]
-[Stage3] bucket=67, batch=4, 推理=85ms
+[Stage1] 解码=5ms, VAD=120ms(6段), 切段=1ms(7chunks)
+[Stage2] 特征提取=45ms, chunks=7, shapes=[(67,560),(67,560),...]  # uniform 4020ms 均匀切段
+[Stage3] target_seq_len=67, batch=4, 推理=85ms  # 按 batch 内 max(lengths) 动态 pad
 ```
 
 ---
