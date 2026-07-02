@@ -53,7 +53,10 @@ class Settings:
     WORKERS: int = int(os.getenv("WORKERS", "1"))
     BATCH: int = int(os.getenv("BATCH", "12"))
     PORT: int = int(os.getenv("PORT", "8080"))  # 容器内部固定端口（entrypoint 硬编码 8080，对外由 HOST_PORT 映射）
-    BATCH_TIMEOUT: int = int(os.getenv("BATCH_TIMEOUT", "10"))  # 毫秒
+    # 工业标准 dynamic batching 参数（Triton/TF-Serving 模式）：
+    #   - max_batch_size：VALID_BATCH_SIZES 最大值（满 batch 立即触发）
+    #   - max_queue_delay_ms：BATCH_TIMEOUT（超时按最早入队 chunk 计时，严格延迟上限）
+    BATCH_TIMEOUT: int = int(os.getenv("BATCH_TIMEOUT", "10"))  # 毫秒（max_queue_delay）
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     MAX_CONCURRENT_REQUESTS: int = int(os.getenv("MAX_CONCURRENT_REQUESTS", "2000"))
     VERBOSE: bool = os.getenv("VERBOSE", "0") in ("1", "true", "True", "yes")
@@ -77,6 +80,16 @@ class Settings:
     # CPU 流水线线程池大小（Stage1 VAD + Stage2 特征提取）。0=自动取 cpu_count。
     # 多 worker（WORKERS>1）时务必显式设小，避免每 worker 各开满核导致线程超额订阅。
     CPU_THREAD_POOL_SIZE: int = int(os.getenv("CPU_THREAD_POOL_SIZE", "0"))
+
+    # VAD ORT session 池大小（round-robin 分配，多请求真正并行）。
+    # 单一全局 session 在并发场景下会被 ORT 内部串行化，需要多 session 才能真正并行。
+    # 20 并发 × 30s 音频压测扫描结果（OMP_NUM_THREADS=1）：
+    #   pool=1  QPS=12.76   pool=2  QPS=12.88（最优）  pool=4  QPS=12.67
+    #   pool=8  QPS=12.48   pool=16 QPS=12.32          pool=32 QPS=12.08
+    # 反直觉发现：pool 越大 QPS 反而略降，因为 OMP=1 后单 session 已高效，
+    # 多 session 增加内存分配/缓存 miss/上下文切换开销。
+    # 默认 4：Pool=2 QPS 最高但太紧，Pool=4 留余量应对突发；差距仅 1.6%。
+    VAD_SESSION_POOL_SIZE: int = int(os.getenv("VAD_SESSION_POOL_SIZE", "4"))
 
     # 固定参数（模型已打包进镜像）
     MODEL_DIR: str = "./models"

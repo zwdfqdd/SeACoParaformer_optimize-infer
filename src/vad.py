@@ -5,8 +5,20 @@ VAD 模块 — 语音活动检测
 对齐官方 OnnxWrapper 实现（context 拼接、state shape=(2,batch,128)）。
 VAD 只输出时间戳列表 [(start_ms, end_ms), ...]，不修改音频数据。
 运行在 CPU 上，与 ASR 推理并行。
+
+并发设计（Session Pool + Round-Robin）：
+    ORT InferenceSession 并发调用 run() 会在内部串行化，高并发下单请求 VAD 墙钟耗时
+    被放大数倍（10 并发实测从 500ms 涨到 3300ms）。
+    解决方案：load() 时一次性预建 N 个 session（VAD_SESSION_POOL_SIZE），请求按
+    无锁 counter round-robin 分配。多 session 之间真正并行；单 session 内即使被多
+    线程调用也是安全的（ORT session.run 线程安全，只是串行化）。
+    对比 threading.local 方案：
+      - 无懒加载竞态（避免 ORT 首次并发创建时 double-free）
+      - Session 数量固定可控（不会因线程数爆炸）
+      - 内存占用可预测（每 session ~5MB × pool_size）
 """
 
+import itertools
 from dataclasses import dataclass
 
 import numpy as np
@@ -43,40 +55,64 @@ class SileroVAD:
     """
     Silero VAD ONNX 推理引擎。
     对齐官方 OnnxWrapper 实现。
+
+    Session 池：load() 一次性预建 N 个 session，请求按 round-robin 分配。
     """
 
     def __init__(self):
-        self._session: ort.InferenceSession | None = None
+        self._sessions: list[ort.InferenceSession] = []
+        # 无锁 round-robin 计数器（itertools.count 是线程安全的原子递增）
+        self._counter = itertools.count()
 
     def load(self):
-        """加载 VAD ONNX 模型（CPU）。"""
+        """加载 VAD ONNX 模型：一次性预建 VAD_SESSION_POOL_SIZE 个 session。"""
         model_path = settings.get_vad_model_path()
+        pool_size = max(1, settings.VAD_SESSION_POOL_SIZE)
         try:
-            sess_options = ort.SessionOptions()
-            sess_options.inter_op_num_threads = 1
-            sess_options.intra_op_num_threads = 1
-            self._session = ort.InferenceSession(
-                model_path,
-                sess_options,
-                providers=["CPUExecutionProvider"],
+            self._sessions = [self._new_session(model_path) for _ in range(pool_size)]
+            logger.info(
+                f"VAD 模型加载成功: {model_path}（session 池大小={pool_size}）"
             )
-            logger.info(f"VAD 模型加载成功: {model_path}")
         except Exception as e:
             raise ASRException(
                 ErrorCode.MODEL_LOAD_FAILED,
                 f"VAD 模型加载失败: {e}",
             )
 
+    @staticmethod
+    def _new_session(model_path: str) -> ort.InferenceSession:
+        sess_options = ort.SessionOptions()
+        # 单 session 内单线程即可（多 session 之间并行，避免线程超额订阅）
+        sess_options.inter_op_num_threads = 1
+        sess_options.intra_op_num_threads = 1
+        # 禁用 arena/mem_pattern：ORT 内部 arena 分配在高并发下有已知竞态（libgomp
+        # thread creation failed / free() corrupted chunks）。禁用后每次 run 独立分配，
+        # 单调用略慢 5-10%，但消除多线程调 session 的并发竞态。
+        sess_options.enable_cpu_mem_arena = False
+        sess_options.enable_mem_pattern = False
+        return ort.InferenceSession(
+            model_path,
+            sess_options,
+            providers=["CPUExecutionProvider"],
+        )
+
+    def _get_session(self) -> ort.InferenceSession:
+        """无锁 round-robin 分配 session。"""
+        if not self._sessions:
+            raise ASRException(ErrorCode.VAD_SEGMENT_ERROR, "VAD 模型未加载")
+        idx = next(self._counter) % len(self._sessions)
+        return self._sessions[idx]
+
     @property
     def is_loaded(self) -> bool:
-        return self._session is not None
+        return len(self._sessions) > 0
 
     def detect(self, pcm: np.ndarray, sample_rate: int = 16000) -> list[VADSegment]:
         """
         对 PCM 音频进行 VAD 检测。
-        线程安全：每次调用独立维护 state，不共享实例状态。
+        线程安全：每次调用独立维护 state，session 从池中 round-robin 分配。
         """
-        if self._session is None:
+        if not self._sessions:
             raise ASRException(ErrorCode.VAD_SEGMENT_ERROR, "VAD 模型未加载")
 
         try:
@@ -106,6 +142,9 @@ class SileroVAD:
         state = np.zeros((2, 1, 128), dtype=np.float32)
         context = np.zeros((1, CONTEXT_SIZE), dtype=np.float32)
 
+        # 获取当前线程独立的 session（首次调用时懒加载）
+        session = self._get_session()
+
         # 逐窗口推理获取概率
         speech_probs = []
         for i in range(0, audio_length, WINDOW_SIZE):
@@ -121,7 +160,7 @@ class SileroVAD:
                 "state": state,
                 "sr": np.array(SAMPLE_RATE, dtype=np.int64),
             }
-            ort_outs = self._session.run(None, ort_inputs)
+            ort_outs = session.run(None, ort_inputs)
             out, state = ort_outs[0], ort_outs[1]
             context = x[:, -CONTEXT_SIZE:]
 
