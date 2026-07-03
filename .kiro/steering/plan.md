@@ -131,9 +131,13 @@ vad.py Silero VAD ONNX 推理：
     - base64 必填；article_url、hotwords 可选
 
 成功：{"code": 0, "article_url": null|str, "istar_asr": "全文",
-       "asr": [{"idx": 0, "slid": "", "text": "...", "speaker": "", "timestamp": [start_s, end_s]}]}
+       "asr": [{"idx": 0, "slid": "", "text": "...", "speaker": "",
+                "timestamp": [start_s, end_s],
+                "words": [{"text": "字", "timestamp": [start_s, end_s]}, ...]}]}
     - slid（语种）、speaker（说话人）当前未实现，固定空字符串
-    - timestamp 秒级 [起始, 结束]，源自原始音频时间轴
+    - 段级 timestamp 源自 VAD 时间轴
+    - 字级 words 由 CIF alphas 反推得到（需 CIF engine 输出 alphas），粒度约 60ms
+    - 旧版 engine 或 ORT 整体模型不支持字级时间戳，words:[] 空数组
 
 失败：{"code": 1001, "article_url": null, "istar_asr": "", "asr": [],
        "error": "DECODE_FAILED", "message": "..."}

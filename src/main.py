@@ -40,6 +40,7 @@ from src.schemas import (
     ASRRequest,
     ASRResponse,
     ASRSegment,
+    ASRWord,
     ErrorResponse,
     HealthResponse,
     HotwordReloadRequest,
@@ -638,9 +639,69 @@ async def _encode_hotwords(hotwords: list[str]) -> np.ndarray | None:
     return await gpu_scheduler.encode_hotwords(padded)
 
 
+def _alphas_to_word_timestamps(
+    alphas: np.ndarray,
+    token_ids: np.ndarray,
+    chunk_start_ms: int,
+    frame_ms: int = 60,
+    cif_threshold: float = 1.0,
+) -> list[dict]:
+    """
+    从 CIF alphas 反推每个 token 的字级时间戳。
+
+    公式（与 cif_v1_export 对齐）：
+        cum = cumsum(alphas); floor_diff = floor(cum/thr) 的一阶差分
+        floor_diff > 0 的位置即 fire 位置（对应 encoder 帧索引）
+        帧索引 × frame_ms + chunk 起始偏移 → 音频时间轴时间戳
+
+    Args:
+        alphas: (real_enc_len,) 每帧 CIF 权重
+        token_ids: (token_num,) decoder 输出的 token ID 数组
+        chunk_start_ms: 该 chunk 在原始音频中的起始毫秒（用于对齐全局时间轴）
+        frame_ms: 每 encoder 帧对应毫秒数（LFR 后 60ms）
+        cif_threshold: CIF fire 门槛（默认 1.0）
+
+    Returns:
+        list of {"text": str, "start_ms": int, "end_ms": int}
+        长度 = fire 数量，与 token_ids 数量原则上对齐
+    """
+    if alphas is None or len(alphas) == 0:
+        return []
+    cum = np.cumsum(alphas)
+    floor_cum = np.floor(cum / cif_threshold)
+    floor_diff = np.empty_like(floor_cum)
+    floor_diff[0] = floor_cum[0]
+    floor_diff[1:] = floor_cum[1:] - floor_cum[:-1]
+    peak_positions = np.where(floor_diff > 0)[0]
+
+    words = []
+    total_frames = len(alphas)
+    n = min(len(peak_positions), len(token_ids))
+    for i in range(n):
+        pos = int(peak_positions[i])
+        tid = int(token_ids[i])
+        # 过滤特殊 token（<blank>=0, <sos>=1, <eos>=2）
+        if tid <= 2:
+            continue
+        # 单字文本：直接从 tokenizer._token_list 取（避免 decode 的空格/拼接规则）
+        try:
+            char = tokenizer._token_list[tid] if 0 <= tid < len(tokenizer._token_list) else ""
+        except AttributeError:
+            char = ""
+        if not char:
+            continue
+        start_ms = chunk_start_ms + pos * frame_ms
+        if i + 1 < len(peak_positions):
+            end_ms = chunk_start_ms + int(peak_positions[i + 1]) * frame_ms
+        else:
+            end_ms = chunk_start_ms + total_frames * frame_ms
+        words.append({"text": char, "start_ms": start_ms, "end_ms": end_ms})
+    return words
+
+
 def _build_response(
     chunks: list[ChunkMeta],
-    logits_list: list[np.ndarray],
+    chunk_results: list[tuple[np.ndarray, np.ndarray | None]],
     hotwords: list[str] | None = None,
     use_faiss_correction: bool = False,
     article_url: str | None = None,
@@ -648,7 +709,8 @@ def _build_response(
     """
     构建最终响应。
 
-    将各 chunk 的 logits 解码为文本，并恢复原始时间戳。
+    将各 chunk 的 logits 解码为文本，并恢复原始时间戳；
+    利用 CIF alphas 反推字级时间戳，填充 ASRSegment.words。
     use_faiss_correction=True（路径 B）时，对每段文本做拼音检索纠错。
     article_url：原样透传请求中的 URL 到响应，未传时为 None。
     """
@@ -661,10 +723,17 @@ def _build_response(
     asr_segments: list[ASRSegment] = []
     full_text_parts: list[str] = []
 
-    for i, (chunk, logits) in enumerate(zip(chunks, logits_list)):
-        # 解码 logits → 文本（argmax 贪心解码 + tokenizer）
+    for i, (chunk, (logits, alphas)) in enumerate(zip(chunks, chunk_results)):
+        # 解码 logits → token_ids → 文本（argmax 贪心解码 + tokenizer）
         token_ids = np.argmax(logits, axis=-1).flatten()
         text = tokenizer.decode(token_ids)
+
+        # 字级时间戳（若 alphas 可用；Faiss 纠错场景 words 不同步纠错，保留原始 token 边界）
+        word_dicts = _alphas_to_word_timestamps(
+            alphas=alphas,
+            token_ids=token_ids,
+            chunk_start_ms=chunk.effective_start_ms,
+        )
 
         # 路径 B：Faiss 后处理纠错
         if corrector is not None and text:
@@ -673,12 +742,21 @@ def _build_response(
         # 使用原始 VAD 时间戳（ms → s，保留 3 位小数与外部标准对齐）
         start_s = round(chunk.effective_start_ms / 1000.0, 3)
         end_s = round(chunk.effective_end_ms / 1000.0, 3)
+
+        words_pyd = [
+            ASRWord(text=w["text"],
+                    timestamp=[round(w["start_ms"] / 1000.0, 3),
+                               round(w["end_ms"] / 1000.0, 3)])
+            for w in word_dicts
+        ]
+
         asr_segments.append(ASRSegment(
             idx=i,
             slid="",           # 语种识别未实现
             text=text,
             speaker="",        # 说话人识别未实现
             timestamp=[start_s, end_s],
+            words=words_pyd,
         ))
         full_text_parts.append(text)
 

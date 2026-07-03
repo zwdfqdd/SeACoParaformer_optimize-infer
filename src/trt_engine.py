@@ -239,7 +239,7 @@ class TRTEngine:
         padded_feats: np.ndarray,
         lengths: np.ndarray,
         bias_embeddings: np.ndarray | None = None,
-    ) -> list[np.ndarray]:
+    ) -> list[tuple[np.ndarray, np.ndarray | None]]:
         """
         4 段串联推理。
 
@@ -249,8 +249,10 @@ class TRTEngine:
             bias_embeddings: (1, H, 512) float32，无热词时传 None（内部用全零 1×1×512）
 
         Returns:
-            logits 列表，每个元素 shape=(token_num, vocab_size)
-                - token_num 由 CIF 输出动态决定，每条音频可能不同
+            (logits, alphas) 元组列表，每 batch 一项：
+                logits: (token_num, vocab_size)，token_num 由 CIF 输出动态决定
+                alphas: (real_enc_len,) 每帧 CIF 权重，用于反推字级时间戳；
+                        engine 未导出该输出时为 None
         """
         if not self._loaded:
             raise RuntimeError("TRT engine 未加载")
@@ -288,14 +290,18 @@ class TRTEngine:
         cif_out = self._cif.infer({"encoder_out": encoder_out, "mask": mask})
         acoustic_embeds = cif_out["acoustic_embeds"]  # (batch, max_token, 512)
         token_num_arr = cif_out["token_num"].flatten()  # (batch,)
+        # alphas: (batch, enc_len+1) 每帧 CIF 权重，用于反推 fire 位置做字级时间戳
+        # engine 未输出时给 None，主流程走无时间戳分支
+        alphas_arr = cif_out.get("alphas")
 
         # ---- 3. Decoder: 逐 batch 切到实际 token 数后传入 ----
         # 由于 token_num 每条不同，需要按最大 token_num 重新 pad
         token_nums = np.round(token_num_arr).astype(np.int64)
         max_tok = int(token_nums.max())
         if max_tok == 0:
-            # 全零 token：返回空 logits 占位
-            return [np.zeros((0, 8404), dtype=np.float32) for _ in range(batch_size)]
+            # 全零 token：返回空 logits 占位（alphas 也给 None）
+            return [(np.zeros((0, 8404), dtype=np.float32), None)
+                    for _ in range(batch_size)]
 
         # 截断 acoustic_embeds 到 max_tok
         acoustic_trimmed = acoustic_embeds[:, :max_tok, :].astype(np.float32)
@@ -327,11 +333,22 @@ class TRTEngine:
         dec_out = self._decoder.infer(dec_inputs)
         logits = dec_out["logits"]  # (batch, max_tok, vocab) 或 list
 
-        # ---- 4. 按各自 token_num 切片返回 ----
+        # ---- 4. 按各自 token_num 切片返回 (logits, alphas) 元组 ----
+        # alphas 每 batch 一份，长度 = encoder 帧数（原样返回，字级时间戳由主流程反推）
         results = []
         for i in range(batch_size):
             n = int(token_nums[i])
-            results.append(logits[i, :n, :].copy())
+            logits_i = logits[i, :n, :].copy()
+            # alphas shape=(B, enc_len+1)（predictor tail_process 加了 1 帧），
+            # 取真实 encoder 长度 +1 帧，去掉 batch 内 padding 帧
+            if alphas_arr is not None:
+                real_len = int(lengths[i]) + 1  # +1 覆盖 tail 帧
+                # 保护上界：真实长度不超过 alphas 实际维度
+                real_len = min(real_len, alphas_arr.shape[1])
+                alphas_i = alphas_arr[i, :real_len].copy()
+            else:
+                alphas_i = None
+            results.append((logits_i, alphas_i))
         return results
 
     # --------------------------------------------------------

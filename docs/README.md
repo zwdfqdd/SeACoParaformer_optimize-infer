@@ -432,7 +432,11 @@ print(response.json())
 #   "code": 0,
 #   "article_url": "https://cdn.example.com/audio/test.wav",
 #   "istar_asr": "...",
-#   "asr": [{"idx": 0, "slid": "", "text": "...", "speaker": "", "timestamp": [0.0, 5.2]}, ...]
+#   "asr": [
+#     {"idx": 0, "slid": "", "text": "...", "speaker": "",
+#      "timestamp": [0.0, 5.2],
+#      "words": [{"text": "今", "timestamp": [0.12, 0.24]}, ...]}
+#   ]
 # }
 ```
 

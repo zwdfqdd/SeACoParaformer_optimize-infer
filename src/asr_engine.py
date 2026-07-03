@@ -261,7 +261,7 @@ class ASREngine:
         padded_feats: np.ndarray,
         lengths: np.ndarray,
         bias_embeddings: np.ndarray | None = None,
-    ) -> list[np.ndarray]:
+    ) -> list[tuple[np.ndarray, np.ndarray | None]]:
         """
         Batch 推理（已 pad 到桶边界）。
 
@@ -271,8 +271,10 @@ class ASREngine:
             bias_embeddings: (1, H, 512) float32 或 None
 
         返回：
-            logits 列表，每个元素 shape=(token_num, vocab_size)
-                token_num 由模型动态决定（CIF 输出）
+            (logits, alphas) 元组列表，每 batch 一项：
+                logits: (token_num, vocab_size)，token_num 由 CIF 输出决定
+                alphas: (real_enc_len,) 每帧 CIF 权重，用于反推字级时间戳；
+                        ORT 整体模型未暴露 alphas 时为 None
         """
         if self._backend == "trt" and self._trt_engine is not None:
             return self._trt_engine.infer_batch_raw(padded_feats, lengths, bias_embeddings)
@@ -283,7 +285,7 @@ class ASREngine:
         padded_feats: np.ndarray,
         lengths: np.ndarray,
         bias_embeddings: np.ndarray | None,
-    ) -> list[np.ndarray]:
+    ) -> list[tuple[np.ndarray, np.ndarray | None]]:
         if self._session is None:
             raise ASRException(ErrorCode.ASR_INFER_FAILED, "ASR 模型未加载")
 
@@ -316,12 +318,13 @@ class ASREngine:
                 if "token_num" in oname.lower():
                     token_nums = np.round(outputs[j].flatten()).astype(np.int64)
                     break
+            # ORT 整体模型未暴露 CIF alphas，字级时间戳不可用（alphas=None）
             for i in range(batch_size):
                 if token_nums is not None and i < len(token_nums):
                     n = int(token_nums[i])
-                    results.append(logits[i, :n, :])
+                    results.append((logits[i, :n, :], None))
                 else:
-                    results.append(logits[i])
+                    results.append((logits[i], None))
             return results
         except Exception as e:
             raise ASRException(ErrorCode.ASR_INFER_FAILED, f"ASR 推理失败: {e}")

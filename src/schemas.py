@@ -20,6 +20,16 @@ class ASRRequest(BaseModel):
     )
 
 
+class ASRWord(BaseModel):
+    """字级识别结果（含时间戳）。"""
+    text: str = Field(..., description="字符（中文单字或英文 BPE subword）")
+    timestamp: list[float] = Field(
+        ...,
+        description="[起始秒, 结束秒]，源自 CIF fire 位置对应的原始音频时间轴",
+        examples=[[0.12, 0.24]],
+    )
+
+
 class ASRSegment(BaseModel):
     """单段识别结果（与外部标准 asr 数组格式对齐）。"""
     idx: int = Field(..., description="段序号（从 0 起）")
@@ -36,6 +46,10 @@ class ASRSegment(BaseModel):
         ...,
         description="[起始秒, 结束秒]，源自原始音频时间轴",
         examples=[[0.0, 12.0]],
+    )
+    words: list[ASRWord] = Field(
+        default_factory=list,
+        description="字级时间戳数组（可选，由 CIF fire 位置反推得到）",
     )
 
 

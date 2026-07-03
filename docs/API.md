@@ -46,14 +46,25 @@
       "slid": "",
       "text": "今天天气真好",
       "speaker": "",
-      "timestamp": [0.0, 5.2]
+      "timestamp": [0.0, 5.2],
+      "words": [
+        {"text": "今", "timestamp": [0.12, 0.24]},
+        {"text": "天", "timestamp": [0.24, 0.42]},
+        {"text": "天", "timestamp": [0.42, 0.6]},
+        {"text": "气", "timestamp": [0.6, 0.78]},
+        {"text": "真", "timestamp": [0.78, 0.96]},
+        {"text": "好", "timestamp": [0.96, 1.2]}
+      ]
     },
     {
       "idx": 1,
       "slid": "",
       "text": "适合出去走走",
       "speaker": "",
-      "timestamp": [5.2, 9.8]
+      "timestamp": [5.2, 9.8],
+      "words": [
+        {"text": "适", "timestamp": [5.32, 5.5]}
+      ]
     }
   ]
 }
@@ -69,7 +80,15 @@
 | asr[].slid | string | 语种识别结果（**当前未实现**，固定空字符串） |
 | asr[].text | string | 该段识别文本 |
 | asr[].speaker | string | 说话人识别结果（**当前未实现**，固定空字符串） |
-| asr[].timestamp | [float, float] | [起始秒, 结束秒]，源自原始音频时间轴 |
+| asr[].timestamp | [float, float] | [起始秒, 结束秒]，段级时间戳，源自 VAD 时间轴 |
+| asr[].words | array | 字级时间戳数组（CIF alphas 反推得到，需 CIF engine 输出 alphas） |
+| asr[].words[].text | string | 字符（中文单字或英文 BPE subword） |
+| asr[].words[].timestamp | [float, float] | [起始秒, 结束秒]，字级时间戳，粒度约 60ms |
+
+**字级时间戳说明**：
+- 由 CIF alphas 输出反推每个 token 的 fire 位置，误差 <60ms（一个 encoder 帧的量子）
+- 需要 CIF engine 输出 `alphas`（重导出 ONNX + 重转 engine 后生效）
+- 旧版 engine 或 ORT 整体模型（onnx_fp32/onnx_int8）不支持字级时间戳，`words: []` 空数组
 
 ### 失败响应
 
