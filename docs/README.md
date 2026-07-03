@@ -404,7 +404,7 @@ docker-compose up -d
 curl -X POST http://localhost:8099/chinese_asr \
     -H "Content-Type: application/json" \
     -d '{
-        "b64": "'"$(base64 -w0 test.wav)"'",
+        "base64": "'"$(base64 -w0 test.wav)"'",
         "article_url": "https://cdn.example.com/audio/test.wav",
         "hotwords": ["张三", "李四"]
     }'
@@ -422,13 +422,18 @@ with open("test.wav", "rb") as f:
 response = requests.post(
     "http://localhost:8099/chinese_asr",
     json={
-        "b64": b64_audio,
+        "base64": b64_audio,
         "article_url": "https://cdn.example.com/audio/test.wav",  # 可选，透传到响应
         "hotwords": ["张三", "李四"],  # 可选
     },
 )
 print(response.json())
-# {"code": 0, "text": "...", "article_url": "https://cdn.example.com/audio/test.wav", "detail": {...}}
+# {
+#   "code": 0,
+#   "article_url": "https://cdn.example.com/audio/test.wav",
+#   "istar_asr": "...",
+#   "asr": [{"idx": 0, "slid": "", "text": "...", "speaker": "", "timestamp": [0.0, 5.2]}, ...]
+# }
 ```
 
 ### 健康检查

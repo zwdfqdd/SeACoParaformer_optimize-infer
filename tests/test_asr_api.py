@@ -67,7 +67,7 @@ def main():
     else:
         sys.exit("仅支持 .wav 或 .txt 输入")
 
-    payload = {"b64": data}
+    payload = {"base64": data}
     if args.hotwords:
         payload["hotwords"] = args.hotwords
 

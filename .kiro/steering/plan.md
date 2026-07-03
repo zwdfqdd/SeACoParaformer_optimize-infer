@@ -125,11 +125,18 @@ vad.py Silero VAD ONNX 推理：
     GPU_STREAM_POOL_SIZE=4
     BATCH_TIMEOUT=30
 
-# 六、API 规约
+# 六、API 规约（POST /chinese_asr）
 
-输入：{"b64": "wav_16k_1channel_base64", "hotwords": ["张三", "李四"]}
-成功：{"code": 0, "text": "全文", "detail": {"0": {"text": "...", "start_ms": ..., "end_ms": ...}}}
-失败：{"code": 1001, "text": "", "detail": {}, "error": "DECODE_FAILED", "message": "..."}
+输入：{"base64": "wav_16k_1channel_base64", "article_url": "https://...", "hotwords": ["张三", "李四"]}
+    - base64 必填；article_url、hotwords 可选
+
+成功：{"code": 0, "article_url": null|str, "istar_asr": "全文",
+       "asr": [{"idx": 0, "slid": "", "text": "...", "speaker": "", "timestamp": [start_s, end_s]}]}
+    - slid（语种）、speaker（说话人）当前未实现，固定空字符串
+    - timestamp 秒级 [起始, 结束]，源自原始音频时间轴
+
+失败：{"code": 1001, "article_url": null, "istar_asr": "", "asr": [],
+       "error": "DECODE_FAILED", "message": "..."}
 
 错误码：
     SUCCESS=0 / INPUT_PARAM_FAILED=1000 / DECODE_FAILED=1001 /

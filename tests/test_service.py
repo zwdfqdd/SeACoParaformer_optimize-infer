@@ -61,7 +61,7 @@ def send_request(url: str, payload: dict) -> dict:
             "success": status == 200,
             "status": status,
             "elapsed_s": elapsed,
-            "text_len": len(body.get("text", "")) if status == 200 else 0,
+            "text_len": len(body.get("istar_asr", "")) if status == 200 else 0,
             "error": body.get("error", "") if status != 200 else "",
         }
     except urllib.error.HTTPError as e:
@@ -221,7 +221,7 @@ def main():
     with open(args.audio, "rb") as f:
         b64_audio = base64.b64encode(f.read()).decode()
 
-    payload = {"b64": b64_audio}
+    payload = {"base64": b64_audio}
     if args.hotwords:
         payload["hotwords"] = args.hotwords
 

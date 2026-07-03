@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 class ASRRequest(BaseModel):
     """ASR 识别请求。"""
-    b64: str = Field(..., description="WAV 16kHz 单声道音频的 Base64 编码（必填）")
+    base64: str = Field(..., description="WAV 16kHz 单声道音频的 Base64 编码（必填）")
     article_url: str | None = Field(
         default=None,
         description="原始音频文件的 URL（可选，服务端原样透传到响应中，用于业务侧追踪）",
@@ -20,24 +20,39 @@ class ASRRequest(BaseModel):
     )
 
 
-class SegmentDetail(BaseModel):
-    """单段识别结果。"""
+class ASRSegment(BaseModel):
+    """单段识别结果（与外部标准 asr 数组格式对齐）。"""
+    idx: int = Field(..., description="段序号（从 0 起）")
+    slid: str = Field(
+        default="",
+        description="语种识别结果（当前未实现，固定空字符串）",
+    )
     text: str = Field(..., description="该段识别文本")
-    start_ms: int = Field(..., description="原始音频中的起始时间（毫秒）")
-    end_ms: int = Field(..., description="原始音频中的结束时间（毫秒）")
+    speaker: str = Field(
+        default="",
+        description="说话人识别结果（当前未实现，固定空字符串）",
+    )
+    timestamp: list[float] = Field(
+        ...,
+        description="[起始秒, 结束秒]，源自原始音频时间轴",
+        examples=[[0.0, 12.0]],
+    )
 
 
 class ASRResponse(BaseModel):
-    """ASR 识别成功响应。"""
+    """ASR 识别成功响应（与外部标准结构对齐）。"""
     code: int = Field(default=0, description="业务状态码，0 表示成功")
-    text: str = Field(..., description="全文拼接结果")
     article_url: str | None = Field(
         default=None,
-        description="原样透传请求中的 article_url，未传时为 None",
+        description="原样透传请求中的 article_url，未传时为 null",
     )
-    detail: dict[str, SegmentDetail] = Field(
+    istar_asr: str = Field(
         ...,
-        description="分段识别结果，key 为段序号",
+        description="全文拼接结果（各段 text 顺序拼接）",
+    )
+    asr: list[ASRSegment] = Field(
+        ...,
+        description="分段识别结果数组，按时间顺序排列",
     )
 
 

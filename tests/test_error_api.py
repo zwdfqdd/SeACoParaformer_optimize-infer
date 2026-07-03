@@ -87,33 +87,33 @@ def run(url: str):
     check("asr_inference_duration_seconds" in text, "含 asr_inference_duration_seconds")
 
     # 3. 非法 base64 → 1001 DECODE_FAILED
-    status, body, _ = _http("POST", f"{url}/chinese_asr", {"b64": "@@@not-base64@@@"}, timeout=30)
+    status, body, _ = _http("POST", f"{url}/chinese_asr", {"base64": "@@@not-base64@@@"}, timeout=30)
     print(f"\n[非法base64] {status} {body}")
     check(status == 400, "非法 base64 返回 400")
     check(isinstance(body, dict) and body.get("code") in (1000, 1001), "错误码 1000/1001")
 
     # 4. 合法 base64 但非 WAV → 1001
-    status, body, _ = _http("POST", f"{url}/chinese_asr", {"b64": _b64(b"this is not a wav file")}, timeout=30)
+    status, body, _ = _http("POST", f"{url}/chinese_asr", {"base64": _b64(b"this is not a wav file")}, timeout=30)
     print(f"\n[非WAV] {status} {body}")
     check(status == 400, "非 WAV 返回 400")
     check(isinstance(body, dict) and body.get("code") == 1001, "错误码 1001(DECODE_FAILED)")
 
     # 5. 采样率不符（8kHz）→ 1001
     wav_8k = _make_wav(8000, 8000)  # 1s @ 8kHz
-    status, body, _ = _http("POST", f"{url}/chinese_asr", {"b64": _b64(wav_8k)}, timeout=30)
+    status, body, _ = _http("POST", f"{url}/chinese_asr", {"base64": _b64(wav_8k)}, timeout=30)
     print(f"\n[采样率8k] {status} {body}")
     check(status == 400, "采样率不符返回 400")
     check(isinstance(body, dict) and body.get("code") == 1001, "错误码 1001")
 
-    # 6. 缺少 b64 字段 → 422（pydantic 校验）或 400
+    # 6. 缺少 base64 字段 → 422（pydantic 校验）或 400
     status, body, _ = _http("POST", f"{url}/chinese_asr", {"hotwords": ["张三"]}, timeout=30)
-    print(f"\n[缺b64] {status}")
-    check(status in (400, 422), "缺 b64 返回 400/422")
+    print(f"\n[缺base64] {status}")
+    check(status in (400, 422), "缺 base64 返回 400/422")
 
-    # 7. 空字符串 b64 → 1000/1001
-    status, body, _ = _http("POST", f"{url}/chinese_asr", {"b64": ""}, timeout=30)
-    print(f"\n[空b64] {status} {body}")
-    check(status == 400, "空 b64 返回 400")
+    # 7. 空字符串 base64 → 1000/1001
+    status, body, _ = _http("POST", f"{url}/chinese_asr", {"base64": ""}, timeout=30)
+    print(f"\n[空base64] {status} {body}")
+    check(status == 400, "空 base64 返回 400")
 
     print(f"\n{'=' * 50}\n结果: {passed} 通过, {failed} 失败\n{'=' * 50}")
     print("提示：1005 AUDIO_TOO_LONG 需服务端设较小 MAX_AUDIO_DURATION_MS（如 5000）"

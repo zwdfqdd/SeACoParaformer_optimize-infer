@@ -21,7 +21,7 @@
 
 ```json
 {
-  "b64": "UklGRi4AAABXQVZFZm10IBAAAA...",
+  "base64": "UklGRi4AAABXQVZFZm10IBAAAA...",
   "article_url": "https://cdn.example.com/audio/xxx.wav",
   "hotwords": ["张三", "李四"]
 }
@@ -29,7 +29,7 @@
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| b64 | string | **是** | WAV 16kHz 单声道音频的 Base64 编码 |
+| base64 | string | **是** | WAV 16kHz 单声道音频的 Base64 编码 |
 | article_url | string | 否 | 原始音频文件的 URL；服务端原样透传到响应，用于业务侧追踪对账 |
 | hotwords | string[] | 否 | 热词列表，提高特定词汇识别率 |
 
@@ -38,43 +38,49 @@
 ```json
 {
   "code": 0,
-  "text": "今天天气真好适合出去走走",
   "article_url": "https://cdn.example.com/audio/xxx.wav",
-  "detail": {
-    "0": {
+  "istar_asr": "今天天气真好适合出去走走",
+  "asr": [
+    {
+      "idx": 0,
+      "slid": "",
       "text": "今天天气真好",
-      "start_ms": 0,
-      "end_ms": 5200
+      "speaker": "",
+      "timestamp": [0.0, 5.2]
     },
-    "1": {
+    {
+      "idx": 1,
+      "slid": "",
       "text": "适合出去走走",
-      "start_ms": 5200,
-      "end_ms": 9800
+      "speaker": "",
+      "timestamp": [5.2, 9.8]
     }
-  }
+  ]
 }
 ```
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | code | int | 业务状态码，0 表示成功 |
-| text | string | 全文拼接结果 |
 | article_url | string \| null | 原样透传请求中的 `article_url`；请求未传时为 `null` |
-| detail | object | 分段识别结果，key 为段序号 |
-| detail.N.text | string | 该段识别文本 |
-| detail.N.start_ms | int | 原始音频中的起始时间（毫秒） |
-| detail.N.end_ms | int | 原始音频中的结束时间（毫秒） |
+| istar_asr | string | 全文拼接结果（各段 text 顺序拼接） |
+| asr | array | 分段识别结果，按时间顺序排列 |
+| asr[].idx | int | 段序号（从 0 起） |
+| asr[].slid | string | 语种识别结果（**当前未实现**，固定空字符串） |
+| asr[].text | string | 该段识别文本 |
+| asr[].speaker | string | 说话人识别结果（**当前未实现**，固定空字符串） |
+| asr[].timestamp | [float, float] | [起始秒, 结束秒]，源自原始音频时间轴 |
 
 ### 失败响应
 
-失败响应包含与成功响应一致的 `text`/`article_url`/`detail` 字段（均为空值），便于客户端用统一结构解析。
+失败响应包含与成功响应一致的 `istar_asr`/`article_url`/`asr` 字段（均为空值），便于客户端用统一结构解析。
 
 ```json
 {
   "code": 1001,
-  "text": "",
   "article_url": null,
-  "detail": {},
+  "istar_asr": "",
+  "asr": [],
   "error": "DECODE_FAILED",
   "message": "音频解码失败，请确认为16kHz单声道WAV格式"
 }
@@ -83,9 +89,9 @@
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | code | int | 业务错误码 |
-| text | string | 失败时固定为空字符串（与成功响应结构对齐） |
 | article_url | null | 失败时固定为 `null`（错误分支无法回读已解析请求中的 article_url） |
-| detail | object | 失败时固定为空对象（与成功响应结构对齐） |
+| istar_asr | string | 失败时固定为空字符串（与成功响应结构对齐） |
+| asr | array | 失败时固定为空数组（与成功响应结构对齐） |
 | error | string | 错误码名称 |
 | message | string | 错误描述 |
 
@@ -96,7 +102,7 @@
 | 错误码 | 名称 | HTTP Status | 说明 |
 |--------|------|-------------|------|
 | 0 | SUCCESS | 200 | 成功 |
-| 1000 | INPUT_PARAM_FAILED | 400 | 输入参数错误（缺少 b64 字段、格式不合法等） |
+| 1000 | INPUT_PARAM_FAILED | 400 | 输入参数错误（缺少 base64 字段、格式不合法等） |
 | 1001 | DECODE_FAILED | 400 | 音频解码失败（非 WAV、文件损坏等） |
 | 1002 | VAD_SEGMENT_ERROR | 500 | VAD 模型推理异常 |
 | 1003 | AUDIO_SEGMENT_ERROR | 500 | 切段合并逻辑异常 |

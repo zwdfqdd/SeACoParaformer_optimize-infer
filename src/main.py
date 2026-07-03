@@ -39,12 +39,12 @@ from src.scheduler import gpu_scheduler
 from src.schemas import (
     ASRRequest,
     ASRResponse,
+    ASRSegment,
     ErrorResponse,
     HealthResponse,
     HotwordReloadRequest,
     HotwordReloadResponse,
     HotwordStatusResponse,
-    SegmentDetail,
 )
 from src.tokenizer import tokenizer
 from src.vad import vad_engine
@@ -256,12 +256,12 @@ async def asr_exception_handler(request: Request, exc: ASRException):
     asr_request_total.labels(status="error").inc()
     content = {"code": int(exc.code)}
     if request.url.path == "/chinese_asr":
-        # 失败响应保持与成功响应结构一致（text/article_url/detail 空值），
+        # 失败响应保持与成功响应结构一致（istar_asr/article_url/asr 空值），
         # 便于客户端用统一结构解析。article_url 在错误分支无法从已解析请求获得，
         # 填 None（与"未传"语义等价）。
-        content["text"] = ""
         content["article_url"] = None
-        content["detail"] = {}
+        content["istar_asr"] = ""
+        content["asr"] = []
     content["error"] = exc.code.name
     content["message"] = exc.message
     return JSONResponse(
@@ -431,7 +431,7 @@ async def asr_recognize(req: ASRRequest):
         # ====== Stage 1: 音频解码 + VAD + 切段（CPU 线程池） ======
         def _stage1_cpu():
             t0 = time.time()
-            pcm, sample_rate, audio_duration_ms = _decode_audio(req.b64)
+            pcm, sample_rate, audio_duration_ms = _decode_audio(req.base64)
             t1 = time.time()
             vad_segments = vad_engine.detect(pcm, sample_rate)
             t2 = time.time()
@@ -530,7 +530,7 @@ async def asr_recognize(req: ASRRequest):
             audio_duration_ms=audio_duration_ms,
             vad_segments=len(vad_segments),
             asr_latency_ms=elapsed_ms,
-            result_length=len(response.text),
+            result_length=len(response.istar_asr),
         )
         asr_request_total.labels(status="success").inc()
 
@@ -658,7 +658,7 @@ def _build_response(
         if faiss_corrector.is_ready:
             corrector = faiss_corrector
 
-    detail: dict[str, SegmentDetail] = {}
+    asr_segments: list[ASRSegment] = []
     full_text_parts: list[str] = []
 
     for i, (chunk, logits) in enumerate(zip(chunks, logits_list)):
@@ -670,17 +670,21 @@ def _build_response(
         if corrector is not None and text:
             text = corrector.correct(text)
 
-        # 使用原始 VAD 时间戳
-        detail[str(i)] = SegmentDetail(
+        # 使用原始 VAD 时间戳（ms → s，保留 3 位小数与外部标准对齐）
+        start_s = round(chunk.effective_start_ms / 1000.0, 3)
+        end_s = round(chunk.effective_end_ms / 1000.0, 3)
+        asr_segments.append(ASRSegment(
+            idx=i,
+            slid="",           # 语种识别未实现
             text=text,
-            start_ms=chunk.effective_start_ms,
-            end_ms=chunk.effective_end_ms,
-        )
+            speaker="",        # 说话人识别未实现
+            timestamp=[start_s, end_s],
+        ))
         full_text_parts.append(text)
 
     return ASRResponse(
         code=0,
-        text="".join(full_text_parts),
         article_url=article_url,
-        detail=detail,
+        istar_asr="".join(full_text_parts),
+        asr=asr_segments,
     )

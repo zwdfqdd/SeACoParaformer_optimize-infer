@@ -3,23 +3,27 @@
 
 输入示例：
     {
-        "b64": "UklGRi4AAABXQVZFZm10IBAAAA...",
+        "base64": "UklGRi4AAABXQVZFZm10IBAAAA...",
         "hotwords": ["张三", "李四"]
     }
 
 输出示例（成功）：
     {
         "code": 0,
-        "text": "今天天气真好适合出去走走",
-        "detail": {
-            "0": {"text": "今天天气真好", "start_ms": 0, "end_ms": 5200},
-            "1": {"text": "适合出去走走", "start_ms": 5200, "end_ms": 9800}
-        }
+        "article_url": null,
+        "istar_asr": "今天天气真好适合出去走走",
+        "asr": [
+            {"idx": 0, "slid": "", "text": "今天天气真好", "speaker": "", "timestamp": [0.0, 5.2]},
+            {"idx": 1, "slid": "", "text": "适合出去走走", "speaker": "", "timestamp": [5.2, 9.8]}
+        ]
     }
 
 输出示例（失败）：
     {
         "code": 1001,
+        "article_url": null,
+        "istar_asr": "",
+        "asr": [],
         "error": "DECODE_FAILED",
         "message": "音频解码失败，请确认为16kHz单声道WAV格式"
     }
@@ -55,7 +59,7 @@ def main():
     with open(args.audio, "rb") as f:
         b64_audio = base64.b64encode(f.read()).decode()
 
-    payload = {"b64": b64_audio}
+    payload = {"base64": b64_audio}
     if args.hotwords:
         payload["hotwords"] = args.hotwords
 
