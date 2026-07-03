@@ -112,127 +112,54 @@ OPENBLAS_NUM_THREADS=1
 
 ---
 
-## K8s 部署示例
+## K8s 部署（多节点多卡）
 
-### Deployment
+完整清单见 [`deploy/k8s.yaml`](../deploy/k8s.yaml)，包含 Deployment + Service（NodePort 30960）。
 
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: seaco-asr
-  labels:
-    app: seaco-asr
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: seaco-asr
-  template:
-    metadata:
-      labels:
-        app: seaco-asr
-    spec:
-      containers:
-        - name: seaco-asr
-          image: seaco-asr:latest
-          ports:
-            - containerPort: 8080
-          env:
-            # 模式 A 默认；大 GPU（24GB+）改为 "11" 进入模式 B（QPS 93.92）
-            - name: WORKERS
-              value: "1"
-            - name: BATCH
-              value: "12"
-            - name: BATCH_TIMEOUT
-              value: "30"
-            - name: LOG_LEVEL
-              value: "INFO"
-            - name: MAX_CONCURRENT_REQUESTS
-              value: "2000"
-            # ★必须显式设为 1，防止 libgomp 线程池爆炸
-            - name: OMP_NUM_THREADS
-              value: "1"
-            - name: MKL_NUM_THREADS
-              value: "1"
-            - name: OPENBLAS_NUM_THREADS
-              value: "1"
-          resources:
-            requests:
-              memory: "2Gi"
-              cpu: "2"
-              nvidia.com/gpu: "1"
-            limits:
-              memory: "8Gi"
-              cpu: "8"
-              nvidia.com/gpu: "1"
-          volumeMounts:
-            - name: logs
-              mountPath: /app/logs
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8080
-            initialDelaySeconds: 420
-            periodSeconds: 30
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8080
-            initialDelaySeconds: 420
-            periodSeconds: 10
-      volumes:
-        - name: logs
-          emptyDir: {}
+### 部署形态
+
+- **节点**：多台 GPU 服务器，每台 3 张 GPU 卡，打标签 `asr=asr-gpu-static`
+- **Pod**：每张 GPU 卡部署 1 个 Pod（每 Pod 独占 1 卡）
+- **对外端口**：容器 8080 → NodePort 30960（每节点宿主机暴露此端口，负载均衡到本节点 Pod）
+
+### 关键约束
+
+- `nodeSelector: asr: asr-gpu-static` 只调度到指定节点
+- `resources.requests.nvidia.com/gpu: 1` Pod 独占 1 卡 → 每节点最多 3 Pod（受 GPU 数天然约束）
+- `topologySpreadConstraints` 均匀分布，避免 Pod 堆积到单个节点
+- `Service.externalTrafficPolicy: Local` 只转发到本节点的 Pod，保留 client IP + 减少跨节点跳数
+
+### 应用命令
+
+```bash
+# 1. 给 GPU 节点打标签（每个 GPU 服务器执行）
+kubectl label node <node-name> asr=asr-gpu-static
+
+# 2. 按实际节点数调整 replicas（例：3 节点 × 3 卡 = 9）
+# 修改 deploy/k8s.yaml 中 spec.replicas: 3 → 9
+
+# 3. 部署
+kubectl apply -f deploy/k8s.yaml
+
+# 4. 查看 Pod 分布（应每节点 3 个）
+kubectl get pods -l app=seaco-asr -o wide
+
+# 5. 测试访问（任意节点 IP + 30960）
+curl http://<node-ip>:30960/health
 ```
 
-> **注意**：`initialDelaySeconds` 设为 420s（7分钟），因为服务启动时需要预热所有 bucket × batch 组合（约 6 分钟）。
+### 启动等待时间
 
-### Service
+服务启动需构建 TRT engine（5-10 min）+ 预热（约 6 min），总计约 15 分钟。
 
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: seaco-asr
-spec:
-  selector:
-    app: seaco-asr
-  ports:
-    - port: 8080
-      targetPort: 8080
-  type: ClusterIP
-```
+清单中 `startupProbe` 允许 `30 × 30s = 15 分钟` 内完成健康检查，超过则重启 Pod。
+如果实际环境预热更慢（大 batch/多热词维度），调整 `startupProbe.failureThreshold`。
 
-### HPA（自动扩缩容）
+### 扩缩容策略
 
-```yaml
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: seaco-asr-hpa
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: seaco-asr
-  minReplicas: 1
-  maxReplicas: 8
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
-    - type: Pods
-      pods:
-        metric:
-          name: asr_inference_duration_seconds
-        target:
-          type: AverageValue
-          averageValue: "2"
-```
+- **纵向**：改 `MODEL_PRECISION`（int8_enc 省显存）或 `WORKERS`（大 GPU 走模式 B）
+- **横向**：新增节点后重打标签 + 调大 `replicas`（`replicas = 节点数 × 3`）
+- 本方案**不用 HPA**（GPU 资源固定，副本数由节点数决定，不适合根据 CPU/QPS 自动扩缩）
 
 ---
 

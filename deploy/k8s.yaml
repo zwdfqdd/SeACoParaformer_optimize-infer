@@ -1,0 +1,152 @@
+# ============================================================
+# SeACo-Paraformer K8s 部署清单（Deployment + Service）
+#
+# 部署形态：
+#   - 多台 GPU 服务器，每台 3 张 GPU 卡（节点标签: asr=asr-gpu-static）
+#   - 每张 GPU 卡部署 1 个 Pod（Pod 独占 1 卡）
+#   - 节点内 3 个 Pod 通过 NodePort Service 对外统一暴露 30960 端口
+#
+# 关键约束：
+#   - nodeSelector 选中带 asr=asr-gpu-static 标签的节点
+#   - Pod 请求 nvidia.com/gpu: 1（节点只有 3 卡 → 天然每节点最多 3 Pod）
+#   - topologySpreadConstraints 均匀分布到各节点，避免堆积
+#   - replicas = 节点数 × 3（运维按实际扩缩，不写死）
+#
+# 应用：
+#   kubectl apply -f deploy/k8s.yaml
+#
+# 节点打标签：
+#   kubectl label node <node-name> asr=asr-gpu-static
+# ============================================================
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaco-asr
+  labels:
+    app: seaco-asr
+spec:
+  # 运维按实际节点数调整：replicas = 节点数 × 3（3 卡/节点）
+  # 例如 3 节点 × 3 卡 = 9
+  replicas: 3
+  selector:
+    matchLabels:
+      app: seaco-asr
+  strategy:
+    # 滚动更新策略：单卡逐个更新，避免同节点多 Pod 同时重启
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: seaco-asr
+    spec:
+      # 只调度到打了 asr=asr-gpu-static 标签的节点
+      nodeSelector:
+        asr: asr-gpu-static
+
+      # Pod 均匀分布到各节点（每节点 Pod 数差 ≤ 1），避免 3 Pod 都挤到一个节点
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: seaco-asr
+
+      containers:
+        - name: seaco-asr
+          image: seaco-asr:latest
+          # 每次 Pod 启动都拉最新镜像（配合 :latest 标签使用，滚动更新时自动同步）
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # ─── 部署形态（模式 A 默认；模式 B 需大 GPU 24GB+，改 WORKERS="11"）───
+            - name: WORKERS
+              value: "1"
+            - name: BATCH
+              value: "12"
+            - name: BATCH_TIMEOUT
+              value: "30"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: MAX_CONCURRENT_REQUESTS
+              value: "2000"
+            # ─── 精度：线上推荐 trt_int8_enc（可改 trt_fp16 / trt_fp32 等）───
+            - name: MODEL_PRECISION
+              value: "trt_int8_enc"
+            # ─── 稳定性/性能池化（run.sh 已固化，这里显式声明便于运维审计）───
+            - name: VAD_SESSION_POOL_SIZE
+              value: "4"
+            - name: GPU_STREAM_POOL_SIZE
+              value: "4"
+            # ★必须显式 1，防 libgomp 线程池爆炸导致高并发崩溃
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: MKL_NUM_THREADS
+              value: "1"
+            - name: OPENBLAS_NUM_THREADS
+              value: "1"
+          resources:
+            requests:
+              memory: "128Gi"
+              cpu: "38"
+              # 独占 1 张 GPU 卡（节点只有 3 卡 → 天然限制每节点最多 3 Pod）
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "256Gi"
+              cpu: "64"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: logs
+              mountPath: /app/logs
+          # 启动时需构建 engine（5-10 min）+ 预热（约 6 min）
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            # 允许启动阶段 30 × 60s = 15 分钟内完成
+            periodSeconds: 60
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: logs
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaco-asr
+  labels:
+    app: seaco-asr
+spec:
+  type: NodePort
+  selector:
+    app: seaco-asr
+  # externalTrafficPolicy=Local：只转发到本节点的 Pod，保留 client IP，少一次跨节点跳
+  # 因为每节点都有 3 Pod，本节点服务能力足够，无需跨节点转发
+  externalTrafficPolicy: Local
+  ports:
+    - name: http
+      port: 8080          # Service ClusterIP 端口（集群内访问用）
+      targetPort: 8080    # Pod 容器端口
+      nodePort: 30960     # 宿主机对外端口（要求 kube-apiserver 允许 NodePort 范围包含 30960）
+      protocol: TCP
