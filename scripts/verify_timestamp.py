@@ -36,25 +36,31 @@ from src.tokenizer import Tokenizer
 FRAME_MS = 60
 
 
-def cif_peak_to_timestamps(cif_peak: np.ndarray, token_num: int) -> list[tuple[int, int]]:
+def alphas_to_fire_positions(alphas: np.ndarray, threshold: float) -> np.ndarray:
     """
-    从 cif_peak 反推每个 token 的 (start_ms, end_ms)。
+    从 predictor 输出的 alphas 反推 fire 位置（对齐 cif_v1_export 公式）。
 
-    cif_peak: (T,) float 数组，>0 表示该 encoder 帧 fire 了一个 token
-    token_num: 预期 token 数量（用于对齐/校验）
-
-    返回：List[(start_ms, end_ms)]，长度 = 实际 fire 数量
+    alphas: (T,) 每帧的 CIF 权重
+    threshold: predictor 的 fire 门槛（一般 1.0）
+    返回：fire 位置数组（长度 = token 数）
     """
-    peak_positions = np.where(cif_peak > 0)[0]
+    cum = np.cumsum(alphas)
+    floor_cum = np.floor(cum / threshold)
+    floor_diff = np.empty_like(floor_cum)
+    floor_diff[0] = floor_cum[0]
+    floor_diff[1:] = floor_cum[1:] - floor_cum[:-1]
+    return np.where(floor_diff > 0)[0]
+
+
+def fire_positions_to_timestamps(peak_positions: np.ndarray, total_frames: int) -> list[tuple[int, int]]:
+    """从 fire 位置反推每个 token 的 (start_ms, end_ms)。"""
     timestamps = []
     for i, pos in enumerate(peak_positions):
-        # 单 token 时间范围：本次 fire 到下次 fire 之间
         start_ms = int(pos * FRAME_MS)
         if i + 1 < len(peak_positions):
             end_ms = int(peak_positions[i + 1] * FRAME_MS)
         else:
-            # 最后一个 token：延伸到 encoder 末尾
-            end_ms = int((len(cif_peak)) * FRAME_MS)
+            end_ms = int(total_frames * FRAME_MS)
         timestamps.append((start_ms, end_ms))
     return timestamps
 
@@ -123,18 +129,22 @@ def main():
     text = tokenizer.decode(token_ids)
     print(f"  识别结果: {text}")
 
-    # cif_peak 反推时间戳
-    cif_peak_np = cif_peak[0].cpu().numpy()  # (T,)
-    token_num_val = int(token_num[0].item())
-    print(f"\ncif_peak 分析:")
-    print(f"  encoder 帧数: {len(cif_peak_np)}")
-    print(f"  预测 token_num（float）: {alphas[0].sum().item():.2f}")
-    print(f"  round(token_num): {token_num_val}")
-    print(f"  cif_peak > 0 帧数: {int((cif_peak_np > 0).sum())}")
-    print(f"  cif_peak 峰值: min={cif_peak_np[cif_peak_np > 0].min():.3f} "
-          f"max={cif_peak_np.max():.3f}")
+    # 从 alphas 反推 fire 位置（每 token 起始的 encoder 帧索引）
+    alphas_np = alphas[0].cpu().numpy()  # (T,)
+    threshold = float(model.predictor.threshold)
+    peak_positions = alphas_to_fire_positions(alphas_np, threshold)
+    token_num_val = int(round(alphas[0].sum().item()))
 
-    timestamps = cif_peak_to_timestamps(cif_peak_np, token_num_val)
+    print(f"\nCIF alphas 分析:")
+    print(f"  encoder 帧数: {len(alphas_np)}")
+    print(f"  CIF threshold: {threshold}")
+    print(f"  alphas 累积和: {alphas[0].sum().item():.3f}")
+    print(f"  round(token_num): {token_num_val}")
+    print(f"  fire 位置数量: {len(peak_positions)}")
+    print(f"  alphas 分布: min={alphas_np.min():.3f} "
+          f"mean={alphas_np.mean():.3f} max={alphas_np.max():.3f}")
+
+    timestamps = fire_positions_to_timestamps(peak_positions, len(alphas_np))
 
     # 字符 + 时间戳表
     print("\n" + "=" * 60)
@@ -143,22 +153,22 @@ def main():
     print(f"{'idx':<4} {'token':<8} {'char':<6} {'start_ms':<10} {'end_ms':<10} {'dur_ms':<8}")
     print("-" * 60)
 
-    # 解码得到 token 字符：直接 argmax 后逐个转（避免 tokenizer.decode 的空格/合并规则）
-    id_to_token = getattr(tokenizer, "_id2token", None)
-    if id_to_token is None:
-        id_to_token = getattr(tokenizer, "id2token", {})
+    # tokenizer 内部按索引存 token（_token_list）
+    token_list = tokenizer._token_list
 
-    # 取 decoder 输出的 token（filter <sos>/<eos>/<blank>）
+    def id_to_char(tid: int) -> str:
+        if tid <= 2:  # <blank>=0, <sos>=1, <eos>=2
+            return f"<{['blank','sos','eos'][tid]}>"
+        if 0 <= tid < len(token_list):
+            return token_list[tid] or f"?{tid}"
+        return f"?{tid}"
+
+    # 取 decoder 输出的 token
     token_ids_list = token_ids.tolist()
-    # 与 timestamps 对齐取前 N 个（N = min(len(timestamps), len(token_ids)) 兼容长度不一致）
     n = min(len(timestamps), len(token_ids_list))
     for i in range(n):
         tid = int(token_ids_list[i])
-        if tid <= 2:  # <blank>=0, <sos>=1, <eos>=2
-            char = f"<{['blank','sos','eos'][tid]}>"
-        else:
-            char = id_to_token.get(tid, f"?{tid}") if isinstance(id_to_token, dict) else \
-                   (id_to_token[tid] if tid < len(id_to_token) else f"?{tid}")
+        char = id_to_char(tid)
         start_ms, end_ms = timestamps[i]
         print(f"{i:<4} {tid:<8} {char:<6} {start_ms:<10} {end_ms:<10} {end_ms-start_ms:<8}")
 
@@ -172,16 +182,18 @@ def main():
         "audio": args.audio,
         "duration_s": round(audio_duration, 3),
         "text": text,
-        "encoder_frames": len(cif_peak_np),
+        "encoder_frames": len(alphas_np),
         "frame_ms": FRAME_MS,
+        "cif_threshold": threshold,
         "token_num_predicted": round(alphas[0].sum().item(), 3),
         "token_num_rounded": token_num_val,
-        "fire_count": len(timestamps),
+        "fire_count": len(peak_positions),
         "decoder_tokens": len(token_ids_list),
         "words": [
             {
                 "idx": i,
                 "token_id": int(token_ids_list[i]) if i < len(token_ids_list) else None,
+                "char": id_to_char(int(token_ids_list[i])) if i < len(token_ids_list) else None,
                 "start_ms": timestamps[i][0],
                 "end_ms": timestamps[i][1],
             }
