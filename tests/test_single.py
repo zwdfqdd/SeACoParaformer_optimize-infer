@@ -62,7 +62,7 @@ def main():
     # 发送请求
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        f"{args.url}/asr", data=data, headers={"Content-Type": "application/json"}, method="POST"
+        f"{args.url}/chinese_asr", data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
     t0 = time.perf_counter()
     try:

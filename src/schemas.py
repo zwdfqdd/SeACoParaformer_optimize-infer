@@ -7,7 +7,12 @@ from pydantic import BaseModel, Field
 
 class ASRRequest(BaseModel):
     """ASR 识别请求。"""
-    b64: str = Field(..., description="WAV 16kHz 单声道音频的 Base64 编码")
+    b64: str = Field(..., description="WAV 16kHz 单声道音频的 Base64 编码（必填）")
+    article_url: str | None = Field(
+        default=None,
+        description="原始音频文件的 URL（可选，服务端原样透传到响应中，用于业务侧追踪）",
+        examples=["https://cdn.example.com/audio/xxx.wav"],
+    )
     hotwords: list[str] | None = Field(
         default=None,
         description="热词列表，可选参数",
@@ -26,6 +31,10 @@ class ASRResponse(BaseModel):
     """ASR 识别成功响应。"""
     code: int = Field(default=0, description="业务状态码，0 表示成功")
     text: str = Field(..., description="全文拼接结果")
+    article_url: str | None = Field(
+        default=None,
+        description="原样透传请求中的 article_url，未传时为 None",
+    )
     detail: dict[str, SegmentDetail] = Field(
         ...,
         description="分段识别结果，key 为段序号",

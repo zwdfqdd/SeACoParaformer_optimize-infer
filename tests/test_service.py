@@ -49,7 +49,7 @@ def send_request(url: str, payload: dict) -> dict:
     """发送单个 ASR 请求（同步，urllib），返回结果和耗时。"""
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        f"{url}/asr", data=data, headers={"Content-Type": "application/json"}, method="POST"
+        f"{url}/chinese_asr", data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
     t0 = time.perf_counter()
     try:
@@ -86,7 +86,7 @@ def send_request(url: str, payload: dict) -> dict:
 def run_benchmark(url: str, payload: dict, concurrency: int, total: int, audio_duration: float):
     """并发压测（线程池模拟多客户端）。"""
     print(f"开始压测: 并发={concurrency}, 总请求={total}")
-    print(f"目标: {url}/asr")
+    print(f"目标: {url}/chinese_asr")
     print()
 
     wall_start = time.perf_counter()

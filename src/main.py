@@ -2,7 +2,7 @@
 SeACo-Paraformer FastAPI 服务入口
 
 提供：
-- POST /asr — 语音识别接口
+- POST /chinese_asr — 中文语音识别接口
 - GET /health — 健康检查接口
 """
 
@@ -249,14 +249,18 @@ app = FastAPI(
 async def asr_exception_handler(request: Request, exc: ASRException):
     """统一业务异常处理。
 
-    /asr 接口的失败响应补充 text/detail 空值字段，与成功响应结构保持一致，
+    /chinese_asr 接口的失败响应补充 text/detail 空值字段，与成功响应结构保持一致，
     便于客户端用统一结构解析（成功 text 有值/detail 有段，失败均为空）。
     其他接口（如 /hotwords/*）保持精简的 code/error/message 结构。
     """
     asr_request_total.labels(status="error").inc()
     content = {"code": int(exc.code)}
-    if request.url.path == "/asr":
+    if request.url.path == "/chinese_asr":
+        # 失败响应保持与成功响应结构一致（text/article_url/detail 空值），
+        # 便于客户端用统一结构解析。article_url 在错误分支无法从已解析请求获得，
+        # 填 None（与"未传"语义等价）。
         content["text"] = ""
+        content["article_url"] = None
         content["detail"] = {}
     content["error"] = exc.code.name
     content["message"] = exc.message
@@ -389,7 +393,7 @@ async def hotwords_rollback():
     )
 
 
-@app.post("/asr", response_model=ASRResponse)
+@app.post("/chinese_asr", response_model=ASRResponse)
 async def asr_recognize(req: ASRRequest):
     """
     语音识别接口 — 三级流水线架构。
@@ -516,6 +520,7 @@ async def asr_recognize(req: ASRRequest):
         response = _build_response(
             chunks, chunk_results, hotwords=req.hotwords,
             use_faiss_correction=use_faiss_correction,
+            article_url=req.article_url,
         )
 
         # 记录日志
@@ -638,12 +643,14 @@ def _build_response(
     logits_list: list[np.ndarray],
     hotwords: list[str] | None = None,
     use_faiss_correction: bool = False,
+    article_url: str | None = None,
 ) -> ASRResponse:
     """
     构建最终响应。
 
     将各 chunk 的 logits 解码为文本，并恢复原始时间戳。
     use_faiss_correction=True（路径 B）时，对每段文本做拼音检索纠错。
+    article_url：原样透传请求中的 URL 到响应，未传时为 None。
     """
     corrector = None
     if use_faiss_correction:
@@ -674,5 +681,6 @@ def _build_response(
     return ASRResponse(
         code=0,
         text="".join(full_text_parts),
+        article_url=article_url,
         detail=detail,
     )

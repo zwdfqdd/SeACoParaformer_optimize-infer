@@ -72,7 +72,7 @@ def main():
         payload["hotwords"] = args.hotwords
 
     t0 = time.time()
-    status, body = _post_json(f"{args.url}/asr", payload, timeout=120)
+    status, body = _post_json(f"{args.url}/chinese_asr", payload, timeout=120)
     elapsed = time.time() - t0
 
     print(f"HTTP {status} | 耗时 {elapsed:.3f}s")

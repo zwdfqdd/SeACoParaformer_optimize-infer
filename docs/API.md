@@ -4,7 +4,7 @@
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | /asr | 语音识别 |
+| POST | /chinese_asr | 中文语音识别 |
 | GET | /health | 健康检查 |
 | GET | /metrics | Prometheus 指标 |
 | POST | /hotwords/reload | 重载默认词表（运行时热更新） |
@@ -13,7 +13,7 @@
 
 ---
 
-## POST /asr — 语音识别
+## POST /chinese_asr — 中文语音识别
 
 ### 请求
 
@@ -22,13 +22,15 @@
 ```json
 {
   "b64": "UklGRi4AAABXQVZFZm10IBAAAA...",
+  "article_url": "https://cdn.example.com/audio/xxx.wav",
   "hotwords": ["张三", "李四"]
 }
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| b64 | string | 是 | WAV 16kHz 单声道音频的 Base64 编码 |
+| b64 | string | **是** | WAV 16kHz 单声道音频的 Base64 编码 |
+| article_url | string | 否 | 原始音频文件的 URL；服务端原样透传到响应，用于业务侧追踪对账 |
 | hotwords | string[] | 否 | 热词列表，提高特定词汇识别率 |
 
 ### 成功响应（HTTP 200）
@@ -37,6 +39,7 @@
 {
   "code": 0,
   "text": "今天天气真好适合出去走走",
+  "article_url": "https://cdn.example.com/audio/xxx.wav",
   "detail": {
     "0": {
       "text": "今天天气真好",
@@ -56,6 +59,7 @@
 |------|------|------|
 | code | int | 业务状态码，0 表示成功 |
 | text | string | 全文拼接结果 |
+| article_url | string \| null | 原样透传请求中的 `article_url`；请求未传时为 `null` |
 | detail | object | 分段识别结果，key 为段序号 |
 | detail.N.text | string | 该段识别文本 |
 | detail.N.start_ms | int | 原始音频中的起始时间（毫秒） |
@@ -63,12 +67,13 @@
 
 ### 失败响应
 
-失败响应包含与成功响应一致的 `text`/`detail` 字段（均为空值），便于客户端用统一结构解析。
+失败响应包含与成功响应一致的 `text`/`article_url`/`detail` 字段（均为空值），便于客户端用统一结构解析。
 
 ```json
 {
   "code": 1001,
   "text": "",
+  "article_url": null,
   "detail": {},
   "error": "DECODE_FAILED",
   "message": "音频解码失败，请确认为16kHz单声道WAV格式"
@@ -79,6 +84,7 @@
 |------|------|------|
 | code | int | 业务错误码 |
 | text | string | 失败时固定为空字符串（与成功响应结构对齐） |
+| article_url | null | 失败时固定为 `null`（错误分支无法回读已解析请求中的 article_url） |
 | detail | object | 失败时固定为空对象（与成功响应结构对齐） |
 | error | string | 错误码名称 |
 | message | string | 错误描述 |
