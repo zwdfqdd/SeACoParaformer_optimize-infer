@@ -162,7 +162,7 @@ MODEL_PRECISION=trt_fp32  bash run.sh
 MODEL_PRECISION=trt_int8  bash run.sh
 MODEL_PRECISION=onnx_fp32 bash run.sh
 MODEL_PRECISION=onnx_int8 bash run.sh
-
+MODEL_PRECISION=trt_int8_enc bash run.sh
 # 单段精度混搭测试
 ENCODER_PRECISION=int8 DECODER_PRECISION=fp16 bash run.sh
 
