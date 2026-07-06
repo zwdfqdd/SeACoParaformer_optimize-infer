@@ -16,8 +16,8 @@ TensorRT 推理引擎（v2 阶段 1：4 段串联架构）
     encode_hotwords(hotword_token_ids) → bias_embed (1, num_hw, 512)
 """
 
-import itertools
 import os
+import queue
 
 import numpy as np
 
@@ -51,11 +51,15 @@ class _TRTInferencer:
     - 一份 engine（weights 共享，加载一次）
     - N 个 execution_context（各自独立 activation memory）
     - N 个 CUDA stream（真正并行）
-    - round-robin 分配：不同调用落到不同 (context, stream)，可在 GPU SM 上并行
+    - Queue 连接池分配：get() 借一个空闲 (context, stream)，用完 put() 归还
 
-    TRT 10.x 要求：
-    - 同一 context 不能被两个线程同时 execute（我们按 counter 分配，天然独占）
-    - 不同 context 可以并发（这就是我们利用的能力）
+    TRT 10.x 要求（★重要）：
+    - 同一 execution_context 不能被两个线程同时 execute（非线程安全）
+    - 之前用 round-robin counter 取模分配有致命缺陷：counter 只递增不追踪
+      context 忙闲，转一圈回到同一 idx 时会把仍在执行的 context 再分给另一线程，
+      两线程同时 execute_async_v3 同一 context → CUDA illegal memory access。
+    - 改用 queue.Queue 阻塞式借还：context 数 < 并发线程数时自动排队串行化，
+      保证任一 context 同时只被一个线程持有。
     """
 
     def __init__(self, engine_path: str, pool_size: int = 1):
@@ -72,8 +76,10 @@ class _TRTInferencer:
             self.engine.create_execution_context() for _ in range(self.pool_size)
         ]
         self.streams = [torch.cuda.Stream() for _ in range(self.pool_size)]
-        # 无锁 round-robin 计数器
-        self._counter = itertools.count()
+        # 连接池：空闲槽位队列（idx），借还保证同一 context 同时只被一个线程用
+        self._slot_pool: "queue.Queue[int]" = queue.Queue()
+        for _idx in range(self.pool_size):
+            self._slot_pool.put(_idx)
 
         self.input_names: list[str] = []
         self.output_names: list[str] = []
@@ -90,55 +96,59 @@ class _TRTInferencer:
     def context(self):
         return self.contexts[0]
 
-    def _acquire_slot(self) -> tuple[int, "trt.IExecutionContext", "torch.cuda.Stream"]:
-        """无锁 round-robin 取一个 (context, stream) 槽位。"""
-        idx = next(self._counter) % self.pool_size
-        return idx, self.contexts[idx], self.streams[idx]
-
     def infer(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """同步推理（输入 numpy → 输出 numpy），使用池中一个 context/stream。"""
-        _idx, ctx, stream = self._acquire_slot()
+        """同步推理（输入 numpy → 输出 numpy），从连接池借一个 context/stream。"""
+        # 借一个空闲槽（阻塞直到有空闲，保证 context 独占）
+        idx = self._slot_pool.get()
+        try:
+            ctx = self.contexts[idx]
+            stream = self.streams[idx]
 
-        # 让本次调用的 H2D/kernel/D2H 全部走这个 stream
-        with torch.cuda.stream(stream):
-            # 输入
-            d_inputs = {}
-            for name in self.input_names:
-                data = inputs[name]
-                ctx.set_input_shape(name, data.shape)
-                t = torch.from_numpy(data).cuda(non_blocking=True).contiguous()
-                d_inputs[name] = t
-                ctx.set_tensor_address(name, t.data_ptr())
+            # 让本次调用的 H2D/kernel/D2H 全部走这个 stream
+            with torch.cuda.stream(stream):
+                # 输入
+                d_inputs = {}
+                for name in self.input_names:
+                    data = inputs[name]
+                    ctx.set_input_shape(name, data.shape)
+                    t = torch.from_numpy(data).cuda(non_blocking=True).contiguous()
+                    d_inputs[name] = t
+                    ctx.set_tensor_address(name, t.data_ptr())
 
-            # 输出（按 context 推断的真实 shape 分配）
-            d_outputs = {}
-            for name in self.output_names:
-                shape = list(ctx.get_tensor_shape(name))
-                for i, s in enumerate(shape):
-                    if s <= 0:
-                        # dynamic 维度：用第一个输入的 batch 维兜底
-                        if i == 0:
-                            shape[i] = list(inputs.values())[0].shape[0]
-                        else:
-                            shape[i] = 300
-                t = torch.zeros(shape, dtype=torch.float32, device="cuda")
-                d_outputs[name] = t
-                ctx.set_tensor_address(name, t.data_ptr())
+                # 输出（按 context 推断的真实 shape 分配）
+                # 动态维度兜底：用输入张量出现过的最大维度值，保证覆盖 encoder seq 维
+                # （alphas/cif_peak 的动态维 = enc_len+1，长音频可达 500+，硬编码 300 会
+                #  导致输出 buffer 不足 → engine 越界写 → CUDA illegal memory access）
+                _batch = list(inputs.values())[0].shape[0]
+                _max_dim = max((max(v.shape) for v in inputs.values()), default=512)
+                _fallback = max(_max_dim + 1, 512)  # +1 覆盖 tail 帧，下限 512
+                d_outputs = {}
+                for name in self.output_names:
+                    shape = list(ctx.get_tensor_shape(name))
+                    for i, s in enumerate(shape):
+                        if s <= 0:
+                            shape[i] = _batch if i == 0 else _fallback
+                    t = torch.zeros(shape, dtype=torch.float32, device="cuda")
+                    d_outputs[name] = t
+                    ctx.set_tensor_address(name, t.data_ptr())
 
-            ctx.execute_async_v3(stream_handle=stream.cuda_stream)
+                ctx.execute_async_v3(stream_handle=stream.cuda_stream)
 
-        # 只等这个 stream 完成，不影响其他 stream
-        stream.synchronize()
+            # 只等这个 stream 完成，不影响其他 stream
+            stream.synchronize()
 
-        results = {}
-        for name, t in d_outputs.items():
-            actual_shape = tuple(ctx.get_tensor_shape(name))
-            if all(s > 0 for s in actual_shape):
-                slices = tuple(slice(0, s) for s in actual_shape)
-                results[name] = t[slices].cpu().numpy()
-            else:
-                results[name] = t.cpu().numpy()
-        return results
+            results = {}
+            for name, t in d_outputs.items():
+                actual_shape = tuple(ctx.get_tensor_shape(name))
+                if all(s > 0 for s in actual_shape):
+                    slices = tuple(slice(0, s) for s in actual_shape)
+                    results[name] = t[slices].cpu().numpy()
+                else:
+                    results[name] = t.cpu().numpy()
+            return results
+        finally:
+            # 归还槽位（异常时也归还，避免池耗尽死锁）
+            self._slot_pool.put(idx)
 
 
 # ============================================================
