@@ -465,13 +465,15 @@ async def asr_recognize(req: ASRRequest):
         #   2) 客户端不传 → 默认词表恒走路径 B（Faiss 保守纠错）
         #      （通用识别多数音频不含默认热词，SeACo 会误纠相似音，
         #        Faiss 三重判定仅在拼音+编辑距离高度吻合时替换，大幅降低误触发）
+        #   两条路径分别受 ENABLE_HOTWORD / ENABLE_FAISS_CORRECTION 开关控制，
+        #   关闭对应开关即跳过该路径（纯通用识别可全关省开销）。
         bias_embeddings = None
         use_faiss_correction = False
 
-        if req.hotwords and asr_engine.has_bias_model:
-            # 路径 A：SeACo 在线增强（客户端主动传热词）
+        if req.hotwords and asr_engine.has_bias_model and settings.ENABLE_HOTWORD:
+            # 路径 A：SeACo 在线增强（客户端主动传热词，且未关闭热词开关）
             bias_embeddings = await _encode_hotwords(req.hotwords)
-        elif not req.hotwords:
+        elif not req.hotwords and settings.ENABLE_FAISS_CORRECTION:
             # 客户端不传：默认词表恒走 Faiss（_determine_route 已固定 route=B）
             default_cache = hotword_manager.cache
             if default_cache is not None:
@@ -676,6 +678,28 @@ def _build_word_timestamps(
     return words
 
 
+def _clamp_words_monotonic(words: list[ASRWord], prev_end_s: float) -> float:
+    """跨 chunk 字级时间戳单调钳制，消除段边界重叠。
+
+    每个 chunk 的字级时间戳在各自 VAD 时间轴独立计算（段内已保证不重叠），
+    但加偏移拼接到全局时间轴后，上一段尾字 end 可能晚于下一段首字 start，
+    产生重叠（如尾字 [72.682,72.742] 与下段首字 [72.682,72.982]）。
+
+    这里按全局顺序逐字钳制：任一字 start 不早于前一字 end；若钳制后 start>end，
+    则把 end 也顶到 start（零时长，避免逆序）。返回本段最后一个字的 end，
+    供下一段继续钳制。
+    """
+    for w in words:
+        s, e = w.timestamp
+        if s < prev_end_s:
+            s = prev_end_s
+        if e < s:
+            e = s
+        w.timestamp = [round(s, 3), round(e, 3)]
+        prev_end_s = e
+    return prev_end_s
+
+
 def _decode_char_list(token_ids: np.ndarray) -> list[str]:
     """token_ids → 有效字符列表（过滤 <blank>/<sos>/<eos>，用 _token_list 逐字取）。"""
     chars = []
@@ -712,20 +736,29 @@ def _build_response(
 
     asr_segments: list[ASRSegment] = []
     full_text_parts: list[str] = []
+    # 全局字级时间戳游标：跨 chunk 单调钳制，消除段边界重叠
+    prev_word_end_s = 0.0
 
     for i, (chunk, (logits, ts_data)) in enumerate(zip(chunks, chunk_results)):
         # 解码 logits → token_ids → 文本（argmax 贪心解码 + tokenizer）
         token_ids = np.argmax(logits, axis=-1).flatten()
         text = tokenizer.decode(token_ids)
-        char_list = _decode_char_list(token_ids)
 
         # 字级时间戳（timestamp head：us_alphas/us_cif_peak → 官方 ts_prediction）
-        # ts_data=None（旧 engine/ORT）时降级为空列表
-        words_pyd = _build_word_timestamps(
-            ts_data=ts_data,
-            char_list=char_list,
-            chunk_start_ms=chunk.effective_start_ms,
-        )
+        # ★仅在 ts_data 存在（ENABLE_WORD_TIMESTAMP=true）时才解码字符列表 + 计算时间戳，
+        #   关闭时间戳时 ts_data 恒为 None，跳过 _decode_char_list 的逐 token 循环，
+        #   避免热路径无谓开销（极限压测下影响吞吐）。
+        words_pyd: list[ASRWord] = []
+        if ts_data is not None:
+            char_list = _decode_char_list(token_ids)
+            words_pyd = _build_word_timestamps(
+                ts_data=ts_data,
+                char_list=char_list,
+                chunk_start_ms=chunk.effective_start_ms,
+            )
+            # 跨 chunk 边界单调钳制（段内官方算法已不重叠，仅需处理拼接处）
+            if words_pyd:
+                prev_word_end_s = _clamp_words_monotonic(words_pyd, prev_word_end_s)
 
         # 路径 B：Faiss 后处理纠错（仅纠正文本，不改字级时间戳）
         if corrector is not None and text:

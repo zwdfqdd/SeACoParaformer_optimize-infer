@@ -226,13 +226,16 @@ class HotwordManager:
         bias_embed = None
         if route == "A":
             bias_embed = self._pre_encode(valid)
-        else:
+        elif settings.ENABLE_FAISS_CORRECTION:
             # route=B：构建 Faiss 纠错索引（懒导入，失败不阻塞）
+            # ENABLE_FAISS_CORRECTION=false 时跳过构建，省内存与启动耗时
             try:
                 from src.hotword_faiss import faiss_corrector
                 faiss_corrector.build(list(valid), version)
             except Exception as e:
                 logger.warning(f"Faiss 索引构建跳过: {e}")
+        else:
+            logger.info("ENABLE_FAISS_CORRECTION=false，跳过默认词表 Faiss 索引构建")
 
         return HotwordCache(
             version=version,

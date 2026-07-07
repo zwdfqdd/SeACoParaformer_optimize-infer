@@ -373,6 +373,8 @@ docker-compose up -d
 | VAD_SESSION_POOL_SIZE | 4 | Silero VAD ORT session 池大小，round-robin 分配；VAD 单 session 线程数硬编码为 1，靠多 session 实现并行 |
 | GPU_STREAM_POOL_SIZE | 4 | TRT 多 stream 多 execution_context 池；作用于 encoder/cif/decoder（启用时含 timestamp）；bias_encoder 固定单 context（低频调用不池化） |
 | ENABLE_WORD_TIMESTAMP | false | 字级时间戳（asr[].words）；true 启用第 5 段 timestamp engine，按 GPU_STREAM_POOL_SIZE 池化，吞吐降约 30% |
+| ENABLE_HOTWORD | true | 路径 A（SeACo 在线热词）总开关；false 时忽略客户端传入的 hotwords，不做 SeACo 增强 |
+| ENABLE_FAISS_CORRECTION | true | 路径 B（默认词表 Faiss 纠错）总开关；false 时不构建/不运行 Faiss 后处理，通用识别零后处理开销 |
 | OMP_NUM_THREADS | 1 | ★必须保持 1，防 libgomp 崩溃（run.sh 已固化） |
 | MKL_NUM_THREADS | 1 | 同上 |
 | OPENBLAS_NUM_THREADS | 1 | 同上 |

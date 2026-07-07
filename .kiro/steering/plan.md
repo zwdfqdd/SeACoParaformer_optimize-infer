@@ -97,6 +97,11 @@ vad.py Silero VAD ONNX 推理：
     早期"默认词表 ≤256 走 A"在通用识别场景导致相似音被误纠
     （如"神棚"→"沈鹏"），故默认词表统一走保守的 Faiss。
 
+模块开关（按需裁剪推理路径）：
+    - ENABLE_HOTWORD（默认 true）：路径 A 总开关，false 忽略客户端 hotwords
+    - ENABLE_FAISS_CORRECTION（默认 true）：路径 B 总开关，false 不构建/不运行 Faiss
+    - 纯通用识别追求极限吞吐可两者全关；也可单独关一路按需组合
+
 路径 A（SeACo）：
     - MAX_HOTWORD_NUM=256（硬上限，engine bias profile max=257 含哨兵）
     - OPT_HOTWORD_NUM=64（TRT profile opt point）

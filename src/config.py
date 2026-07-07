@@ -89,6 +89,20 @@ class Settings:
     # 多 worker（WORKERS>1）时务必显式设小，避免每 worker 各开满核导致线程超额订阅。
     CPU_THREAD_POOL_SIZE: int = int(os.getenv("CPU_THREAD_POOL_SIZE", "0"))
 
+    # ============================================================
+    # 热词模块开关（按需裁剪推理路径，纯通用识别可全关省开销）
+    # ============================================================
+    # 路径 A（SeACo 在线热词）开关。默认 true。
+    #   true：客户端传入 hotwords 时走 SeACo 实时编码 bias_embed 增强；
+    #   false：忽略客户端 hotwords，不做 SeACo 增强（bias_encoder 仍可加载但不调用）。
+    ENABLE_HOTWORD: bool = os.getenv("ENABLE_HOTWORD", "true").lower() in ("1", "true", "yes")
+    # 路径 B（默认词表 Faiss 后处理纠错）开关。默认 true。
+    #   true：客户端不传热词时，用默认词表 Faiss 三重判定保守纠错；
+    #   false：不构建/不运行 Faiss 索引，通用识别零后处理开销。
+    ENABLE_FAISS_CORRECTION: bool = os.getenv("ENABLE_FAISS_CORRECTION", "true").lower() in (
+        "1", "true", "yes"
+    )
+
     # 字级时间戳开关。默认 false（关闭，最大吞吐）。
     #   true：加载独立 timestamp engine（第 5 段），响应 asr[].words 返回字级时间戳。
     #         upsample_cnn + blstm 计算量较大，实测吞吐下降约 30%（2800→2000 req/s）。
