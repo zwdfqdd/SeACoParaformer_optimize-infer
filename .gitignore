@@ -55,3 +55,9 @@ Thumbs.db
 report_*.json
 tmp_*/
 tmp_trt_analyze*/
+
+# 测试音视频样本（体积大，不纳入版本控制）
+test_data/*.mp4
+test_data/*.mp3
+test_data/*.m4a
+
