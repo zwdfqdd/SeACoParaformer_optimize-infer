@@ -32,6 +32,8 @@ services:
       - VAD_SESSION_POOL_SIZE=${VAD_SESSION_POOL_SIZE:-4}
       # TRT engine 多 stream 多 execution_context 池（weights 共享，activation 独立）
       - GPU_STREAM_POOL_SIZE=${GPU_STREAM_POOL_SIZE:-4}
+      # 字级时间戳（asr[].words）：true 启用第 5 段 timestamp engine，吞吐降约 30%
+      - ENABLE_WORD_TIMESTAMP=${ENABLE_WORD_TIMESTAMP:-false}
       # OMP/BLAS 单线程：★必须，Silero VAD 是串行 LSTM 无 OMP 收益，多线程反致 libgomp 崩溃
       - OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
       - MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}

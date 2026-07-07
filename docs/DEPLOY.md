@@ -417,9 +417,39 @@ docker-compose logs -f seaco-asr
 - 什么时候可以尝试 >1：非 VAD 场景、CPU 未跑满、有大矩阵密集计算
 - 相关：`MKL_NUM_THREADS` `OPENBLAS_NUM_THREADS` 一并设为 1（若上层库走不同 BLAS）
 
+#### `ENABLE_WORD_TIMESTAMP`（默认 false）
+- 作用：是否返回字级时间戳（响应 `asr[].words`，每字带 [start_s, end_s]）
+- 实现：独立第 5 段 timestamp engine（upsample CIF timestamp head + blstm），
+  对齐 FunASR 官方 `ts_prediction_lfr6_standard`，精度约 20ms
+- **性能影响**：启用后吞吐下降约 30%（实测 2800 → 2000 req/s），因 upsample+blstm
+  对每个请求额外一次 GPU 推理
+- 建议：
+  - **需要字幕/对齐/精确定位** → true（接受吞吐下降）
+  - **纯转写、追求吞吐** → false（默认，words 为空）
+- 启用前提：`ENABLE_WORD_TIMESTAMP=true` 时 prepare_model 会额外构建 timestamp engine
+  （首次启动多几分钟），engine 命名 `{gpu}_timestamp_fp16.engine`
+
+#### `CPU_THREAD_POOL_SIZE` / `ORT_INTRA_OP_THREADS` / `ORT_INTER_OP_THREADS`（CPU 侧线程）
+三个参数职责与**生效后端**不同，务必区分：
+
+| 参数 | 作用对象 | 生效后端 | 说明 |
+|------|---------|---------|------|
+| `CPU_THREAD_POOL_SIZE` | Stage1 VAD + Stage2 特征提取的线程池 | ★所有后端（含 TRT/GPU） | 0=自动取全核；多 worker 务必设小，否则每 worker 各开满核线程超额订阅 |
+| `ORT_INTRA_OP_THREADS` | 主 ASR 模型单 session 算子并行 | **仅 CPU 后端**（onnx_fp32/onnx_int8） | TRT/GPU 部署完全不生效（主 ASR 在 GPU 推理） |
+| `ORT_INTER_OP_THREADS` | 主 ASR 模型 session 间并行 | **仅 CPU 后端** | 同上 |
+
+- **重要**：`ORT_INTRA/INTER_OP_THREADS` 对 **VAD 无效**——Silero VAD 是串行 LSTM，
+  `vad.py` 中 session 线程数硬编码为 `intra=inter=1`（单次 run 仅处理 (1,576) 极小张量，
+  多线程无收益且徒增调度开销），VAD 的并行靠 `VAD_SESSION_POOL_SIZE` 多 session round-robin。
+- **GPU/TRT 网格压测结论**：能影响 TRT 吞吐的 CPU 侧参数只有 `CPU_THREAD_POOL_SIZE` 与
+  `VAD_SESSION_POOL_SIZE`；把 `ORT_INTRA/INTER_OP_THREADS` 列为网格变量属无效项（结果全是噪声）。
+- **`CPU_THREAD_POOL_SIZE` 取值建议**（256 核机器，WORKERS=10）：总线程 ≈ WORKERS × 值，
+  不超订分界 ≈ 256/10 ≈ 25/worker；推荐扫描 `{8, 16, 24, 32}`，勿到 64（10×64=640 严重超订）。
+
 #### `VAD_SESSION_POOL_SIZE`（推荐 4，可调 2-8）
 - 作用：Silero VAD ORT session 池大小，多请求 round-robin 分配
 - 影响范围：仅 Stage1 VAD
+- **单 session 线程数硬编码 intra=inter=1**（见 vad.py），并行度完全由本 pool 提供
 - 建议值：**4**（默认）
 - 调优场景：
   - 低并发（<10）：可降到 2 省内存

@@ -1,11 +1,13 @@
 """
 SeACo-Paraformer 分段 ONNX 导出脚本
 
-基于独立的 seaco_paraformer 包（不依赖 FunASR 运行时），导出 4 个子模型：
+基于独立的 seaco_paraformer 包（不依赖 FunASR 运行时），导出 5 个子模型：
 1. encoder.onnx       — Encoder（speech → encoder_out）
 2. cif.onnx           — CIF Predictor（encoder_out + mask → acoustic_embeds, token_num）
 3. decoder.onnx       — Decoder + SeACo（acoustic_embeds + encoder_out + bias_embed → logits）
 4. bias_encoder.onnx  — Bias Encoder（hotword_ids → hw_embed）
+5. timestamp.onnx     — 字级时间戳（encoder_out + mask + token_num → us_alphas, us_cif_peak）
+                        按需启用（ENABLE_WORD_TIMESTAMP），不影响主链路吞吐
 
 用法：
     python scripts/export_onnx_split.py --output-dir ./models/asr/split
@@ -51,6 +53,9 @@ class CIFWrapper(nn.Module):
     替换原始 cif（含 for 循环）为 cif_v1_export（向量化），保持 TRT 兼容。
     输入：encoder_out (B, T, D) + mask (B, 1, T)
     输出：acoustic_embeds, token_num, alphas, cif_peak
+
+    注：字级时间戳（upsample+blstm）已拆分为独立的 TimestampWrapper（timestamp.onnx），
+        通过 ENABLE_WORD_TIMESTAMP 开关按需加载，避免拖累主链路吞吐。
     """
 
     def __init__(self, predictor):
@@ -97,6 +102,32 @@ class CIFWrapper(nn.Module):
         acoustic_embeds, cif_peak = cif_v1_export(hidden, alphas, pred.threshold)
 
         return acoustic_embeds, token_num, alphas, cif_peak
+
+
+# ============================================================
+# Timestamp Wrapper（独立第 5 段，字级时间戳，按需启用）
+# ============================================================
+class TimestampWrapper(nn.Module):
+    """
+    字级时间戳导出 wrapper（独立 engine，ENABLE_WORD_TIMESTAMP 控制加载）。
+
+    upsample_cnn + blstm + cif_output2 计算量较大，并入 CIF 会拖累吞吐
+    （实测 2800→2000 req/s）。拆为独立 engine 后不启用时零成本。
+
+    输入：encoder_out (B, T, D) + mask (B, 1, T) + token_num (B,)
+    输出：us_alphas (B, T*up)、us_cif_peak (B, T*up)
+    复用 predictor.get_upsample_timestamp（与 PT 验证同一份代码）。
+    """
+
+    def __init__(self, predictor):
+        super().__init__()
+        self.predictor = predictor
+
+    def forward(self, encoder_out: torch.Tensor, mask: torch.Tensor,
+                token_num: torch.Tensor):
+        return self.predictor.get_upsample_timestamp(
+            encoder_out, mask=mask, token_num=torch.round(token_num)
+        )
 
 
 # ============================================================
@@ -282,6 +313,41 @@ def export_cif(model, output_path: str, opset: int = 17):
     print(f"  输出: {output_path} ({size_mb:.1f}MB)")
 
 
+def export_timestamp(model, output_path: str, opset: int = 17):
+    """
+    导出字级时间戳独立 engine（第 5 段，按需启用）。
+    upsample_cnn + blstm + cif_output2 → us_alphas / us_cif_peak。
+    """
+    print("\n[5] 导出 Timestamp（字级时间戳，独立 engine）...")
+    ts_wrapper = TimestampWrapper(model.predictor)
+    ts_wrapper.eval()
+
+    with torch.no_grad():
+        dummy_speech = torch.randn(1, 134, 560)
+        dummy_lengths = torch.tensor([134], dtype=torch.long)
+        enc_out, _, _ = model.encoder(dummy_speech, dummy_lengths)
+    mask = torch.ones(1, 1, enc_out.shape[1])
+    token_num = torch.tensor([30.0], dtype=torch.float32)
+
+    torch.onnx.export(
+        ts_wrapper,
+        (enc_out, mask, token_num),
+        output_path,
+        opset_version=opset,
+        input_names=["encoder_out", "mask", "token_num"],
+        output_names=["us_alphas", "us_cif_peak"],
+        dynamic_axes={
+            "encoder_out": {0: "batch", 1: "enc_len"},
+            "mask": {0: "batch", 2: "enc_len"},
+            "token_num": {0: "batch"},
+            "us_alphas": {0: "batch", 1: "enc_len_up"},
+            "us_cif_peak": {0: "batch", 1: "enc_len_up"},
+        },
+    )
+    size_mb = Path(output_path).stat().st_size / (1024 * 1024)
+    print(f"  输出: {output_path} ({size_mb:.1f}MB)")
+
+
 def export_decoder(model, output_path: str, opset: int = 17):
     """导出 Decoder + SeACo。"""
     print("\n[3/4] 导出 Decoder + SeACo...")
@@ -386,6 +452,8 @@ def main():
         export_decoder(model, str(output_dir / "decoder.onnx"), args.opset)
     if "bias_encoder" not in args.skip:
         export_bias_encoder(model, str(output_dir / "bias_encoder.onnx"), args.opset)
+    if "timestamp" not in args.skip:
+        export_timestamp(model, str(output_dir / "timestamp.onnx"), args.opset)
 
     print("\n" + "=" * 60)
     print("导出完成！")

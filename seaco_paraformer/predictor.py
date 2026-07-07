@@ -12,6 +12,30 @@ from .layers import LayerNorm
 from .utils import make_pad_mask
 
 
+def _cif_wo_hidden_v1(alphas: torch.Tensor, threshold: float) -> torch.Tensor:
+    """
+    向量化 cif_wo_hidden（无 for 循环，TRT/ONNX 兼容）。
+
+    对齐 FunASR cif_wo_hidden 的 fire 检测语义：
+        原始逐帧 integrate += alpha，integrate>=threshold 时 fire 并 integrate-=threshold。
+        fire 帧 = 累积和跨过 threshold 整数倍边界的帧。
+    向量化：cum = cumsum(alphas)，floor(cum/thr) 相比上一帧增加 → 该帧 fire。
+        输出 peak：fire 帧置 1.0（>=1-1e-4 命中官方 ts_prediction 的 where 判定），
+        非 fire 帧置该帧在当前累积周期内的余数（不影响 where 判定）。
+
+    返回：(B, T) peak 张量，fire 帧值 >= 1.0
+    """
+    cum = torch.cumsum(alphas, dim=1)                       # (B, T)
+    floor_cum = torch.floor(cum / threshold)                # (B, T)
+    prev = torch.zeros_like(floor_cum)
+    prev[:, 1:] = floor_cum[:, :-1]
+    fired = (floor_cum > prev).to(alphas.dtype)             # (B, T) 1=fire
+    # fire 帧置 1.0（命中 peaks>=1-1e-4）；非 fire 帧置周期内余数（<1，不命中）
+    frac = cum - floor_cum * threshold                      # (B, T) 当前周期余数 ∈ [0,thr)
+    peak = fired * 1.0 + (1.0 - fired) * frac
+    return peak
+
+
 def cif(hidden, alphas, threshold):
     """原始 CIF 实现（含 for 循环，PT 推理用）。
 
@@ -246,6 +270,52 @@ class CifPredictorV3(nn.Module):
             token_num_int = torch.max(token_num).type(torch.int32).item()
             acoustic_embeds = acoustic_embeds[:, :token_num_int, :]
         return acoustic_embeds, token_num, alphas, cif_peak, token_num2
+
+    def get_upsample_timestamp(self, hidden, mask=None, token_num=None):
+        """
+        时间戳预测（对齐 FunASR CifPredictorV3Export.get_upsample_timestmap）。
+
+        用 upsample 分支（cnn + blstm + cif_output2）生成高分辨率 alphas2，
+        用 main head 的 token_num 归一化后，cif_wo_hidden 得 fire 峰值 us_cif_peak。
+
+        Args:
+            hidden: (B, T, D) encoder_out
+            mask: (B, 1, T) 或 None
+            token_num: (B,) main head 预测的 token 数（用于归一化 alphas2）
+
+        Returns:
+            us_alphas: (B, T*upsample_times) 上采样 CIF 权重
+            us_cif_peak: (B, T*upsample_times) fire 峰值（累积值，>=threshold 处即 fire）
+        """
+        context = hidden.transpose(1, 2)  # (B, D, T)
+        output2 = self.upsample_cnn(context)          # (B, D, T*up)
+        output2 = output2.transpose(1, 2)             # (B, T*up, D)
+        output2, _ = self.blstm(output2)              # (B, T*up, 2D)
+        alphas2 = torch.sigmoid(self.cif_output2(output2))
+        alphas2 = torch.nn.functional.relu(
+            alphas2 * self.smooth_factor2 - self.noise_threshold2
+        )
+
+        if mask is not None:
+            # mask 上采样 upsample_times 倍，匹配 alphas2 长度
+            mask2 = (
+                mask.repeat(1, self.upsample_times, 1)
+                .transpose(-1, -2)
+                .reshape(alphas2.shape[0], -1)
+            )
+            mask2 = mask2.unsqueeze(-1)
+            alphas2 = alphas2 * mask2
+        alphas2 = alphas2.squeeze(-1)                 # (B, T*up)
+
+        # 用 main head token_num 归一化（保证 alphas2 累积和 = token 数）
+        _token_num = alphas2.sum(-1)
+        if token_num is not None:
+            scale = (token_num / _token_num.clamp(min=1e-6))[:, None]
+            alphas2 = alphas2 * scale
+
+        us_alphas = alphas2
+        us_cif_peak = _cif_wo_hidden_v1(us_alphas, self.threshold - 1e-4)
+        return us_alphas, us_cif_peak
 
     def tail_process_fn(self, hidden, alphas, token_num=None, mask=None):
         b, t, d = hidden.size()

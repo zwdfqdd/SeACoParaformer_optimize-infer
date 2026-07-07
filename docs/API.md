@@ -86,9 +86,13 @@
 | asr[].words[].timestamp | [float, float] | [起始秒, 结束秒]，字级时间戳，粒度约 60ms |
 
 **字级时间戳说明**：
-- 由 CIF alphas 输出反推每个 token 的 fire 位置，误差 <60ms（一个 encoder 帧的量子）
-- 需要 CIF engine 输出 `alphas`（重导出 ONNX + 重转 engine 后生效）
-- 旧版 engine 或 ORT 整体模型（onnx_fp32/onnx_int8）不支持字级时间戳，`words: []` 空数组
+- 由独立 timestamp engine（第 5 段，upsample CIF timestamp head）计算，对齐 FunASR
+  官方 `ts_prediction_lfr6_standard`：相邻 fire 中点划界（不重叠）+ 超长截断 + 静音扣除
+- 精度约 20ms（upsample 3x），单字时长稳定，无重叠、无超长
+- **需要开启 `ENABLE_WORD_TIMESTAMP=true`**（默认 false）：
+  - 启用后加载第 5 段 timestamp engine，吞吐下降约 30%（含 blstm 计算）
+  - 关闭时 `words: []` 空数组，主链路吞吐不受影响
+- ORT 整体模型（onnx_fp32/onnx_int8）不支持字级时间戳，`words: []`
 
 ### 失败响应
 
@@ -135,13 +139,15 @@
 
 ## 热词格式说明
 
-热词通过 `hotwords` 字段传入（可选）。服务按**生效词表大小**三路分流，切换点 = 256：
+热词通过 `hotwords` 字段传入（可选）。服务按**是否客户端主动传热词**两路分流（防通用识别误触发）：
 
 | 条件 | 路径 | 处理方式 |
 |---|---|---|
 | 客户端传 `hotwords` | 路径 A：SeACo 在线热词 | 截断 Top256 → bias_encoder 编码 → ASF top-50 注入 decoder → 热词增强识别 |
-| 不传，默认词表 ≤256 | 路径 A：SeACo（默认表） | 用启动预编码缓存的 bias_embed，零额外成本 |
-| 不传，默认词表 >256 | 路径 B：Faiss 后处理纠错 | 普通 ASR → 拼音滑窗检索 → 三重联合判定 → 纠错 |
+| 客户端不传（默认词表） | 路径 B：Faiss 后处理纠错 | 普通 ASR → 拼音滑窗检索 → 三重联合判定 → 纠错 |
+
+> 默认词表恒走 Faiss：通用识别多数音频不含默认热词，SeACo 会把声学相似普通词误纠成
+> 热词（如"神棚"→"沈鹏"），Faiss 三重判定仅在高度吻合时替换，大幅降低误触发。
 
 ### 路径 A：SeACo 在线热词
 
@@ -159,7 +165,7 @@
 }
 ```
 
-### 路径 B：默认大词库纠错（未传热词且默认词表 >256）
+### 路径 B：默认词表纠错（客户端未传热词时恒走此路径）
 
 - 服务端维护大词库（`models/asr/hotwords.txt`，规模 1 万~20 万）
 - 普通 ASR 输出后，按拼音相似度 + 编辑距离做后处理纠错
@@ -247,7 +253,7 @@
 | version | int | 更新后的词表版本号 |
 | md5 | string | 词表内容哈希 |
 | count | int | 有效词条数（去重 + 剔除 OOV 后） |
-| route | string | 生效路径，A（SeACo，≤256）或 B（Faiss，>256） |
+| route | string | 默认词表生效路径，恒为 B（Faiss）；路径 A 仅客户端传热词时使用 |
 | dropped_oov | string[] | 被剔除的无法编码词 |
 
 **校验失败响应（HTTP 400）：**

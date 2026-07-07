@@ -82,7 +82,13 @@ class SileroVAD:
     @staticmethod
     def _new_session(model_path: str) -> ort.InferenceSession:
         sess_options = ort.SessionOptions()
-        # 单 session 内单线程即可（多 session 之间并行，避免线程超额订阅）
+        # ★硬编码单线程，刻意不读 ORT_INTRA_OP_THREADS / ORT_INTER_OP_THREADS：
+        #   Silero VAD 是串行 LSTM，单次 run 仅处理 (1,576) 极小张量，算子内无可并行的
+        #   大矩阵；30s 音频要 ~937 次 session.run，intra>1 只会反复唤醒/同步线程组，
+        #   开销超过计算本身。并行度由 VAD_SESSION_POOL_SIZE 多 session round-robin 提供，
+        #   而非单 session 内多线程。若单 session 再开多线程会与 session 池形成
+        #   「池 × 每 session 线程」双重乘积，触发线程超额订阅（libgomp 崩溃）。
+        #   故这两个环境变量对 VAD 无效，仅作用于主 ASR 的 CPU 后端（见 asr_engine.py）。
         sess_options.inter_op_num_threads = 1
         sess_options.intra_op_num_threads = 1
         # 禁用 arena/mem_pattern：ORT 内部 arena 分配在高并发下有已知竞态（libgomp

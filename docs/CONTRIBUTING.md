@@ -87,7 +87,7 @@ python scripts/evaluate_cer.py --audio-dir calib_data/audio_data --csv report_ce
 
 ## v2 TRT 分段模型架构
 
-模型拆分为四个子模型独立转换（含热词支持）：
+模型拆分为 4 段主模型 + 1 段可选（含热词与字级时间戳支持）：
 
 | 子模型 | 功能 | 推荐精度 | 说明 |
 |--------|------|----------|------|
@@ -95,6 +95,11 @@ python scripts/evaluate_cer.py --audio-dir calib_data/audio_data --csv report_ce
 | cif.onnx | CIF 预测器 | fp16 | 向量化实现（cumsum+bmm），TRT 兼容 |
 | decoder.onnx | 解码器+SeACo | fp16 | 含 ASF + SeACo decoder + 热词合并 |
 | bias_encoder.onnx | 热词编码器 | fp16 | LSTM 编码热词 token IDs |
+| timestamp.onnx | 字级时间戳 | fp16 | upsample CIF head + blstm，ENABLE_WORD_TIMESTAMP 开关，默认不加载 |
+
+> timestamp 段独立设计原因：upsample+blstm 计算量大，并入 CIF 会拖累吞吐
+> （实测 2800→2000 req/s）。拆为独立 engine + 环境开关，不启用时零成本。
+> 字级时间戳算法对齐 FunASR ts_prediction_lfr6_standard（见 src/timestamp.py）。
 
 > 历史问题：早期 encoder/decoder 全 fp16 会精度崩溃（残差 Add 溢出 inf）。
 > 现已通过 **opset 17 原生 LayerNormalization + encoder 残差 Add clamp 60000**

@@ -216,27 +216,27 @@ python scripts/inspect_engine_precision.py --engine models/asr/trt/2080_ti_encod
 
 ---
 
-## 热词管理（三路分流 + 运行时热更新）
+## 热词管理（两路分流 + 运行时热更新）
 
-路由按**生效词表大小**分流，切换点 = `MAX_HOTWORD_NUM` = 256（SeACo 精准增强与 Faiss 大库保守纠错的天然切换点）：
+路由按**是否客户端主动传热词**分流（防通用识别误触发）：
 
 ```
 请求到达
 ├─ 客户端传了 hotwords？
 │   ├─ 是 → 截断 Top256 → 路径 A：SeACo 在线热词（每请求实时编码 bias_embed）
-│   └─ 否 → 看服务端默认词表大小
-│            ├─ ≤256 → 路径 A：SeACo（用启动预编码缓存的 bias_embed，零额外成本）
-│            └─ >256 → 路径 B：普通 ASR + Faiss 后处理纠错
+│   │        （客户端主动传 = 明确知道音频含这些词，激进增强合理）
+│   └─ 否 → 默认词表恒走路径 B：普通 ASR + Faiss 后处理纠错
+│            （通用识别多数音频不含默认热词，SeACo 会误纠相似音，Faiss 三重判定更稳）
 ```
 
 | 路径 | 触发 | 处理 | bias_embed 来源 |
 |---|---|---|---|
 | A-客户端 | 传 hotwords | SeACo 模型内增强 | 每请求实时编码（含 Top256 截断） |
-| A-默认 | 不传 且 默认表 ≤256 | SeACo 模型内增强 | 启动预编码缓存，复用（省 LSTM） |
-| B-默认 | 不传 且 默认表 >256 | 普通 ASR + Faiss 纠错 | 不用（bias=全零） |
+| B-默认 | 不传（默认词表） | 普通 ASR + Faiss 纠错 | 不用（bias=全零） |
 
-> 设计依据：词表越小越适合 SeACo（精准、强修正、GPU 成本几乎不变）；
-> 词表越大 SeACo 误触发风险越高，Faiss「检索命中 + 三重阈值才替换」更适合大规模词库。
+> 设计依据：客户端主动传热词 = 明确该音频含这些词（垂直场景），用 SeACo 激进增强；
+> 默认词表面向通用识别，绝大多数音频不含热词，SeACo 会把声学相似的普通词误纠成热词
+> （如"神棚"→"沈鹏"），故默认词表恒走 Faiss——「检索命中 + 三重阈值才替换」的保守策略。
 
 ### 路径 A：SeACo 在线热词
 
@@ -247,13 +247,14 @@ python scripts/inspect_engine_precision.py --engine models/asr/trt/2080_ti_encod
 | ASF 过滤 NFILTER | 50 |
 | 编码 | tokenizer（中文逐字 / 英文查 seg_dict BPE）+ `[sos]` 哨兵 → bias_encoder |
 | 显存 | bias 维度 ≤256，engine profile max 固定不重建 |
+| 触发 | 仅客户端主动传 `hotwords` 时（默认词表不再走此路径） |
 | 默认词表优化 | 静态，启动预编码 bias_embed 缓存，命中默认路径直接复用 |
 
 ### 路径 B：Faiss 大词库后处理纠错
 
 | 项 | 选择 |
 |---|---|
-| 触发 | 不传热词 且 默认词表 >256 |
+| 触发 | 客户端不传热词（默认词表恒走此路径，不论大小） |
 | ASR | 普通识别（SeACo bias=全零，无热词增强） |
 | 热词表示 | 拼音向量 + 编辑距离辅助 |
 | Faiss 索引 | `IndexFlatIP`（未来百万级可换 `IVFFlat`） |
@@ -287,7 +288,7 @@ models/asr/.hotwords.lock        跨进程互斥锁文件
 3. 本 worker 立即重建缓存 + 原子切换引用
 4. 其他 worker 后台轮询 version（`HOTWORD_POLL_INTERVAL` 默认 5s）→ 发现变更各自重建 → 数秒内全局收敛（最终一致）
 
-校验链（任一失败 → 丢弃新表，保留旧表）：UTF-8/去空白/去重/非空 → 数量(≤256路径A/>256路径B) → tokenizer 可编码(剔 OOV) → 试跑 bias_encoder 验 nan/inf。
+校验链（任一失败 → 丢弃新表，保留旧表）：UTF-8/去空白/去重/非空 → tokenizer 可编码(剔 OOV) → Faiss 索引构建（默认词表恒走路径 B）。
 
 零中断原理：缓存是只读内存对象，后台构建新对象后用一行引用赋值切换（GIL 原子），在途请求用旧引用跑完，旧对象引用归零自动 GC。
 
@@ -319,9 +320,9 @@ models/asr/.hotwords.lock        跨进程互斥锁文件
 
 ### 核心优势
 
-1. 显存上界恒定：路径 A ≤256，路径 B =0，与词库规模解耦
+1. 显存上界恒定：路径 A（客户端热词）≤256，路径 B（默认词表）=0，与词库规模解耦
 2. engine 永不重建：profile max=256 固定
-3. 小词表更快更准：默认 ≤256 走 SeACo（预编码缓存零成本），省掉 Faiss CPU 流水线
+3. 通用识别防误触发：默认词表恒走 Faiss 三重判定，避免 SeACo 把相似音误纠成热词
 4. 大词库平滑扩展：`IndexFlatIP` → 未来百万级换 `IVFFlat`
 5. 运行时热更新：多 worker 文件轮询收敛，零中断、可校验、可回滚
 6. 职责分离：在线/小词表走模型，离线大词库走检索纠错
@@ -366,8 +367,12 @@ docker-compose up -d
 | MAX_AUDIO_DURATION_MS | 7200000 | 音频最大时长（ms），超出返回 1005；默认 2 小时，0=不限 |
 | ACQUIRE_TIMEOUT | 5 | 过载并发等待超时（秒），超时返回 1007；0=无限等待 |
 | MODEL_PRECISION | auto | 模型精度（见下表） |
-| VAD_SESSION_POOL_SIZE | 4 | Silero VAD ORT session 池大小，round-robin 分配 |
-| GPU_STREAM_POOL_SIZE | 4 | TRT engine 多 stream 多 execution_context 池 |
+| CPU_THREAD_POOL_SIZE | 0(自动全核) | CPU 流水线线程池（Stage1 VAD + Stage2 特征提取）；★对所有后端生效；多 worker 务必设小 |
+| ORT_INTRA_OP_THREADS | 0(自动全核) | 主 ASR 单 session 算子并行线程数；**仅 CPU 后端（onnx_fp32/onnx_int8）生效**，TRT/GPU 与 VAD 均不生效 |
+| ORT_INTER_OP_THREADS | 1 | 主 ASR session 间并行线程数；**仅 CPU 后端生效**，同上 |
+| VAD_SESSION_POOL_SIZE | 4 | Silero VAD ORT session 池大小，round-robin 分配；VAD 单 session 线程数硬编码为 1，靠多 session 实现并行 |
+| GPU_STREAM_POOL_SIZE | 4 | TRT 多 stream 多 execution_context 池；作用于 encoder/cif/decoder（启用时含 timestamp）；bias_encoder 固定单 context（低频调用不池化） |
+| ENABLE_WORD_TIMESTAMP | false | 字级时间戳（asr[].words）；true 启用第 5 段 timestamp engine，按 GPU_STREAM_POOL_SIZE 池化，吞吐降约 30% |
 | OMP_NUM_THREADS | 1 | ★必须保持 1，防 libgomp 崩溃（run.sh 已固化） |
 | MKL_NUM_THREADS | 1 | 同上 |
 | OPENBLAS_NUM_THREADS | 1 | 同上 |

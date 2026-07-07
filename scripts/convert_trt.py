@@ -166,7 +166,7 @@ def build_engine(
     #   - 分段模型（encoder/cif/decoder/bias）：强制由 config 动态生成
     #     （单一数据源，与 scheduler bucket/batch + 热词维度严格一致，杜绝硬编码漂移）
     #   - 完整模型（asr）：用 ASR_PROFILES
-    if profile_type in ("encoder", "cif", "decoder", "bias"):
+    if profile_type in ("encoder", "cif", "decoder", "bias", "timestamp"):
         if _Settings is None:
             raise RuntimeError(
                 "无法导入 src.config.Settings，分段 profile 必须由 config 生成。"
@@ -255,7 +255,7 @@ def main():
     parser.add_argument("--input", required=True, help="ONNX 模型路径")
     parser.add_argument("--output", default=None, help="输出 engine 路径（默认自动命名）")
     parser.add_argument("--precision", default="fp32", choices=["fp32", "fp16", "int8"], help="推理精度（默认 fp32）")
-    parser.add_argument("--profile", default="asr", choices=["asr", "encoder", "cif", "decoder", "bias"], help="shape profile 类型")
+    parser.add_argument("--profile", default="asr", choices=["asr", "encoder", "cif", "decoder", "bias", "timestamp"], help="shape profile 类型")
     args = parser.parse_args()
 
     if not Path(args.input).exists():

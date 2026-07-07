@@ -70,10 +70,18 @@ class Settings:
     # 模型精度（见文件头精度矩阵）
     MODEL_PRECISION: str = os.getenv("MODEL_PRECISION", "auto")
 
-    # CPU 推理线程数（仅 onnx_int8/onnx_fp32 走 CPU 时生效）
+    # CPU 推理线程数。
     #   ORT_INTRA_OP_THREADS：单个推理 session 内算子并行线程数（0=自动取 cpu_count）
     #   ORT_INTER_OP_THREADS：session 间算子并行线程数（默认 1）
-    # 高并发场景务必显式设小（如 总核数 / 预期并发），避免线程超额订阅导致越并发越慢。
+    #
+    # ★应用范围（重要）：仅作用于「主 ASR 模型走 CPU（onnx_fp32 / onnx_int8）」时，
+    #   见 asr_engine.py 的 device=="cpu" 分支。以下场景这两个参数完全不生效：
+    #     - TRT 后端（trt_*）：主 ASR 在 GPU 上推理，不经过 ORT CPU session；
+    #     - Silero VAD：session 线程数在 vad.py 中硬编码 intra=inter=1
+    #       （VAD 是串行 LSTM，单次 run 仅处理 (1,576) 极小张量，多线程无收益且徒增
+    #        调度开销；并行度由 VAD_SESSION_POOL_SIZE 多 session round-robin 提供）。
+    #   因此在 GPU/TRT 部署下调这两个参数无效，网格压测请勿将其列为变量。
+    # 高并发（CPU 部署）务必显式设小（如 总核数 / 预期并发），避免线程超额订阅导致越并发越慢。
     ORT_INTRA_OP_THREADS: int = int(os.getenv("ORT_INTRA_OP_THREADS", "0"))
     ORT_INTER_OP_THREADS: int = int(os.getenv("ORT_INTER_OP_THREADS", "1"))
 
@@ -81,12 +89,36 @@ class Settings:
     # 多 worker（WORKERS>1）时务必显式设小，避免每 worker 各开满核导致线程超额订阅。
     CPU_THREAD_POOL_SIZE: int = int(os.getenv("CPU_THREAD_POOL_SIZE", "0"))
 
+    # 字级时间戳开关。默认 false（关闭，最大吞吐）。
+    #   true：加载独立 timestamp engine（第 5 段），响应 asr[].words 返回字级时间戳。
+    #         upsample_cnn + blstm 计算量较大，实测吞吐下降约 30%（2800→2000 req/s）。
+    #   false：不加载/不运行 timestamp engine，words 为空数组，吞吐不受影响。
+    ENABLE_WORD_TIMESTAMP: bool = os.getenv("ENABLE_WORD_TIMESTAMP", "false").lower() in (
+        "1", "true", "yes"
+    )
+    # 字级时间戳 upsample 倍数（对齐模型 CifPredictorV3.upsample_times，本模型为 3）。
+    # TIME_RATE = 10 * LFR_N(6) / 1000 / upsample_times，决定字级时间戳粒度（3 → 20ms）。
+    # 必须与导出 timestamp engine 时的 upsample_times 一致，否则时间戳整体缩放错误。
+    TIMESTAMP_UPSAMPLE_TIMES: int = int(os.getenv("TIMESTAMP_UPSAMPLE_TIMES", "3"))
+
     # GPU 多 stream 多 execution_context 池大小（单卡榨干利用率）。
     # 每个 TRT engine 共享 weights，创建 N 个 execution_context + N 个 CUDA stream，
-    # scheduler 提交推理时 round-robin 分配 context/stream，不同 stream 上的 batch
+    # 推理时用 queue.Queue 连接池借还 (context, stream)，不同 stream 上的 batch
     # 可在 GPU SM 上真正并行执行（GPU 分时调度）。
     # 压测发现 GPU sm-util 只有 13-15%，开 4 stream 预期提升到 40-60%，QPS 翻倍。
-    # 显存开销：每 stream × 每段 activation ≈ 200-300MB × 4段 × 4 stream ≈ 1.5-2GB。
+    #
+    # ★应用范围（各段池化策略，见 trt_engine.py TRTEngine.load）：
+    #   - encoder / cif / decoder：主链路每 chunk 必经，全部按本值池化（pool_size=N）；
+    #   - timestamp（第 5 段，ENABLE_WORD_TIMESTAMP 启用时）：同为主链路串联一环
+    #     （CIF 后 Decoder 前每 chunk 都调），也按本值池化，否则单 context 会成为
+    #     串行瓶颈拖垮整条流水线；
+    #   - bias_encoder：固定 pool_size=1，不随本值放大。原因：热词编码仅在「客户端传
+    #     热词」或「默认词表热更新」时调用（低频，非每 chunk），且结果可缓存复用；
+    #     多 context 对它无并发收益，反而白占显存，故单 context 足够。
+    #
+    # 显存开销：每 stream × 每段 activation ≈ 200-300MB。
+    #   关闭时间戳：encoder+cif+decoder 3 段 × N；启用时间戳：再加 timestamp 1 段 × N。
+    #   （bias_encoder 恒 1 份，不计入 N 倍放大）
     # 建议值：3-6，超过后收益递减且显存吃紧。
     GPU_STREAM_POOL_SIZE: int = int(os.getenv("GPU_STREAM_POOL_SIZE", "4"))
 
@@ -235,6 +267,14 @@ class Settings:
             return {
                 "hotword": {"min": (1, 1), "opt": (opt_hw, 4), "max": (max_hw, cls.MAX_HOTWORD_LEN)},
             }
+        if profile_type == "timestamp":
+            # 第 5 段字级时间戳：输入 encoder_out + mask + token_num
+            # 输出 us_alphas/us_cif_peak（enc_len × upsample_times）由 engine 推断，无需 profile
+            return {
+                "encoder_out": {"min": (1, mn, hd), "opt": (ob, opt, hd), "max": (mb, mx, hd)},
+                "mask": {"min": (1, 1, mn), "opt": (ob, 1, opt), "max": (mb, 1, mx)},
+                "token_num": {"min": (1,), "opt": (ob,), "max": (mb,)},
+            }
         raise ValueError(f"未知 profile_type: {profile_type}")
 
     # ============================================================
@@ -369,13 +409,21 @@ class Settings:
         """
         precision = cls.get_model_precision()
         if not precision.startswith("trt_"):
-            return {"encoder": None, "cif": None, "decoder": None, "bias_encoder": None}
+            return {"encoder": None, "cif": None, "decoder": None,
+                    "bias_encoder": None, "timestamp": None}
 
         prec_map = cls.get_trt_precision_map()
-        return {
+        paths = {
             module: cls._find_trt_engine(prec_map[module], module)
             for module in ("encoder", "cif", "decoder", "bias_encoder")
         }
+        # 第 5 段 timestamp engine：仅 ENABLE_WORD_TIMESTAMP 开启时查找
+        # timestamp 含 blstm，固定 fp16（不量化）
+        if cls.ENABLE_WORD_TIMESTAMP:
+            paths["timestamp"] = cls._find_trt_engine("fp16", "timestamp")
+        else:
+            paths["timestamp"] = None
+        return paths
 
     @classmethod
     def _has_trt_profile(cls, profile_name: str) -> bool:

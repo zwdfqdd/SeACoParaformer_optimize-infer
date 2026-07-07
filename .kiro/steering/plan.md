@@ -14,11 +14,13 @@
 
 # 一、模型转换（一次性完成，产物打包进镜像/volume）
 
-架构：4 段独立 engine
+架构：4 段主 engine + 1 段可选
     - encoder.engine       — speech → encoder_out
     - cif.engine           — encoder_out + mask → acoustic_embeds, token_num
     - decoder.engine       — 主 decoder + SeACo + ASF 热词合并 → logits
     - bias_encoder.engine  — hotword_ids → hw_embed（供 decoder bias 注入）
+    - timestamp.engine     — encoder_out + mask + token_num → us_alphas/us_cif_peak
+                             （字级时间戳，ENABLE_WORD_TIMESTAMP 开关，默认关闭）
 
 关键技术（详见 docs/CONTRIBUTING.md v2 TRT 分段模型架构）：
     - opset 17 LayerNormalization 单节点（TRT 10.6 内部 fp32 累加）
@@ -82,12 +84,18 @@ vad.py Silero VAD ONNX 推理：
     | trt_int8_enc    | int8/fp16/fp16/fp16   | 中偏小 | ★线上推荐（CER≈0，显存减半）|
     | trt_int8        | int8/int8/int8/int8   | 小   | 全 QDQ（精度损失较大，仅备选）|
 
-# 四、热词管理（三路分流）
+# 四、热词管理（两路分流）
 
-按生效词表大小路由：
+按"是否客户端主动传热词"路由（防通用识别误触发）：
     - 客户端传 hotwords → 路径 A（SeACo 在线）：截断 Top256 → 实时编码 bias_embed
-    - 未传 且 默认词表 <=256 → 路径 A：复用启动预编码缓存
-    - 未传 且 默认词表 >256 → 路径 B（Faiss 后处理纠错）
+      （客户端主动传 = 明确知道音频含这些词，激进增强合理）
+    - 客户端不传 → 默认词表恒走路径 B（Faiss 后处理纠错）
+      （通用识别多数音频不含默认热词，SeACo 会把声学相似普通词误纠成热词，
+        Faiss 三重判定仅在拼音+编辑距离高度吻合时替换，大幅降低误触发）
+
+设计变更（防误触发）：默认词表不再按大小走 A，恒走 B。
+    早期"默认词表 ≤256 走 A"在通用识别场景导致相似音被误纠
+    （如"神棚"→"沈鹏"），故默认词表统一走保守的 Faiss。
 
 路径 A（SeACo）：
     - MAX_HOTWORD_NUM=256（硬上限，engine bias profile max=257 含哨兵）
@@ -141,6 +149,15 @@ vad.py Silero VAD ONNX 推理：
 
 失败：{"code": 1001, "article_url": null, "istar_asr": "", "asr": [],
        "error": "DECODE_FAILED", "message": "..."}
+
+字级时间戳（asr[].words）：
+    - ENABLE_WORD_TIMESTAMP 开关控制（默认 false，吞吐优先）
+    - 独立第 5 段 timestamp engine（upsample CIF head + blstm），对齐 FunASR
+      ts_prediction_lfr6_standard：相邻 fire 中点划界（不重叠）+ 超长截断 + 静音扣除
+    - 精度约 20ms（upsample 3x），启用后吞吐降约 30%（2800→2000 req/s）
+    - 关闭或 ORT 模型：words 为空数组
+
+istar_asr 段间用逗号分隔（各段为 VAD 切段单位，非完整句），便于阅读。
 
 错误码：
     SUCCESS=0 / INPUT_PARAM_FAILED=1000 / DECODE_FAILED=1001 /

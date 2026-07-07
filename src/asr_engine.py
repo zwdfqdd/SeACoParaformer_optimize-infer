@@ -97,6 +97,7 @@ class ASREngine:
                 cif_path=paths["cif"],
                 decoder_path=paths["decoder"],
                 bias_encoder_path=paths.get("bias_encoder"),
+                timestamp_path=paths.get("timestamp"),
             )
             self._trt_engine = engine
             return True
@@ -271,10 +272,10 @@ class ASREngine:
             bias_embeddings: (1, H, 512) float32 或 None
 
         返回：
-            (logits, alphas) 元组列表，每 batch 一项：
+            (logits, ts_data) 元组列表，每 batch 一项：
                 logits: (token_num, vocab_size)，token_num 由 CIF 输出决定
-                alphas: (real_enc_len,) 每帧 CIF 权重，用于反推字级时间戳；
-                        ORT 整体模型未暴露 alphas 时为 None
+                ts_data: 字级时间戳数据 dict 或 None；
+                        ORT 整体模型未暴露 timestamp 输出，一律 None
         """
         if self._backend == "trt" and self._trt_engine is not None:
             return self._trt_engine.infer_batch_raw(padded_feats, lengths, bias_embeddings)

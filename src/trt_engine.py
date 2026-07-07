@@ -166,6 +166,7 @@ class TRTEngine:
         self._cif: _TRTInferencer | None = None
         self._decoder: _TRTInferencer | None = None
         self._bias_encoder: _TRTInferencer | None = None
+        self._timestamp: _TRTInferencer | None = None  # 第 5 段（可选，字级时间戳）
         self._loaded = False
 
     @property
@@ -176,9 +177,14 @@ class TRTEngine:
     def has_bias_encoder(self) -> bool:
         return self._bias_encoder is not None
 
+    @property
+    def has_timestamp(self) -> bool:
+        return self._timestamp is not None
+
     def load(self, encoder_path: str, cif_path: str, decoder_path: str,
-             bias_encoder_path: str | None = None):
-        """加载 4 段 engine 文件。"""
+             bias_encoder_path: str | None = None,
+             timestamp_path: str | None = None):
+        """加载 4 段主 engine + 可选第 5 段 timestamp engine。"""
         if not TRT_AVAILABLE:
             raise RuntimeError("TensorRT 未安装")
         if not TORCH_AVAILABLE:
@@ -206,10 +212,20 @@ class TRTEngine:
 
         if bias_encoder_path and os.path.exists(bias_encoder_path):
             logger.info(f"  bias_encoder: {bias_encoder_path}")
-            # bias_encoder 调用频率低（热词编码），单 context 即可
+            # bias_encoder 固定单 context（不随 GPU_STREAM_POOL_SIZE 放大）：
+            #   热词编码仅在「客户端传热词」或「默认词表热更新」时调用，属低频操作，
+            #   非主链路每 chunk 必经；且编码结果可缓存复用。多 context 对它无并发收益，
+            #   反而白占显存，故 pool_size=1 足够。
             self._bias_encoder = _TRTInferencer(bias_encoder_path, pool_size=1)
         else:
             logger.info("  bias_encoder: 未加载（热词功能不可用）")
+
+        # 第 5 段 timestamp engine（ENABLE_WORD_TIMESTAMP 启用时才传入路径）
+        if timestamp_path and os.path.exists(timestamp_path):
+            logger.info(f"  timestamp: {timestamp_path}（字级时间戳启用）")
+            self._timestamp = _TRTInferencer(timestamp_path, pool_size=pool_size)
+        else:
+            logger.info("  timestamp: 未加载（字级时间戳关闭，words 为空）")
 
         self._loaded = True
 
@@ -259,10 +275,11 @@ class TRTEngine:
             bias_embeddings: (1, H, 512) float32，无热词时传 None（内部用全零 1×1×512）
 
         Returns:
-            (logits, alphas) 元组列表，每 batch 一项：
+            (logits, ts_data) 元组列表，每 batch 一项：
                 logits: (token_num, vocab_size)，token_num 由 CIF 输出动态决定
-                alphas: (real_enc_len,) 每帧 CIF 权重，用于反推字级时间戳；
-                        engine 未导出该输出时为 None
+                ts_data: {"us_alphas", "us_cif_peak", "num_tokens"} 或 None
+                    用于主流程算字级时间戳（对齐 FunASR ts_prediction）；
+                    engine 无 timestamp 输出时为 None（字级时间戳降级）
         """
         if not self._loaded:
             raise RuntimeError("TRT engine 未加载")
@@ -300,16 +317,27 @@ class TRTEngine:
         cif_out = self._cif.infer({"encoder_out": encoder_out, "mask": mask})
         acoustic_embeds = cif_out["acoustic_embeds"]  # (batch, max_token, 512)
         token_num_arr = cif_out["token_num"].flatten()  # (batch,)
-        # alphas: (batch, enc_len+1) 每帧 CIF 权重，用于反推 fire 位置做字级时间戳
-        # engine 未输出时给 None，主流程走无时间戳分支
-        alphas_arr = cif_out.get("alphas")
+
+        # 第 5 段 timestamp engine（可选，ENABLE_WORD_TIMESTAMP 启用时才加载）：
+        #   输入 encoder_out + mask + token_num → us_alphas/us_cif_peak
+        # 未启用（self._timestamp is None）时不跑，主链路吞吐不受影响。
+        us_alphas_arr = None
+        us_cif_peak_arr = None
+        if self._timestamp is not None:
+            ts_out = self._timestamp.infer({
+                "encoder_out": encoder_out,
+                "mask": mask,
+                "token_num": np.round(token_num_arr).astype(np.float32),
+            })
+            us_alphas_arr = ts_out.get("us_alphas")
+            us_cif_peak_arr = ts_out.get("us_cif_peak")
 
         # ---- 3. Decoder: 逐 batch 切到实际 token 数后传入 ----
         # 由于 token_num 每条不同，需要按最大 token_num 重新 pad
         token_nums = np.round(token_num_arr).astype(np.int64)
         max_tok = int(token_nums.max())
         if max_tok == 0:
-            # 全零 token：返回空 logits 占位（alphas 也给 None）
+            # 全零 token：返回空 logits 占位（ts_data 也给 None）
             return [(np.zeros((0, 8404), dtype=np.float32), None)
                     for _ in range(batch_size)]
 
@@ -343,22 +371,27 @@ class TRTEngine:
         dec_out = self._decoder.infer(dec_inputs)
         logits = dec_out["logits"]  # (batch, max_tok, vocab) 或 list
 
-        # ---- 4. 按各自 token_num 切片返回 (logits, alphas) 元组 ----
-        # alphas 每 batch 一份，长度 = encoder 帧数（原样返回，字级时间戳由主流程反推）
+        # ---- 4. 按各自 token_num 切片返回 (logits, ts_data) 元组 ----
+        # ts_data: {"us_alphas", "us_cif_peak", "num_tokens"}，供主流程算字级时间戳；
+        #          engine 无 timestamp 输出时为 None（字级时间戳降级）。
+        # us_alphas/us_cif_peak 长度 = enc_len × upsample_times，按真实帧数截取去 padding。
         results = []
+        has_ts = us_alphas_arr is not None and us_cif_peak_arr is not None
+        up_ratio = (us_alphas_arr.shape[1] // seq_len) if has_ts and seq_len > 0 else 1
         for i in range(batch_size):
             n = int(token_nums[i])
             logits_i = logits[i, :n, :].copy()
-            # alphas shape=(B, enc_len+1)（predictor tail_process 加了 1 帧），
-            # 取真实 encoder 长度 +1 帧，去掉 batch 内 padding 帧
-            if alphas_arr is not None:
-                real_len = int(lengths[i]) + 1  # +1 覆盖 tail 帧
-                # 保护上界：真实长度不超过 alphas 实际维度
-                real_len = min(real_len, alphas_arr.shape[1])
-                alphas_i = alphas_arr[i, :real_len].copy()
+            if has_ts:
+                real_up = int(lengths[i]) * up_ratio  # 真实上采样帧数（去 padding）
+                real_up = min(real_up, us_alphas_arr.shape[1])
+                ts_data = {
+                    "us_alphas": us_alphas_arr[i, :real_up].copy(),
+                    "us_cif_peak": us_cif_peak_arr[i, :real_up].copy(),
+                    "num_tokens": n,
+                }
             else:
-                alphas_i = None
-            results.append((logits_i, alphas_i))
+                ts_data = None
+            results.append((logits_i, ts_data))
         return results
 
     # --------------------------------------------------------

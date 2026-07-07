@@ -1,20 +1,20 @@
 """
 Timestamp 验证脚本
 
-用 PT 模型跑一段音频，dump CIF 输出的 cif_peak 反推每个 token 的时间戳，
-并打印字符 + 时间戳表，供人工听感对照识别精度。
+对比两种字级时间戳方案：
+  --method main    ：main head alphas 反推（60ms 粒度，粗，字间停顿归前字）
+  --method alphas2 ：upsample timestamp head（12ms 粒度，对齐 FunASR 官方 ts_prediction）
 
-流程：
-    1. 加载音频 → 特征提取
-    2. PT encoder + predictor 拿到 encoder_out + cif_peak
-    3. cif_peak 找 fire 位置 → 每个 token 的 encoder 帧索引
-    4. encoder 帧 60ms/帧（LFR_M=7, LFR_N=6, fbank shift 10ms）→ token 时间戳
-    5. decoder 解码得到 text，与时间戳一一对应
+alphas2 方案（推荐）流程：
+  1. predictor.get_upsample_timestamp → us_alphas(上采样5x) + us_cif_peak(fire峰值)
+  2. ts_prediction_lfr6_standard 后处理：
+     - fire_place = where(peak>=1-1e-4) + force_time_shift
+     - 相邻 fire 之间作为前一 token 的时长（不重叠）
+     - 单 token 超 MAX_TOKEN_DURATION 截断补静音
+     - 首尾静音处理
+  3. TIME_RATE = 10 * LFR_N(6) / 1000 / upsample_times
 
-字级/词级时间戳精度评估：
-    - 中文单字一般 100-300ms 时长
-    - 若 cif_peak 精度足够（帧级 = 60ms），可满足字幕/搜索场景
-    - 若不够，可导出 alphas2 (upsample 4x, 15ms/帧) 更细粒度
+打印字符 + 时间戳表，保存 JSON 供对比。
 """
 import argparse
 import os
@@ -23,187 +23,233 @@ import numpy as np
 import torch
 import soundfile as sf
 
-# 允许 scripts/ 直接执行 python scripts/verify_timestamp.py
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from seaco_paraformer.load_model import load_model
+from seaco_paraformer.utils import make_pad_mask
 from src.feature_extractor import extract_features, load_cmvn
 from src.tokenizer import Tokenizer
 
 
-# encoder 每帧对应的音频时长（ms）：
-# LFR 堆叠 M=7 帧, stride=6 帧 → 每 encoder 帧 = 6 × 10ms(fbank shift) = 60ms
-FRAME_MS = 60
+FRAME_MS = 60  # main head：每 encoder 帧 60ms（LFR_N=6 × 10ms）
 
 
-def alphas_to_fire_positions(alphas: np.ndarray, threshold: float) -> np.ndarray:
+def ts_prediction_lfr6_standard(
+    us_alphas: np.ndarray,
+    us_peaks: np.ndarray,
+    char_list: list[str],
+    upsample_times: int = 5,
+    force_time_shift: float = -1.5,
+    max_token_duration_frames: int = 12,
+    start_end_threshold: int = 5,
+) -> list[list[int]]:
     """
-    从 predictor 输出的 alphas 反推 fire 位置（对齐 cif_v1_export 公式）。
+    移植 FunASR ts_prediction_lfr6_standard（去掉 sil_in_str 文本拼接，只返回时间戳）。
 
-    alphas: (T,) 每帧的 CIF 权重
-    threshold: predictor 的 fire 门槛（一般 1.0）
-    返回：fire 位置数组（长度 = token 数）
+    Args:
+        us_alphas: (T_up,) 上采样 CIF 权重
+        us_peaks: (T_up,) fire 峰值（>=1-1e-4 处 fire）
+        char_list: token 字符列表（不含 <eos>）
+        upsample_times: 上采样倍数（本模型 5）
+        force_time_shift: fire 位置整体偏移（官方 -1.5）
+        max_token_duration_frames: 单 token 最大帧数（超则截断补静音）
+        start_end_threshold: 首尾静音判定帧数阈值
+
+    Returns:
+        list of [start_ms, end_ms]，长度 = len(char_list)（不含静音）
     """
+    if not len(char_list):
+        return []
+    TIME_RATE = 10.0 * 6 / 1000 / upsample_times  # 每 fire 帧的秒数
+
+    alphas = us_alphas.copy()
+    peaks = us_peaks.copy()
+
+    fire_place = np.where(peaks >= 1.0 - 1e-4)[0] + force_time_shift
+    # fire 数应 = token 数 + 1；不符则按 token 数重新归一化后再检测
+    if len(fire_place) != len(char_list) + 1:
+        total = alphas.sum()
+        if total > 0:
+            alphas = alphas / (total / (len(char_list) + 1))
+        # 重新 cif_wo_hidden（numpy 版）
+        cum = np.cumsum(alphas)
+        thr = 1.0 - 1e-4
+        floor_cum = np.floor(cum / thr)
+        prev = np.zeros_like(floor_cum)
+        prev[1:] = floor_cum[:-1]
+        fired = (floor_cum > prev).astype(np.float32)
+        frac = cum - floor_cum * thr
+        peaks = fired * 1.0 + (1.0 - fired) * frac
+        fire_place = np.where(peaks >= 1.0 - 1e-4)[0] + force_time_shift
+
+    num_frames = peaks.shape[0]
+    timestamp_list = []
+    new_char_list = []
+
+    # 首静音
+    if len(fire_place) > 0 and fire_place[0] > start_end_threshold:
+        timestamp_list.append([0.0, fire_place[0] * TIME_RATE])
+        new_char_list.append("<sil>")
+
+    # 逐 token 时间戳（相邻 fire 之间 = 前一 token 时长）
+    for i in range(len(fire_place) - 1):
+        new_char_list.append(char_list[i] if i < len(char_list) else "?")
+        dur = fire_place[i + 1] - fire_place[i]
+        if max_token_duration_frames < 0 or dur <= max_token_duration_frames:
+            timestamp_list.append([fire_place[i] * TIME_RATE, fire_place[i + 1] * TIME_RATE])
+        else:
+            # 超长：截断到 max，剩余作静音
+            _split = fire_place[i] + max_token_duration_frames
+            timestamp_list.append([fire_place[i] * TIME_RATE, _split * TIME_RATE])
+            timestamp_list.append([_split * TIME_RATE, fire_place[i + 1] * TIME_RATE])
+            new_char_list.append("<sil>")
+
+    # 尾静音
+    if len(fire_place) > 0 and num_frames - fire_place[-1] > start_end_threshold:
+        _end = (num_frames + fire_place[-1]) * 0.5
+        if timestamp_list:
+            timestamp_list[-1][1] = _end * TIME_RATE
+        timestamp_list.append([_end * TIME_RATE, num_frames * TIME_RATE])
+        new_char_list.append("<sil>")
+    elif timestamp_list:
+        timestamp_list[-1][1] = num_frames * TIME_RATE
+
+    # 只返回非静音 token 的时间戳（ms）
+    res = []
+    for char, ts in zip(new_char_list, timestamp_list):
+        if char != "<sil>":
+            res.append([int(ts[0] * 1000), int(ts[1] * 1000)])
+    return res
+
+
+def main_head_timestamps(alphas: np.ndarray, token_ids: list[int], threshold: float) -> list[tuple[int, int]]:
+    """main head alphas 反推（旧方案，60ms 粒度，对照用）。"""
     cum = np.cumsum(alphas)
     floor_cum = np.floor(cum / threshold)
     floor_diff = np.empty_like(floor_cum)
     floor_diff[0] = floor_cum[0]
     floor_diff[1:] = floor_cum[1:] - floor_cum[:-1]
-    return np.where(floor_diff > 0)[0]
-
-
-def fire_positions_to_timestamps(peak_positions: np.ndarray, total_frames: int) -> list[tuple[int, int]]:
-    """从 fire 位置反推每个 token 的 (start_ms, end_ms)。"""
-    timestamps = []
-    for i, pos in enumerate(peak_positions):
-        start_ms = int(pos * FRAME_MS)
-        if i + 1 < len(peak_positions):
-            end_ms = int(peak_positions[i + 1] * FRAME_MS)
-        else:
-            end_ms = int(total_frames * FRAME_MS)
-        timestamps.append((start_ms, end_ms))
-    return timestamps
+    peaks = np.where(floor_diff > 0)[0]
+    total = len(alphas)
+    out = []
+    for i, pos in enumerate(peaks):
+        start = int(pos * FRAME_MS)
+        end = int(peaks[i + 1] * FRAME_MS) if i + 1 < len(peaks) else int(total * FRAME_MS)
+        out.append((start, end))
+    return out
 
 
 def main():
     parser = argparse.ArgumentParser(description="Timestamp 验证脚本")
-    parser.add_argument("--audio", required=True, help="音频文件路径（16kHz 单声道）")
-    parser.add_argument("--model-id", default="./models/asr/pt",
-                        help="PT 模型路径（默认 ./models/asr/pt）")
-    parser.add_argument("--config-dir", default="./models/asr/pt",
-                        help="CMVN + tokenizer 配置目录")
+    parser.add_argument("--audio", required=True)
+    parser.add_argument("--model-id", default="./models/asr/pt")
+    parser.add_argument("--config-dir", default="./models/asr/pt")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--method", default="alphas2", choices=["main", "alphas2"],
+                        help="main=旧60ms粒度，alphas2=官方upsample时间戳")
     args = parser.parse_args()
 
     if args.device == "auto":
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("=" * 60)
-    print(f"Timestamp 验证（PT 模型，device={args.device}）")
+    print(f"Timestamp 验证（method={args.method}, device={args.device}）")
     print("=" * 60)
 
-    # 加载配置
     cmvn_mean, cmvn_istd = load_cmvn(os.path.join(args.config_dir, "am.mvn"))
     tokenizer = Tokenizer()
     tokenizer.load(os.path.join(args.config_dir, "tokens.json"))
 
-    # 加载音频与特征
     pcm, sr = sf.read(args.audio, dtype="float32")
     if len(pcm.shape) > 1:
         pcm = pcm[:, 0]
-    features = extract_features(pcm, sample_rate=sr,
-                                cmvn_mean=cmvn_mean, cmvn_istd=cmvn_istd)
+    features = extract_features(pcm, sample_rate=sr, cmvn_mean=cmvn_mean, cmvn_istd=cmvn_istd)
     audio_duration = len(pcm) / sr
-    print(f"\n音频: {args.audio}")
-    print(f"  时长: {audio_duration:.2f}s, 特征帧: {features.shape[0]}")
+    print(f"\n音频: {args.audio}  时长: {audio_duration:.2f}s  特征帧: {features.shape[0]}")
 
-    # 加载模型
-    print("\n加载模型...")
     model = load_model(model_id=args.model_id, device=args.device)
     model.eval()
-
     speech = torch.from_numpy(features).unsqueeze(0).float().to(args.device)
     speech_lengths = torch.tensor([features.shape[0]], dtype=torch.long).to(args.device)
 
-    # Encoder + Predictor
-    print("\n推理...")
     with torch.no_grad():
-        # encoder 前向
         encoder_out, encoder_out_lens = model.encode(speech, speech_lengths)
-        # predictor（含 CIF）: 返回 (acoustic_embeds, token_num, alphas, cif_peak, token_num2)
-        from seaco_paraformer.utils import make_pad_mask
         encoder_out_mask = (
             ~make_pad_mask(encoder_out_lens, maxlen=encoder_out.size(1))[:, None, :]
         ).to(encoder_out.device)
         pred_out = model.predictor(encoder_out, None, encoder_out_mask, ignore_id=-1)
         acoustic_embeds, token_num, alphas, cif_peak = pred_out[:4]
 
-        # decoder 解码得到文本（不用 SeACo，只看主 decoder logits）
         decoder_out, _, _ = model.decoder(
-            encoder_out, encoder_out_lens,
-            acoustic_embeds, token_num,
+            encoder_out, encoder_out_lens, acoustic_embeds, token_num,
             return_hidden=True, return_both=True,
         )
         token_ids = decoder_out[0].argmax(dim=-1).cpu().numpy()
 
-    text = tokenizer.decode(token_ids)
-    print(f"  识别结果: {text}")
-
-    # 从 alphas 反推 fire 位置（每 token 起始的 encoder 帧索引）
-    alphas_np = alphas[0].cpu().numpy()  # (T,)
-    threshold = float(model.predictor.threshold)
-    peak_positions = alphas_to_fire_positions(alphas_np, threshold)
-    token_num_val = int(round(alphas[0].sum().item()))
-
-    print(f"\nCIF alphas 分析:")
-    print(f"  encoder 帧数: {len(alphas_np)}")
-    print(f"  CIF threshold: {threshold}")
-    print(f"  alphas 累积和: {alphas[0].sum().item():.3f}")
-    print(f"  round(token_num): {token_num_val}")
-    print(f"  fire 位置数量: {len(peak_positions)}")
-    print(f"  alphas 分布: min={alphas_np.min():.3f} "
-          f"mean={alphas_np.mean():.3f} max={alphas_np.max():.3f}")
-
-    timestamps = fire_positions_to_timestamps(peak_positions, len(alphas_np))
-
-    # 字符 + 时间戳表
-    print("\n" + "=" * 60)
-    print("字级时间戳（cif_peak → encoder 帧 × 60ms）:")
-    print("=" * 60)
-    print(f"{'idx':<4} {'token':<8} {'char':<6} {'start_ms':<10} {'end_ms':<10} {'dur_ms':<8}")
-    print("-" * 60)
-
-    # tokenizer 内部按索引存 token（_token_list）
+    # 过滤特殊 token 得字符列表
     token_list = tokenizer._token_list
+    char_list = []
+    valid_token_ids = []
+    for tid in token_ids.tolist():
+        if tid <= 2:  # blank/sos/eos
+            continue
+        char = token_list[tid] if 0 <= tid < len(token_list) else f"?{tid}"
+        char_list.append(char)
+        valid_token_ids.append(tid)
 
-    def id_to_char(tid: int) -> str:
-        if tid <= 2:  # <blank>=0, <sos>=1, <eos>=2
-            return f"<{['blank','sos','eos'][tid]}>"
-        if 0 <= tid < len(token_list):
-            return token_list[tid] or f"?{tid}"
-        return f"?{tid}"
+    text = tokenizer.decode(token_ids)
+    print(f"识别结果: {text}")
+    print(f"token 数（含特殊）: {len(token_ids)}  有效字符数: {len(char_list)}")
 
-    # 取 decoder 输出的 token
-    token_ids_list = token_ids.tolist()
-    n = min(len(timestamps), len(token_ids_list))
-    for i in range(n):
-        tid = int(token_ids_list[i])
-        char = id_to_char(tid)
-        start_ms, end_ms = timestamps[i]
-        print(f"{i:<4} {tid:<8} {char:<6} {start_ms:<10} {end_ms:<10} {end_ms-start_ms:<8}")
+    if args.method == "alphas2":
+        with torch.no_grad():
+            tn = torch.round(token_num).to(encoder_out.device)
+            us_alphas, us_cif_peak = model.predictor.get_upsample_timestamp(
+                encoder_out, encoder_out_mask, tn
+            )
+        us_alphas_np = us_alphas[0].cpu().numpy()
+        us_peaks_np = us_cif_peak[0].cpu().numpy()
+        up = int(model.predictor.upsample_times)
+        print(f"\nupsample_times={up}  us_alphas 长度={len(us_alphas_np)}  "
+              f"fire 数={int((us_peaks_np >= 1.0 - 1e-4).sum())}  期望={len(char_list)}+1")
+        ts = ts_prediction_lfr6_standard(
+            us_alphas_np, us_peaks_np, char_list, upsample_times=up
+        )
+        words = [{"text": c, "start_ms": t[0], "end_ms": t[1]} for c, t in zip(char_list, ts)]
+    else:
+        threshold = float(model.predictor.threshold)
+        alphas_np = alphas[0].cpu().numpy()
+        ts = main_head_timestamps(alphas_np, valid_token_ids, threshold)
+        words = [{"text": c, "start_ms": t[0], "end_ms": t[1]} for c, t in zip(char_list, ts)]
 
-    if len(timestamps) != len(token_ids_list):
-        print(f"\n[警告] cif_peak fire 数({len(timestamps)}) != decoder 输出 token 数"
-              f"({len(token_ids_list)})，对齐可能不完全")
+    # 打印
+    print("\n" + "=" * 60)
+    print(f"{'idx':<4} {'char':<8} {'start_ms':<10} {'end_ms':<10} {'dur_ms':<8}")
+    print("-" * 60)
+    prev_end = -1
+    overlap_cnt = 0
+    long_cnt = 0
+    for i, w in enumerate(words):
+        dur = w["end_ms"] - w["start_ms"]
+        flag = ""
+        if w["start_ms"] < prev_end:
+            flag += " OVERLAP"
+            overlap_cnt += 1
+        if dur > 500:
+            flag += " LONG"
+            long_cnt += 1
+        print(f"{i:<4} {w['text']:<8} {w['start_ms']:<10} {w['end_ms']:<10} {dur:<8}{flag}")
+        prev_end = w["end_ms"]
 
-    # 保存 JSON 便于后续对比
+    print("-" * 60)
+    print(f"字数={len(words)}  重叠={overlap_cnt}  超长(>500ms)={long_cnt}")
+
     import json
-    out_json = {
-        "audio": args.audio,
-        "duration_s": round(audio_duration, 3),
-        "text": text,
-        "encoder_frames": len(alphas_np),
-        "frame_ms": FRAME_MS,
-        "cif_threshold": threshold,
-        "token_num_predicted": round(alphas[0].sum().item(), 3),
-        "token_num_rounded": token_num_val,
-        "fire_count": len(peak_positions),
-        "decoder_tokens": len(token_ids_list),
-        "words": [
-            {
-                "idx": i,
-                "token_id": int(token_ids_list[i]) if i < len(token_ids_list) else None,
-                "char": id_to_char(int(token_ids_list[i])) if i < len(token_ids_list) else None,
-                "start_ms": timestamps[i][0],
-                "end_ms": timestamps[i][1],
-            }
-            for i in range(n)
-        ],
-    }
-    out_path = os.path.splitext(args.audio)[0] + "_timestamp.json"
+    out_path = os.path.splitext(args.audio)[0] + f"_ts_{args.method}.json"
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(out_json, f, ensure_ascii=False, indent=2)
-    print(f"\n结果已保存: {out_path}")
+        json.dump({"audio": args.audio, "method": args.method, "text": text,
+                   "words": words}, f, ensure_ascii=False, indent=2)
+    print(f"结果已保存: {out_path}")
 
 
 if __name__ == "__main__":

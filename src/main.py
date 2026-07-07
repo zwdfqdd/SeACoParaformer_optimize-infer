@@ -47,6 +47,7 @@ from src.schemas import (
     HotwordReloadResponse,
     HotwordStatusResponse,
 )
+from src.timestamp import compute_word_timestamps
 from src.tokenizer import tokenizer
 from src.vad import vad_engine
 
@@ -457,22 +458,24 @@ async def asr_recognize(req: ASRRequest):
             asr_stage_duration.labels(stage=f"stage1_{_k}").observe(_v)
 
         # ====== Stage 2: 特征提取（CPU 线程池） ======
-        # 热词路由（按生效词表大小三路分流）：
-        #   1) 客户端传 hotwords → 路径 A：实时编码（含 Top-N 截断）
-        #   2) 未传 + 默认词表 route=A（≤MAX_HOTWORD_NUM）→ 复用启动预编码缓存
-        #   3) 未传 + 默认词表 route=B（>MAX_HOTWORD_NUM）→ bias=None（普通 ASR，后续 Faiss 纠错）
+        # 热词路由（防通用识别误触发）：
+        #   1) 客户端传 hotwords → 路径 A：SeACo 实时编码
+        #      （客户端主动传 = 明确知道音频含这些词，激进增强合理；
+        #        超 MAX_HOTWORD_NUM 时 _encode_hotwords 内部 Top-N 截断）
+        #   2) 客户端不传 → 默认词表恒走路径 B（Faiss 保守纠错）
+        #      （通用识别多数音频不含默认热词，SeACo 会误纠相似音，
+        #        Faiss 三重判定仅在拼音+编辑距离高度吻合时替换，大幅降低误触发）
         bias_embeddings = None
         use_faiss_correction = False
+
         if req.hotwords and asr_engine.has_bias_model:
+            # 路径 A：SeACo 在线增强（客户端主动传热词）
             bias_embeddings = await _encode_hotwords(req.hotwords)
         elif not req.hotwords:
+            # 客户端不传：默认词表恒走 Faiss（_determine_route 已固定 route=B）
             default_cache = hotword_manager.cache
             if default_cache is not None:
-                if default_cache.route == "A":
-                    bias_embeddings = default_cache.bias_embed
-                else:
-                    # route=B：普通 ASR + Faiss 后处理纠错（阶段 4 实现）
-                    use_faiss_correction = True
+                use_faiss_correction = True
 
         def _extract_one(chunk: ChunkMeta) -> np.ndarray:
             chunk_audio = extract_chunk_audio(pcm, chunk, sample_rate)
@@ -639,69 +642,56 @@ async def _encode_hotwords(hotwords: list[str]) -> np.ndarray | None:
     return await gpu_scheduler.encode_hotwords(padded)
 
 
-def _alphas_to_word_timestamps(
-    alphas: np.ndarray,
-    token_ids: np.ndarray,
+def _build_word_timestamps(
+    ts_data: dict | None,
+    char_list: list[str],
     chunk_start_ms: int,
-    frame_ms: int = 60,
-    cif_threshold: float = 1.0,
-) -> list[dict]:
+) -> list[ASRWord]:
     """
-    从 CIF alphas 反推每个 token 的字级时间戳。
+    用 timestamp head 输出（us_alphas/us_cif_peak）计算字级时间戳。
 
-    公式（与 cif_v1_export 对齐）：
-        cum = cumsum(alphas); floor_diff = floor(cum/thr) 的一阶差分
-        floor_diff > 0 的位置即 fire 位置（对应 encoder 帧索引）
-        帧索引 × frame_ms + chunk 起始偏移 → 音频时间轴时间戳
+    对齐 FunASR ts_prediction_lfr6_standard（见 src/timestamp.py）：
+        相邻 fire 间隔作为前一 token 时长（不重叠），单 token 超时截断，
+        首尾静音扣除。时间戳加 chunk_start_ms 偏移对齐全局音频时间轴。
 
-    Args:
-        alphas: (real_enc_len,) 每帧 CIF 权重
-        token_ids: (token_num,) decoder 输出的 token ID 数组
-        chunk_start_ms: 该 chunk 在原始音频中的起始毫秒（用于对齐全局时间轴）
-        frame_ms: 每 encoder 帧对应毫秒数（LFR 后 60ms）
-        cif_threshold: CIF fire 门槛（默认 1.0）
-
-    Returns:
-        list of {"text": str, "start_ms": int, "end_ms": int}
-        长度 = fire 数量，与 token_ids 数量原则上对齐
+    ts_data 为 None（旧 engine/ORT 无 timestamp 输出）时返回空列表（降级）。
     """
-    if alphas is None or len(alphas) == 0:
+    if ts_data is None or not char_list:
         return []
-    cum = np.cumsum(alphas)
-    floor_cum = np.floor(cum / cif_threshold)
-    floor_diff = np.empty_like(floor_cum)
-    floor_diff[0] = floor_cum[0]
-    floor_diff[1:] = floor_cum[1:] - floor_cum[:-1]
-    peak_positions = np.where(floor_diff > 0)[0]
-
+    ts_list = compute_word_timestamps(
+        us_alphas=ts_data["us_alphas"],
+        us_cif_peak=ts_data["us_cif_peak"],
+        num_tokens=len(char_list),
+        upsample_times=settings.TIMESTAMP_UPSAMPLE_TIMES,
+        offset_ms=chunk_start_ms,
+    )
     words = []
-    total_frames = len(alphas)
-    n = min(len(peak_positions), len(token_ids))
+    n = min(len(ts_list), len(char_list))
     for i in range(n):
-        pos = int(peak_positions[i])
-        tid = int(token_ids[i])
-        # 过滤特殊 token（<blank>=0, <sos>=1, <eos>=2）
-        if tid <= 2:
-            continue
-        # 单字文本：直接从 tokenizer._token_list 取（避免 decode 的空格/拼接规则）
-        try:
-            char = tokenizer._token_list[tid] if 0 <= tid < len(tokenizer._token_list) else ""
-        except AttributeError:
-            char = ""
-        if not char:
-            continue
-        start_ms = chunk_start_ms + pos * frame_ms
-        if i + 1 < len(peak_positions):
-            end_ms = chunk_start_ms + int(peak_positions[i + 1]) * frame_ms
-        else:
-            end_ms = chunk_start_ms + total_frames * frame_ms
-        words.append({"text": char, "start_ms": start_ms, "end_ms": end_ms})
+        s, e = ts_list[i]
+        words.append(ASRWord(
+            text=char_list[i],
+            timestamp=[round(s / 1000.0, 3), round(e / 1000.0, 3)],
+        ))
     return words
+
+
+def _decode_char_list(token_ids: np.ndarray) -> list[str]:
+    """token_ids → 有效字符列表（过滤 <blank>/<sos>/<eos>，用 _token_list 逐字取）。"""
+    chars = []
+    tl = getattr(tokenizer, "_token_list", None)
+    for tid in token_ids.tolist():
+        tid = int(tid)
+        if tid <= 2:  # blank/sos/eos
+            continue
+        if tl is not None and 0 <= tid < len(tl) and tl[tid]:
+            chars.append(tl[tid])
+    return chars
 
 
 def _build_response(
     chunks: list[ChunkMeta],
-    chunk_results: list[tuple[np.ndarray, np.ndarray | None]],
+    chunk_results: list[tuple[np.ndarray, dict | None]],
     hotwords: list[str] | None = None,
     use_faiss_correction: bool = False,
     article_url: str | None = None,
@@ -723,32 +713,27 @@ def _build_response(
     asr_segments: list[ASRSegment] = []
     full_text_parts: list[str] = []
 
-    for i, (chunk, (logits, alphas)) in enumerate(zip(chunks, chunk_results)):
+    for i, (chunk, (logits, ts_data)) in enumerate(zip(chunks, chunk_results)):
         # 解码 logits → token_ids → 文本（argmax 贪心解码 + tokenizer）
         token_ids = np.argmax(logits, axis=-1).flatten()
         text = tokenizer.decode(token_ids)
+        char_list = _decode_char_list(token_ids)
 
-        # 字级时间戳（若 alphas 可用；Faiss 纠错场景 words 不同步纠错，保留原始 token 边界）
-        word_dicts = _alphas_to_word_timestamps(
-            alphas=alphas,
-            token_ids=token_ids,
+        # 字级时间戳（timestamp head：us_alphas/us_cif_peak → 官方 ts_prediction）
+        # ts_data=None（旧 engine/ORT）时降级为空列表
+        words_pyd = _build_word_timestamps(
+            ts_data=ts_data,
+            char_list=char_list,
             chunk_start_ms=chunk.effective_start_ms,
         )
 
-        # 路径 B：Faiss 后处理纠错
+        # 路径 B：Faiss 后处理纠错（仅纠正文本，不改字级时间戳）
         if corrector is not None and text:
             text = corrector.correct(text)
 
-        # 使用原始 VAD 时间戳（ms → s，保留 3 位小数与外部标准对齐）
+        # 段级时间戳用原始 VAD 时间戳（ms → s，保留 3 位小数与外部标准对齐）
         start_s = round(chunk.effective_start_ms / 1000.0, 3)
         end_s = round(chunk.effective_end_ms / 1000.0, 3)
-
-        words_pyd = [
-            ASRWord(text=w["text"],
-                    timestamp=[round(w["start_ms"] / 1000.0, 3),
-                               round(w["end_ms"] / 1000.0, 3)])
-            for w in word_dicts
-        ]
 
         asr_segments.append(ASRSegment(
             idx=i,
@@ -760,9 +745,12 @@ def _build_response(
         ))
         full_text_parts.append(text)
 
+    # istar_asr 段间用逗号分隔，便于阅读（各段为 VAD/切段单位，非完整句，用逗号最稳）
+    istar_asr = "，".join(p for p in full_text_parts if p)
+
     return ASRResponse(
         code=0,
         article_url=article_url,
-        istar_asr="".join(full_text_parts),
+        istar_asr=istar_asr,
         asr=asr_segments,
     )
