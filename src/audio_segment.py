@@ -22,7 +22,6 @@ from dataclasses import dataclass
 import numpy as np
 
 from src.config import settings
-from src.errors import ASRException, ErrorCode
 from src.vad import VADSegment
 
 
@@ -76,21 +75,28 @@ def segment_to_chunks(
       3. 尾块保留实际长度（可能 < UNIFORM_CHUNK_MS），scheduler 按 TRT opt seq 帧数 pad
 
     所有 chunk 长度一致（除尾块）→ scheduler 无需桶分组 → 合批天花板显著提升。
+
+    特殊情况：
+      - VAD 后无有效语音段（静音/空音频）→ 返回空列表，由上层返回“音频内容为空”提示；
+      - 有效语音但整体时长 < 最小桶（MIN_BUCKET_MS=2040ms）→ 尾部扩展 pad 到 2040ms，
+        保证 encoder 输入不低于 profile 下界（短音频也能正常识别）。
     """
+    # VAD 无有效语音段：返回空列表（不抛异常），上层据此返回空结果 + 提示
     if not vad_segments:
-        raise ASRException(
-            ErrorCode.AUDIO_SEGMENT_ERROR,
-            "无有效语音段，音频可能为静音",
-        )
+        return []
 
     # 取 VAD 整体时间跨度（首段 start 到末段 end）
     speech_start = vad_segments[0].start_ms
     speech_end = vad_segments[-1].end_ms
     if speech_end <= speech_start:
-        raise ASRException(
-            ErrorCode.AUDIO_SEGMENT_ERROR,
-            "VAD 段时间戳异常",
-        )
+        # 时间戳异常同样视为无有效语音
+        return []
+
+    # 短音频保护：整体语音时长 < 最小桶时，尾部扩展 pad 到 MIN_BUCKET_MS。
+    # 不超过音频总时长上界（extract_chunk_audio 会 clip 到 pcm 长度，
+    # 不足部分由特征提取补零），避免 encoder 输入低于 TRT profile 下界。
+    if speech_end - speech_start < MIN_BUCKET_MS:
+        speech_end = speech_start + MIN_BUCKET_MS
 
     # 均匀切分
     chunks: list[ChunkMeta] = []

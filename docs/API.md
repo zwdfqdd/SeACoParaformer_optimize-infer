@@ -84,6 +84,12 @@
 | asr[].words | array | 字级时间戳数组（CIF alphas 反推得到，需 CIF engine 输出 alphas） |
 | asr[].words[].text | string | 字符（中文单字或英文 BPE subword） |
 | asr[].words[].timestamp | [float, float] | [起始秒, 结束秒]，字级时间戳，粒度约 60ms |
+| message | string | 提示信息；正常识别为空，VAD 后无有效语音时为 `"音频内容为空"` |
+
+**空音频 / 短音频行为**：
+- **VAD 后无有效语音**（纯静音、极短或无人声）：返回 HTTP 200 成功，
+  `code=0, istar_asr="", asr=[], message="音频内容为空"`（不再报 500 错误）
+- **VAD 有效但整体时长 < 2s**：尾部自动 pad 到 2s 后正常识别（保证 encoder 输入不越界）
 
 **字级时间戳说明**：
 - 由独立 timestamp engine（第 5 段，upsample CIF timestamp head）计算，对齐 FunASR

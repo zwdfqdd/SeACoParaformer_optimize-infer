@@ -68,6 +68,10 @@ class ASRResponse(BaseModel):
         ...,
         description="分段识别结果数组，按时间顺序排列",
     )
+    message: str = Field(
+        default="",
+        description="提示信息（正常识别为空；如 VAD 后无有效语音则提示“音频内容为空”）",
+    )
 
 
 class ErrorResponse(BaseModel):

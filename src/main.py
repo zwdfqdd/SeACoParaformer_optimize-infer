@@ -457,6 +457,18 @@ async def asr_recognize(req: ASRRequest):
         for _k, _v in _s1_sub.items():
             asr_stage_duration.labels(stage=f"stage1_{_k}").observe(_v)
 
+        # VAD 后无有效语音（静音/极短音频）：不报错，返回成功空结果 + 提示
+        if not chunks:
+            logger.info("VAD 后无有效语音段，返回空结果（音频内容为空）")
+            asr_request_total.labels(status="success").inc()
+            return ASRResponse(
+                code=0,
+                article_url=req.article_url,
+                istar_asr="",
+                asr=[],
+                message="音频内容为空",
+            )
+
         # ====== Stage 2: 特征提取（CPU 线程池） ======
         # 热词路由（防通用识别误触发）：
         #   1) 客户端传 hotwords → 路径 A：SeACo 实时编码
