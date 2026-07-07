@@ -4,8 +4,8 @@
 职责：
 1. 加载服务端默认词表（models/asr/hotwords.txt）
 2. 校验链：格式 / 数量 / 可编码 / 试编码
-3. 路径判定：词表 ≤ MAX_HOTWORD_NUM 走路径 A（预编码 bias_embed 缓存）；
-   > MAX_HOTWORD_NUM 走路径 B（Faiss，不预编码）
+3. 路径判定：默认词表恒走路径 B（Faiss 保守纠错，防通用识别误触发）；
+   路径 A（SeACo）只保留给客户端主动传的 hotwords（见 main._encode_hotwords）
 4. 运行时热更新（多 worker 安全）：
    - flock 跨进程互斥
    - expected_version 乐观并发（CAS）
@@ -203,8 +203,19 @@ class HotwordManager:
         return valid, dropped
 
     def _determine_route(self, count: int) -> str:
-        """路径判定：≤ MAX_HOTWORD_NUM 走 A，否则走 B。"""
-        return "A" if count <= settings.MAX_HOTWORD_NUM else "B"
+        """
+        默认词表路径判定：固定走 B（Faiss 保守后处理纠错）。
+
+        设计依据（通用识别场景防误触发）：
+            SeACo（路径 A）是"只要声学接近热词就强增强"，适合垂直场景
+            （音频确定含热词）；但通用识别里绝大多数音频不含默认热词，
+            SeACo 会把声学相似的普通词误纠成热词（如"神棚"→"沈鹏"）。
+            默认词表统一走 Faiss，靠三重判定（拼音+编辑距离+区分度阈值）
+            仅在高度吻合时才替换，大幅降低误触发。
+        SeACo（路径 A）只保留给"客户端主动传 hotwords"（见 main._encode_hotwords）
+            —— 客户端传热词 = 明确知道该音频含这些词，才需要激进增强。
+        """
+        return "B"
 
     def _build_cache(self, raw_words: list[str], version: int) -> HotwordCache:
         """构建缓存对象（含校验 + 路径判定 + 预编码）。"""
