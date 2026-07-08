@@ -604,9 +604,6 @@ class Settings:
 
         lines: list[str] = []
         lines.append("=" * 60)
-        lines.append("实际生效运行配置（用于复现 / 排错）")
-        lines.append("=" * 60)
-
         lines.append("[后端/精度]")
         lines.append(f"  MODEL_PRECISION（请求值）: {cls.MODEL_PRECISION}")
         lines.append(f"  实际精度 / 后端 / 设备   : {precision} / {backend} / {device}")
