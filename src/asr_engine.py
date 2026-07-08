@@ -35,9 +35,11 @@ class ASREngine:
 
         # TRT 后端
         self._trt_engine = None  # src.trt_engine.TRTEngine 实例
+        # ORT 分段后端（启用字级时间戳时用，替代整体模型）
+        self._ort_split = None  # src.ort_engine.ORTSplitEngine 实例
 
         self._device: str = "cpu"
-        self._backend: str = "ort"  # "ort" 或 "trt"
+        self._backend: str = "ort"  # "ort" / "trt" / "ort_split"
 
     # ============================================================
     # 加载入口
@@ -57,27 +59,62 @@ class ASREngine:
             if self._load_trt_engines():
                 self._backend = "trt"
             else:
-                logger.warning("TRT engines 加载失败，回退到 ORT fp32")
-                self._backend = "ort"
-                self._load_ort_main()
-                self._load_ort_bias()
+                logger.warning("TRT engines 加载失败，回退到 ORT")
+                self._load_ort_backend()
         else:
-            self._backend = "ort"
-            self._load_ort_main()
-            self._load_ort_bias()
+            self._load_ort_backend()
 
         self._warmup()
+
+    def _load_ort_backend(self):
+        """加载 ORT 后端：启用字级时间戳且分段 ONNX 齐全 → 分段串联；否则整体模型。"""
+        if settings.use_ort_split():
+            if self._load_ort_split():
+                self._backend = "ort_split"
+                logger.info("ORT 后端使用分段串联模式（支持字级时间戳）")
+                return
+            logger.warning("ORT 分段加载失败，回退整体模型（字级时间戳不可用）")
+        self._backend = "ort"
+        self._load_ort_main()
+        self._load_ort_bias()
+
+    def _load_ort_split(self) -> bool:
+        paths = settings.get_split_onnx_paths()
+        if not (paths.get("encoder") and paths.get("cif") and paths.get("decoder")):
+            logger.info(f"ORT 分段 ONNX 不齐全: {paths}")
+            return False
+        try:
+            from src.ort_engine import ORTSplitEngine
+            engine = ORTSplitEngine()
+            engine.load(
+                encoder_path=paths["encoder"],
+                cif_path=paths["cif"],
+                decoder_path=paths["decoder"],
+                bias_encoder_path=paths.get("bias_encoder"),
+                timestamp_path=paths.get("timestamp"),
+                device=self._device,
+            )
+            self._ort_split = engine
+            return True
+        except Exception as e:
+            logger.warning(f"ORT 分段 engine 加载异常: {e}")
+            self._ort_split = None
+            return False
 
     @property
     def is_loaded(self) -> bool:
         if self._backend == "trt":
             return self._trt_engine is not None and self._trt_engine.is_loaded
+        if self._backend == "ort_split":
+            return self._ort_split is not None and self._ort_split.is_loaded
         return self._session is not None
 
     @property
     def has_bias_model(self) -> bool:
         if self._backend == "trt":
             return self._trt_engine is not None and self._trt_engine.has_bias_encoder
+        if self._backend == "ort_split":
+            return self._ort_split is not None and self._ort_split.has_bias_encoder
         return self._bias_session is not None
 
     # ============================================================
@@ -180,6 +217,10 @@ class ASREngine:
             self._trt_engine.warmup(bucket_seq_lens, batch_sizes)
             return
 
+        if self._backend == "ort_split" and self._ort_split is not None:
+            self._ort_split.warmup(bucket_seq_lens, batch_sizes)
+            return
+
         if self._session is None:
             return
 
@@ -234,6 +275,15 @@ class ASREngine:
                 logger.warning(f"TRT bias encoder 推理失败: {e}")
                 return None
 
+        if self._backend == "ort_split":
+            if self._ort_split is None or not self._ort_split.has_bias_encoder:
+                return None
+            try:
+                return self._ort_split.encode_hotwords(hotword_token_ids)
+            except Exception as e:
+                logger.warning(f"ORT 分段 bias encoder 推理失败: {e}")
+                return None
+
         # ORT 后端
         if self._bias_session is None:
             return None
@@ -279,6 +329,8 @@ class ASREngine:
         """
         if self._backend == "trt" and self._trt_engine is not None:
             return self._trt_engine.infer_batch_raw(padded_feats, lengths, bias_embeddings)
+        if self._backend == "ort_split" and self._ort_split is not None:
+            return self._ort_split.infer_batch_raw(padded_feats, lengths, bias_embeddings)
         return self._infer_batch_raw_ort(padded_feats, lengths, bias_embeddings)
 
     def _infer_batch_raw_ort(

@@ -426,7 +426,7 @@ def main():
                              "clamp=30000 裁剪过狠（后段裁到3万）导致截断输入解码错乱，已弃用。"
                              "传 0 禁用 clamp（仅 fp32/ORT 路径用，无损但 fp16 会溢出）。")
     parser.add_argument("--skip", nargs="*", default=[],
-                        choices=["encoder", "cif", "decoder", "bias_encoder"],
+                        choices=["encoder", "cif", "decoder", "bias_encoder", "timestamp"],
                         help="跳过指定模块")
     args = parser.parse_args()
 

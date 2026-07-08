@@ -96,9 +96,12 @@ def has_onnx_int8() -> bool:
     return os.path.exists(os.path.join(INT8_DIR, "model.onnx"))
 
 
-def has_split_onnx(qdq_modules: list[str] = None) -> bool:
-    """检查 4 段普通 split ONNX 是否齐全。"""
-    for m in ("encoder", "cif", "decoder", "bias_encoder"):
+def has_split_onnx(need_timestamp: bool = False) -> bool:
+    """检查分段 ONNX 是否齐全（need_timestamp=True 时含第 5 段 timestamp）。"""
+    modules = ["encoder", "cif", "decoder", "bias_encoder"]
+    if need_timestamp:
+        modules.append("timestamp")
+    for m in modules:
         if not os.path.exists(os.path.join(SPLIT_DIR, f"{m}.onnx")):
             return False
     return True
@@ -331,7 +334,13 @@ def prepare(precision: str, check_only: bool = False) -> bool:
         return ensure_pt()
 
     if precision == "onnx_fp32":
-        return ensure_onnx_fp32()
+        ok = ensure_onnx_fp32()
+        # 启用字级时间戳时，ORT 走分段串联，需额外确保分段 ONNX（含 timestamp）存在
+        if Settings.ENABLE_WORD_TIMESTAMP:
+            if not has_split_onnx(need_timestamp=True):
+                print("[准备] 字级时间戳启用，ORT 分段串联需分段 ONNX（含 timestamp）")
+                ensure_split_onnx()
+        return ok
 
     if precision == "onnx_int8":
         return ensure_onnx_int8()

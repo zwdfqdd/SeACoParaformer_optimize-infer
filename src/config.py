@@ -404,6 +404,49 @@ class Settings:
         """ORT 热词 bias encoder 路径（v1 整体模型 model_eb.onnx）。"""
         return os.path.join(cls.MODEL_DIR, "asr", cls._ort_subdir(), "model_eb.onnx")
 
+    # --- ORT 分段 ONNX 路径（启用字级时间戳时用，替代整体模型） ---
+    @classmethod
+    def get_split_onnx_dir(cls) -> str:
+        """分段 ONNX 目录（encoder/cif/decoder/bias_encoder/timestamp.onnx）。"""
+        return os.path.join(cls.MODEL_DIR, "asr", "split")
+
+    @classmethod
+    def get_split_onnx_paths(cls) -> dict[str, str | None]:
+        """获取 ORT 分段 ONNX 路径字典。缺失的段为 None。
+
+        用于 ENABLE_WORD_TIMESTAMP 开启且走 ORT 后端时的分段串联推理：
+        encoder → cif → decoder + bias_encoder + timestamp 五段独立 session。
+        timestamp 仅 ENABLE_WORD_TIMESTAMP 开启时返回路径。
+        """
+        d = cls.get_split_onnx_dir()
+
+        def _p(name: str) -> str | None:
+            path = os.path.join(d, f"{name}.onnx")
+            return path if os.path.exists(path) else None
+
+        paths = {
+            "encoder": _p("encoder"),
+            "cif": _p("cif"),
+            "decoder": _p("decoder"),
+            "bias_encoder": _p("bias_encoder"),
+        }
+        paths["timestamp"] = _p("timestamp") if cls.ENABLE_WORD_TIMESTAMP else None
+        return paths
+
+    @classmethod
+    def use_ort_split(cls) -> bool:
+        """是否走 ORT 分段串联路径。
+
+        条件：ORT 后端 + ENABLE_WORD_TIMESTAMP 开启 + 分段 ONNX（含 timestamp）齐全。
+        否则回退整体模型（无字级时间戳）。
+        """
+        if cls.get_inference_backend() != "ort":
+            return False
+        if not cls.ENABLE_WORD_TIMESTAMP:
+            return False
+        paths = cls.get_split_onnx_paths()
+        return all(paths.get(m) for m in ("encoder", "cif", "decoder", "timestamp"))
+
     # --- TRT 4 段 engine 路径（v2 主路径，支持混合精度） ---
     @classmethod
     def get_trt_precision_map(cls) -> dict[str, str]:
