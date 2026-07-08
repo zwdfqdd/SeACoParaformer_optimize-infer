@@ -589,5 +589,87 @@ class Settings:
             pass
         return "unknown"
 
+    @classmethod
+    def dump_effective_config(cls) -> list[str]:
+        """收集所有实际生效的运行配置，返回逐行字符串列表（供启动时打印）。
+
+        用于复现与排错：一眼确认环境变量是否按预期生效、实际走哪个后端/精度/设备、
+        各功能开关与池化参数最终取值。分组输出，含 per-worker 换算与 engine 路径。
+        """
+        precision = cls.get_model_precision()
+        backend = cls.get_inference_backend()
+        device = cls.get_device()
+        import os as _os
+        cpu_pool = cls.CPU_THREAD_POOL_SIZE or (_os.cpu_count() or 4)
+
+        lines: list[str] = []
+        lines.append("=" * 60)
+        lines.append("实际生效运行配置（用于复现 / 排错）")
+        lines.append("=" * 60)
+
+        lines.append("[后端/精度]")
+        lines.append(f"  MODEL_PRECISION（请求值）: {cls.MODEL_PRECISION}")
+        lines.append(f"  实际精度 / 后端 / 设备   : {precision} / {backend} / {device}")
+        if backend == "trt":
+            prec_map = cls.get_trt_precision_map()
+            lines.append(f"  TRT 各段精度             : enc={prec_map['encoder']} "
+                         f"cif={prec_map['cif']} dec={prec_map['decoder']} "
+                         f"bias={prec_map['bias_encoder']} ts={prec_map['timestamp']}")
+
+        lines.append("[服务/并发]")
+        lines.append(f"  WORKERS                  : {cls.WORKERS}")
+        lines.append(f"  BATCH / BATCH_TIMEOUT    : {cls.BATCH} / {cls.BATCH_TIMEOUT}ms")
+        lines.append(f"  MAX_CONCURRENT_REQUESTS  : {cls.MAX_CONCURRENT_REQUESTS}")
+        lines.append(f"  ACQUIRE_TIMEOUT          : {cls.ACQUIRE_TIMEOUT}s")
+        lines.append(f"  MAX_AUDIO_DURATION_MS    : {cls.MAX_AUDIO_DURATION_MS}")
+
+        lines.append("[线程/池化]（per-worker）")
+        lines.append(f"  CPU_THREAD_POOL_SIZE     : {cls.CPU_THREAD_POOL_SIZE}"
+                     f"（实际 {cpu_pool}；总线程≈WORKERS×值={cls.WORKERS * cpu_pool}）")
+        lines.append(f"  VAD_SESSION_POOL_SIZE    : {cls.VAD_SESSION_POOL_SIZE}")
+        lines.append(f"  GPU_STREAM_POOL_SIZE     : {cls.GPU_STREAM_POOL_SIZE}")
+        lines.append(f"  ORT_INTRA/INTER_OP       : {cls.ORT_INTRA_OP_THREADS}/"
+                     f"{cls.ORT_INTER_OP_THREADS}（仅 CPU 后端生效）")
+        lines.append(f"  OMP/MKL/OPENBLAS         : "
+                     f"{_os.getenv('OMP_NUM_THREADS', '?')}/"
+                     f"{_os.getenv('MKL_NUM_THREADS', '?')}/"
+                     f"{_os.getenv('OPENBLAS_NUM_THREADS', '?')}")
+
+        lines.append("[功能开关]")
+        lines.append(f"  ENABLE_WORD_TIMESTAMP    : {cls.ENABLE_WORD_TIMESTAMP}"
+                     f"（upsample_times={cls.TIMESTAMP_UPSAMPLE_TIMES}）")
+        lines.append(f"  ENABLE_HOTWORD           : {cls.ENABLE_HOTWORD}")
+        lines.append(f"  ENABLE_FAISS_CORRECTION  : {cls.ENABLE_FAISS_CORRECTION}")
+
+        lines.append("[热词参数]")
+        lines.append(f"  MAX/OPT_HOTWORD_NUM      : {cls.MAX_HOTWORD_NUM}/{cls.OPT_HOTWORD_NUM}")
+        lines.append(f"  NFILTER / MAX_HOTWORD_LEN: {cls.NFILTER}/{cls.MAX_HOTWORD_LEN}")
+        lines.append(f"  DEFAULT_HOTWORD_PATH     : {cls.DEFAULT_HOTWORD_PATH}")
+
+        lines.append("[Bucket/Batch]")
+        lines.append(f"  BUCKET_SEQ_LENS          : {cls.BUCKET_SEQ_LENS}")
+        lines.append(f"  VALID_BATCH_SIZES        : {cls.VALID_BATCH_SIZES}")
+        lines.append(f"  TRT_OPT_SEQ / TRT_MAX_SEQ: {cls.TRT_OPT_SEQ}/{cls.TRT_MAX_SEQ}")
+
+        # engine / 模型路径（确认真的加载了预期产物）
+        lines.append("[模型路径]")
+        if backend == "trt":
+            for m, p in cls.get_trt_engine_paths().items():
+                lines.append(f"  {m:<12}: {p or '（缺失/未启用）'}")
+        elif backend == "pt":
+            lines.append(f"  PT_MODEL_DIR : {cls.PT_MODEL_DIR}")
+        else:  # ort
+            if cls.use_ort_split():
+                lines.append("  ORT 模式     : 分段串联（字级时间戳）")
+                for m, p in cls.get_split_onnx_paths().items():
+                    lines.append(f"  {m:<12}: {p or '（缺失/未启用）'}")
+            else:
+                lines.append("  ORT 模式     : 整体模型")
+                lines.append(f"  model.onnx   : {cls.get_asr_model_path()}")
+                lines.append(f"  model_eb.onnx: {cls.get_asr_bias_model_path()}")
+
+        lines.append("=" * 60)
+        return lines
+
 
 settings = Settings()

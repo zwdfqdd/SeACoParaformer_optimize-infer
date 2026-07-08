@@ -161,6 +161,10 @@ async def lifespan(app: FastAPI):
         pass  # 静音可能无 VAD 段，忽略
     logger.info("端到端预热完成")
 
+    # 打印所有实际生效的运行配置（复现 / 排错用；每 worker 各打一份）
+    for _line in settings.dump_effective_config():
+        logger.info(_line)
+
     logger.info(f"服务启动完成, CPU 线程池: {_cpu_executor._max_workers} workers")
 
     # 注册 SIGHUP 信号处理（配置热更新）
