@@ -15,8 +15,8 @@ services:
       # 模式 B（大 GPU 生产）：WORKERS=11，需 24GB+ 显存，QPS 93.92（conc=120）
       - WORKERS=${WORKERS:-1}
       - BATCH=${BATCH:-12}
-      # BATCH_TIMEOUT：工业标准 dynamic batching 的 max_queue_delay（ms）
-      - BATCH_TIMEOUT=${BATCH_TIMEOUT:-30}
+      # BATCH_TIMEOUT：工业标准 dynamic batching 的 max_queue_delay（ms），实测 10 吞吐最优
+      - BATCH_TIMEOUT=${BATCH_TIMEOUT:-10}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-2000}
       # 音频最大时长（ms），超出返回 1005；默认 2 小时，0=不限
@@ -46,6 +46,7 @@ services:
       # - CIF_PRECISION=fp16
       # - DECODER_PRECISION=fp16
       # - BIAS_PRECISION=fp16
+      # - TIMESTAMP_PRECISION=fp16   # 仅 fp32/fp16（含 BLSTM 不量化，int8 回退 fp16）
       # 本地 PT 权重目录（默认 ./models/asr/pt）
       # - PT_MODEL_DIR=/app/models/asr/pt
       # ─── Bucket/Batch 参数（改动后需重新转 engine，转换与运行共用）───

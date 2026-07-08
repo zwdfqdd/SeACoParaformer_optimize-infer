@@ -89,7 +89,8 @@
 **空音频 / 短音频行为**：
 - **VAD 后无有效语音**（纯静音、极短或无人声）：返回 HTTP 200 成功，
   `code=0, istar_asr="", asr=[], message="音频内容为空"`（不再报 500 错误）
-- **VAD 有效但整体时长 < 2s**：尾部自动 pad 到 2s 后正常识别（保证 encoder 输入不越界）
+- **VAD 有效但整体时长 < 2040ms**（最小桶 34 帧 × 60ms，约 2s）：尾部自动 pad 到 2040ms
+  后正常识别（保证 encoder 输入不低于 TRT profile 下界）
 
 **字级时间戳说明**：
 - 由独立 timestamp engine（第 5 段，upsample CIF timestamp head）计算，对齐 FunASR
@@ -252,7 +253,7 @@
   "version": 4,
   "md5": "a1b2c3...",
   "count": 3,
-  "route": "A",
+  "route": "B",
   "dropped_oov": ["xxx"],
   "message": "词表更新成功，已切换至 version 4"
 }
@@ -293,7 +294,7 @@
   "version": 4,
   "md5": "a1b2c3...",
   "count": 3,
-  "route": "A",
+  "route": "B",
   "loaded_at": "2026-06-25T10:30:00",
   "cache_ready": true
 }

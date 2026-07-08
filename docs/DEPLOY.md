@@ -53,7 +53,7 @@ docker-compose logs -f seaco-asr
 HOST_PORT=8099
 WORKERS=1
 BATCH=12
-BATCH_TIMEOUT=30
+BATCH_TIMEOUT=10
 LOG_LEVEL=INFO
 MAX_CONCURRENT_REQUESTS=2000
 MODEL_PRECISION=trt_int8_enc
@@ -76,7 +76,7 @@ OPENBLAS_NUM_THREADS=1
 | HOST_PORT | 8099 | 宿主机映射端口 |
 | WORKERS | 1 | uvicorn workers；小 GPU 保持 1，大 GPU 可设 11 见「高并发调优 模式 B」 |
 | BATCH | 12 | 最大 batch size（合法值：1,2,4,8,12） |
-| BATCH_TIMEOUT | 30 | batch 等待超时（毫秒），工业标准 dynamic batching 的 max_queue_delay |
+| BATCH_TIMEOUT | 10 | batch 等待超时（毫秒），工业标准 dynamic batching 的 max_queue_delay（实测 10 吞吐最优） |
 | LOG_LEVEL | INFO | 日志级别（DEBUG/INFO/WARNING/ERROR） |
 | MAX_CONCURRENT_REQUESTS | 2000 | 最大并发请求数 |
 | MODEL_PRECISION | auto | 模型精度选择（见 README MODEL_PRECISION 取值表） |
@@ -185,7 +185,7 @@ curl http://<node-ip>:30960/health
 |------|----------|
 | WORKERS | **1** 或 **11**（详见「WORKERS 参数说明」），中间值不推荐 |
 | BATCH | 增大可提高 GPU 利用率，但增加单请求延迟。合法值：1,2,4,8,12 |
-| BATCH_TIMEOUT | 减小可降低延迟，但降低 batch 填充率。默认 30ms |
+| BATCH_TIMEOUT | 减小可降低延迟，但降低 batch 填充率。默认 10ms（实测吞吐最优） |
 | MAX_CONCURRENT_REQUESTS | 控制最大并发，防止内存溢出。默认 2000 |
 | VAD_SESSION_POOL_SIZE | 默认 4；单进程 20+ 并发可调 8 |
 | GPU_STREAM_POOL_SIZE | 默认 4；显存充足可扩到 8 |
@@ -237,7 +237,8 @@ K8s 部署时需确保 `initialDelaySeconds` 大于预热时间，避免 Pod 被
 
 ### 概述
 
-线上推理使用 TensorRT 10.6 进行 GPU 推理，分段模型架构（encoder/cif/decoder/bias_encoder），
+线上推理使用 TensorRT 10.6 进行 GPU 推理，分段模型架构（encoder/cif/decoder/bias_encoder
++ 可选 timestamp 第 5 段），
 转换与推理合一镜像：启动时按 `MODEL_PRECISION` 从本地 PT 权重逐级转换出所需产物。
 
 线上推荐精度 `trt_int8_enc`：encoder int8(QDQ) + cif/decoder/bias fp16
@@ -457,12 +458,13 @@ docker-compose logs -f seaco-asr
   - 观测 `stage1_vad_sum/count` 均值：>800ms 时考虑增大 pool
 - **注意**：与 OMP 相关：`OMP × Pool ≈ 有效线程数`，OMP=1 时 Pool 数直接对应真实并发
 
-#### `BATCH_TIMEOUT`（推荐 30ms）
+#### `BATCH_TIMEOUT`（推荐 10ms）
 - 作用：GPU Scheduler 单个 chunk 最长排队时间（工业标准 max_queue_delay）
 - 影响：单请求 GPU 侧延迟严格上限 ≤ BATCH_TIMEOUT + 1ms tick
-- 建议值：**30ms**（默认）
+- 建议值：**10ms**（默认，性能网格实测吞吐最优）
 - 调优场景：
-  - 追求最低延迟：15-20ms（合批变弱）
+  - 高并发下 chunk 到达密集，10ms 已能合到大 batch，无需更大超时
+  - 追求更强合批（低并发大音频）：可上调 20-30ms（延迟略升）
   - 追求最高吞吐：50-100ms（合批更强，延迟略升）
 - 与 `VALID_BATCH_SIZES[-1]=12` 配合：满 12 立即触发，未满按 timeout 兜底
 
@@ -482,7 +484,7 @@ docker-compose logs -f seaco-asr
 ```bash
 MODEL_PRECISION=trt_int8_enc     # 或 trt_fp16
 WORKERS=1                        # 单进程独占 GPU
-BATCH_TIMEOUT=30
+BATCH_TIMEOUT=10
 VAD_SESSION_POOL_SIZE=4
 GPU_STREAM_POOL_SIZE=4
 OMP_NUM_THREADS=1
@@ -502,7 +504,7 @@ OPENBLAS_NUM_THREADS=1
 ```bash
 MODEL_PRECISION=trt_fp16
 WORKERS=11                       # ★关键：多进程隔离 CPU 竞争
-BATCH_TIMEOUT=30
+BATCH_TIMEOUT=10
 VAD_SESSION_POOL_SIZE=4
 GPU_STREAM_POOL_SIZE=4
 OMP_NUM_THREADS=1

@@ -15,18 +15,19 @@
 # ============================================================
 
 # ─── 模型精度（核心，逐个测试时改这里）───
-MODEL_PRECISION=${MODEL_PRECISION:-trt_int8_enc}   # 可选: auto onnx_fp32 onnx_int8 trt_fp32 trt_fp16 trt_int8 trt_int8_enc
+MODEL_PRECISION=${MODEL_PRECISION:-trt_fp16}       # 可选: auto onnx_fp32 onnx_int8 trt_fp32 trt_fp16 trt_int8 trt_int8_enc
 
 # 单段精度覆盖（可选，优先级高于 MODEL_PRECISION；留空 "" 表示不覆盖）
 ENCODER_PRECISION=${ENCODER_PRECISION:-}           # 可选: "" fp32 fp16 int8
 CIF_PRECISION=${CIF_PRECISION:-}                   # 可选: "" fp32 fp16 int8
 DECODER_PRECISION=${DECODER_PRECISION:-}           # 可选: "" fp32 fp16 int8
 BIAS_PRECISION=${BIAS_PRECISION:-}                 # 可选: "" fp32 fp16 int8
+TIMESTAMP_PRECISION=${TIMESTAMP_PRECISION:-}       # 可选: "" fp32 fp16（含 BLSTM 不量化，int8 会回退 fp16）
 
 # ─── 服务运行参数 ───
 WORKERS=${WORKERS:-1}                         # uvicorn worker 进程数；可选: 1 2 4...（GPU 显存够才调大）
 BATCH=${BATCH:-12}                            # 最大 batch；合法值: 1 2 4 8 12
-BATCH_TIMEOUT=${BATCH_TIMEOUT:-30}            # batch 等待超时(ms)，工业标准 max_queue_delay；可选: 10 20 30 50
+BATCH_TIMEOUT=${BATCH_TIMEOUT:-10}            # batch 等待超时(ms)，工业标准 max_queue_delay；可选: 10 20 30 50（实测 10 吞吐最优）
 MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-2000}   # 最大并发请求数
 ACQUIRE_TIMEOUT=${ACQUIRE_TIMEOUT:-5}         # 过载拒绝等待超时（秒）；0=不拒绝（无限排队）
 MAX_AUDIO_DURATION_MS=${MAX_AUDIO_DURATION_MS:-7200000}   # 音频时长上限（ms）；默认 2 小时；0=不限
@@ -99,7 +100,7 @@ LANG=${LANG:-C.UTF-8}
 # ============================================================
 # 以下为执行逻辑，一般无需修改
 # ============================================================
-export MODEL_PRECISION ENCODER_PRECISION CIF_PRECISION DECODER_PRECISION BIAS_PRECISION
+export MODEL_PRECISION ENCODER_PRECISION CIF_PRECISION DECODER_PRECISION BIAS_PRECISION TIMESTAMP_PRECISION
 export WORKERS BATCH BATCH_TIMEOUT MAX_CONCURRENT_REQUESTS ACQUIRE_TIMEOUT MAX_AUDIO_DURATION_MS
 export LOG_LEVEL VERBOSE
 export ORT_INTRA_OP_THREADS ORT_INTER_OP_THREADS CPU_THREAD_POOL_SIZE VAD_SESSION_POOL_SIZE GPU_STREAM_POOL_SIZE

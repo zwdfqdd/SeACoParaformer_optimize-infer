@@ -1,11 +1,13 @@
 """
-TensorRT 推理引擎（v2 阶段 1：4 段串联架构）
+TensorRT 推理引擎（v2：4 段主 engine + 1 段可选 timestamp）
 
 模型组成：
     encoder.engine       — speech → encoder_out
     cif.engine           — encoder_out + mask → acoustic_embeds, token_num
     decoder.engine       — acoustic_embeds + encoder_out + bias_embed → logits
     bias_encoder.engine  — hotword_ids → hw_embed（外部按热词长度切片得到 bias_embed）
+    timestamp.engine     — encoder_out + mask + token_num → us_alphas, us_cif_peak
+                           （第 5 段，可选，ENABLE_WORD_TIMESTAMP 控制加载，字级时间戳）
 
 精度方案（推荐：纯 fp16）：
     opset 17 + clamp 60000 + trtexec --fp16
@@ -156,9 +158,11 @@ class _TRTInferencer:
 # ============================================================
 class TRTEngine:
     """
-    SeACo-Paraformer TRT 4 段串联推理引擎。
+    SeACo-Paraformer TRT 推理引擎（4 段主 + 1 段可选 timestamp）。
 
-    内部维护 4 个 _TRTInferencer，对外暴露 ASREngine 兼容接口。
+    内部维护 encoder/cif/decoder/bias_encoder 四个 _TRTInferencer，
+    以及可选的 timestamp 第 5 段（ENABLE_WORD_TIMESTAMP 开启时加载）。
+    对外暴露 ASREngine 兼容接口。
     """
 
     def __init__(self):

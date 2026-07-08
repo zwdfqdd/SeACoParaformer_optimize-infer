@@ -136,7 +136,7 @@ vad.py Silero VAD ONNX 推理：
       （防 libgomp 崩溃，Silero VAD 是串行 LSTM，OMP 内并行无收益）
     VAD_SESSION_POOL_SIZE=4
     GPU_STREAM_POOL_SIZE=4
-    BATCH_TIMEOUT=30
+    BATCH_TIMEOUT=10
 
 # 六、API 规约（POST /chinese_asr）
 

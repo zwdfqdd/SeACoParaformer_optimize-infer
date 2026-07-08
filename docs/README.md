@@ -304,7 +304,7 @@ models/asr/.hotwords.lock        跨进程互斥锁文件
 
 | 参数 | 默认 | 路径 | 说明 |
 |---|---|---|---|
-| MAX_HOTWORD_NUM | 256 | A | SeACo 热词硬上限 / 路径切换点 |
+| MAX_HOTWORD_NUM | 256 | A | 客户端热词硬上限/截断点（默认词表恒走 B，此值不作路由切换） |
 | OPT_HOTWORD_NUM | 64 | A | TRT profile opt point |
 | NFILTER | 50 | A | ASF 过滤注入数 |
 | DEFAULT_HOTWORD_PATH | models/asr/hotwords.txt | A/B | 服务端默认词表 |
@@ -361,7 +361,7 @@ docker-compose up -d
 | HOST_PORT | 8099 | 宿主机映射端口 |
 | WORKERS | 1 | uvicorn workers；小 GPU 保持 1，大 GPU（≥24GB）可设 11 见 DEPLOY.md 模式 B |
 | BATCH | 12 | 最大 batch size（合法值：1,2,4,8,12） |
-| BATCH_TIMEOUT | 30 | batch 等待超时（毫秒），工业标准 dynamic batching 的 max_queue_delay |
+| BATCH_TIMEOUT | 10 | batch 等待超时（毫秒），工业标准 dynamic batching 的 max_queue_delay（实测 10 吞吐最优） |
 | LOG_LEVEL | INFO | 日志级别 |
 | MAX_CONCURRENT_REQUESTS | 2000 | 最大并发请求数 |
 | MAX_AUDIO_DURATION_MS | 7200000 | 音频最大时长（ms），超出返回 1005；默认 2 小时，0=不限 |
@@ -480,7 +480,7 @@ SeACoParaformer/
 │   ├── vad.py                # Silero VAD ONNX
 │   ├── audio_segment.py      # 固定桶边界切分（桶边界从 config 派生）
 │   ├── asr_engine.py         # ORT/TRT 双后端路由 + 热词编码
-│   ├── trt_engine.py         # TensorRT 4 段串联推理引擎
+│   ├── trt_engine.py         # TensorRT 推理引擎（4 段主 + 可选 timestamp 第 5 段）
 │   ├── scheduler.py          # GPU Scheduler（bias-aware 分桶 + dynamic batch）
 │   ├── hotword_manager.py    # 默认词表加载 + 预编码缓存 + 热更新
 │   └── hotword_faiss.py      # 路径 B：拼音检索纠错
@@ -519,7 +519,7 @@ SeACoParaformer/
 │   │   ├── pt/               # PT 权重（提前打包，PT_MODEL_DIR）
 │   │   ├── fp32/             # 整体 ONNX fp32（onnx_fp32）
 │   │   ├── int8/             # 整体 ONNX int8（onnx_int8）
-│   │   ├── split/            # 分段 ONNX（encoder/cif/decoder/bias_encoder + *_qdq）
+│   │   ├── split/            # 分段 ONNX（encoder/cif/decoder/bias_encoder + timestamp + *_qdq）
 │   │   └── trt/              # TRT engine（GPU 绑定，直接打包进镜像）
 │   └── vad/silero_vad.onnx
 ├── docs/
