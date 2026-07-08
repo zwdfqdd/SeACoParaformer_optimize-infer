@@ -4,14 +4,46 @@
 字级时间戳、动态 Batch 推理、多后端（TensorRT / ONNX Runtime / PyTorch）、GPU 加速。
 三大功能（字级时间戳 / 热词 / Faiss）均由环境变量参数控制，可按需裁剪。
 
-## 环境准备
+## 目录
 
-### 系统要求
+- [快速开始](#快速开始) — 一条命令跑起来
+- [系统要求与安装](#系统要求与安装)
+- [模型准备](#模型准备) — 按精度/后端的完整转换流程（TRT/INT8/ORT/PT）
+- [热词管理](#热词管理) — 双路分流 + 运行时热更新
+- [精度与后端矩阵](#精度与后端矩阵) — 后端能力 + 精度选型速查
+- [服务配置](#服务配置) — 环境变量全表 + 部署形态
+- [API 使用](#api-使用)
+- [项目结构](#项目结构) — 目录树 + 服务架构（三级流水线）
 
-- 基础镜像：`nvcr.io/nvidia/tensorrt:24.11-py3`（TensorRT 10.6 + CUDA 12.6 + cuDNN 9 + Python 3.10 + PyTorch 2.5）
-- Docker + Docker Compose + NVIDIA Container Toolkit
+---
 
-### 安装依赖
+## 快速开始
+
+前提：已构建镜像、本地 PT 权重就位（`models/asr/pt/`）、宿主机有 NVIDIA GPU + Container Toolkit。
+
+```bash
+# 1. 启动服务（首次启动 run.sh 自动按精度转换出所需产物：PT→ONNX→TRT engine）
+docker-compose up -d          # 默认 trt_fp16 + 模式 B 最优参数（A10 24GB）
+#   小显存（如 2080Ti 11GB）：先 export WORKERS=1 再启动，防 OOM
+
+# 2. 等待就绪（首次含模型转换，可能数分钟）
+curl http://localhost:8099/health
+
+# 3. 冒烟测试
+python tests/test_single.py --audio test_data/audio_16000_10s.wav --url http://localhost:8099
+```
+
+不同精度 / 功能开关的一键启动命令见 [DEPLOY.md「各精度/模式 生成+运行命令速查」](DEPLOY.md)。
+
+---
+
+## 系统要求与安装
+
+| 项 | 要求 |
+|----|------|
+| 基础镜像 | `nvcr.io/nvidia/tensorrt:24.11-py3`（TensorRT 10.6 + CUDA 12.6 + cuDNN 9 + Python 3.10 + PyTorch 2.5） |
+| 运行时 | Docker + Docker Compose + NVIDIA Container Toolkit |
+| GPU | 生产推荐 A10 24GB（模式 B）；小显存（2080Ti 11GB）用模式 A |
 
 ```bash
 # 推理 + 现场转换统一依赖（转换推理合一镜像）
@@ -19,64 +51,63 @@ pip install -r requirements-infer.txt
 ```
 
 > TensorRT/PyTorch 由基础镜像内置，requirements 仅补充业务依赖 + 转换工具（onnx / nvidia-modelopt）。
+> INT8 量化额外依赖见[模型准备 · INT8 量化](#b-int8-量化trt_int8_enc--trt_int8)。
 
 ---
 
-## v2 推理路径（推荐：纯 fp16）
+## 模型准备
 
-### 总体技术路径
+服务采用**转换推理合一镜像**：`run.sh`（或容器 entrypoint）启动前自动调
+`prepare_model.py --precision $MODEL_PRECISION`，从本地 PT 权重逐级生成缺失产物，
+**生产部署无需手动执行以下步骤**。下列分步流程用于调试、单独验证或提前打包产物。
 
-通过 3 个独立技术点叠加，实现纯 fp16 推理（无任何 fp32 fallback）：
+产物依赖链（按精度自动选择所需部分）：
+
+```
+PT 权重(models/asr/pt/)
+   ├─ 整体 ONNX ──────────────→ onnx_fp32 →(动态量化)→ onnx_int8      [ORT 后端]
+   ├─ 分段 ONNX(encoder/cif/decoder/bias/timestamp)
+   │     ├─(trtexec fp16/fp32)→ TRT engine                          [TRT 后端]
+   │     └─(QDQ 量化)→ int8 ONNX →(trtexec int8)→ INT8 engine        [TRT 后端]
+   └─ 直接加载 PT 权重 ────────→ PT 原生推理                          [PT 后端]
+```
+
+### A. TRT 分段 engine（生产主路径，纯 fp16）
+
+**纯 fp16 三大关键技术**（无任何 fp32 fallback）：
 
 | # | 技术点 | 实现位置 | 作用 |
 |---|---|---|---|
-| 1 | **opset 17 LayerNormalization 单节点** | `scripts/export_onnx_split.py` 默认 `--opset 17` | PyTorch 2.5 trace 自动识别 `nn.LayerNorm`，导出为单节点；TRT 10.6 内部对该节点自动 fp32 累加，避免 fp16 LayerNorm 内 `(x-mean)²` 溢出 |
-| 2 | **encoder 残差 Add 后 clamp 60000** | `seaco_paraformer/encoder.py` 的 `EncoderLayerSANM(clamp_value=60000)` | encoder 后段层残差激活峰值高达 ~48万（远超 fp16 上限 65504）；60000 贴近 fp16 上限最大化保留信息，防溢出 inf。clamp=30000 裁剪过狠致截断输入解码错乱，已弃用 |
-| 3 | **纯 trtexec --fp16 转换** | `scripts/convert_trt.py --precision fp16` | 不需要 Python TRT API、不需要 OBEY_PRECISION_CONSTRAINTS、不需要任何手动 fp32 fallback |
+| 1 | **opset 17 LayerNormalization 单节点** | `export_onnx_split.py` 默认 `--opset 17` | TRT 10.6 内部对该节点自动 fp32 累加，避免 fp16 LayerNorm 内 `(x-mean)²` 溢出 |
+| 2 | **encoder 残差 Add clamp 60000** | `encoder.py` 的 `EncoderLayerSANM(clamp_value=60000)` | encoder 后段激活峰值 ~48万 >> fp16 上限 65504；60000 贴近上限最大化保留信息（30000 裁剪过狠已弃用） |
+| 3 | **纯 trtexec --fp16** | `convert_trt.py --precision fp16` | 无需 Python TRT API / OBEY_PRECISION_CONSTRAINTS / 手动 fallback |
 
-### 完整执行流程
+**执行流程**：
 
 ```bash
-# Step 1：PT baseline 验证（转换容器内）
-python tests/test_pt_inference_v2.py \
-    --audio test_data/audio_16000_10s.wav \
-    --hotwords 埃文 账号
+# ① PT baseline 验证（转换容器内，确认权重与识别正确）
+python tests/test_pt_inference_v2.py --audio test_data/audio_16000_10s.wav --hotwords 埃文 账号
 
-# Step 2：导出分段 ONNX（注入 clamp=60000）
-python scripts/export_onnx_split.py \
-    --output-dir ./models/asr/split \
-    --clamp-value 60000
+# ② 导出分段 ONNX（含 timestamp 第 5 段，注入 clamp=60000）
+python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 60000
 
-# Step 3：ORT 验证 ONNX 等价性
-python tests/test_split_onnx_pipeline.py \
-    --audio test_data/audio_16000_10s.wav \
-    --device cuda \
-    --hotwords 埃文 账号
+# ③ ORT 验证 ONNX 与 PT 等价
+python tests/test_split_onnx_pipeline.py --audio test_data/audio_16000_10s.wav --device cuda --hotwords 埃文 账号
 
-# Step 4：清理旧 engine（可选）
-rm -f models/asr/trt/*.engine
+# ④ 转 TRT engine（4 段主 + 可选 timestamp；--precision fp16/fp32）
+for m in encoder cif decoder bias; do
+    python scripts/convert_trt.py --input ./models/asr/split/$m.onnx --precision fp16 --profile $m
+done
+#   字级时间戳（可选，ENABLE_WORD_TIMESTAMP=true 时需要；仅 fp16/fp32）
+python scripts/convert_trt.py --input ./models/asr/split/timestamp.onnx --precision fp16 --profile timestamp
 
-# Step 5：转 fp32 baseline（可选，用于性能对比）
-python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp32 --profile encoder
-python scripts/convert_trt.py --input ./models/asr/split/cif.onnx --precision fp32 --profile cif
-python scripts/convert_trt.py --input ./models/asr/split/decoder.onnx --precision fp32 --profile decoder
-python scripts/convert_trt.py --input ./models/asr/split/bias_encoder.onnx --precision fp32 --profile bias
-
-# Step 6：转 fp16（生产方案）
-python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp16 --profile encoder
-python scripts/convert_trt.py --input ./models/asr/split/cif.onnx --precision fp16 --profile cif
-python scripts/convert_trt.py --input ./models/asr/split/decoder.onnx --precision fp16 --profile decoder
-python scripts/convert_trt.py --input ./models/asr/split/bias_encoder.onnx --precision fp16 --profile bias
-
-# Step 7：端到端验证
-python tests/test_trt_pipeline.py \
-    --audio test_data/audio_16000_10s.wav \
-    --encoder-precision fp16 --cif-precision fp16 \
-    --decoder-precision fp16 --bias-precision fp16 \
+# ⑤ 端到端验证
+python tests/test_trt_pipeline.py --audio test_data/audio_16000_10s.wav \
+    --encoder-precision fp16 --cif-precision fp16 --decoder-precision fp16 --bias-precision fp16 \
     --hotwords 埃文 账号
 ```
 
-### 精度验证标准（2080 Ti，10s 音频）
+**精度验证标准（2080 Ti，10s 音频）**：
 
 | 指标 | 期望值 | 含义 |
 |---|---|---|
@@ -86,33 +117,19 @@ python tests/test_trt_pipeline.py \
 | 识别文本 | 与 PT baseline 一致（fp16 仅极少数边缘 token 微抖） | 推理等价 |
 | RTX | ~80-100x | 性能符合预期（2080 Ti） |
 
-> **fp16 本质局限**：encoder 后段激活天然 ~48万，fp16(65504) 无法无损表示，
-> clamp=60000 仍裁极少数峰值点（单条样本偶见叠字微抖，CER 影响极小）。
-> 追求完全无损用 `trt_fp32` / `onnx_fp32`（clamp=0）。
+> **fp16 本质局限**：encoder 后段激活天然 ~48万，fp16(65504) 无法无损表示，clamp=60000 仍裁
+> 极少数峰值点（单条样本偶见叠字微抖，CER 影响极小）。追求完全无损用 `trt_fp32` / `onnx_fp32`（clamp=0）。
 
-### 备选方案（追求最高速度）
+### B. INT8 量化（trt_int8_enc / trt_int8）
 
-```bash
-# encoder fp16 + 其余 fp32 → RTX 124-157x
-python tests/test_trt_pipeline.py \
-    --audio test_data/audio_16000_10s.wav \
-    --encoder-precision fp16 \
-    --cif-precision fp32 --decoder-precision fp32 --bias-precision fp32 \
-    --hotwords 埃文 账号
-```
-
----
-
-## v2 阶段 2：INT8 量化（QDQ Explicit）
-
-### 核心结论
+#### 核心结论
 
 | 方案 | 在 SeACo 架构上的效果 |
 |---|---|
 | Calibrator Implicit（`IInt8EntropyCalibrator2`） | ❌ 无效。encoder MatMul 被 TRT myelin 融合进 LayerNorm 大 kernel，融合 kernel 不支持部分 INT8，全部 fall back fp16（engine 体积不降，INT8 层=0） |
 | **QDQ Explicit（`nvidia-modelopt`）** | ✅ 有效。Q/DQ 节点显式标记量化边界，TRT 不融合掉，INT8 真正生效 |
 
-### 环境依赖（仅 INT8 导出需要）
+#### 环境依赖（仅 INT8 导出需要）
 
 ```bash
 # 必须钉版本！0.44+ 会把 torch 顶到 2.12+cu130 破坏 torchaudio/TRT 环境
@@ -124,7 +141,7 @@ pip install nvidia-modelopt==0.21.0 torchprofile pulp regex --extra-index-url ht
 python -c "import modelopt.torch.quantization as mtq; print('modelopt OK')"
 ```
 
-### 量化范围
+#### 量化范围
 
 | 模块 | 精度 | 体积 | 说明 |
 |---|---|---|---|
@@ -144,7 +161,7 @@ python -c "import modelopt.torch.quantization as mtq; print('modelopt OK')"
 > cif QDQ（`export_cif_qdq.py`）需 fp16 encoder engine 生成校准输入；
 > bias QDQ（`export_bias_qdq.py`）自包含，用词表编码 token 校准。
 
-### 完整执行流程
+#### 执行流程
 
 ```bash
 # 校准数据：calib_data/audio_data 下放 16kHz 单声道 WAV（300 条）
@@ -196,29 +213,53 @@ python scripts/evaluate_cer.py --audio-dir calib_data/audio_data \
     --config-dir ./models/asr/pt --csv report_cer.csv
 ```
 
-### 诊断工具
+#### 诊断与说明
 
 ```bash
 # 查看 engine 各层精度分布（判断 INT8 是否真正生效）
 python scripts/inspect_engine_precision.py --engine models/asr/trt/2080_ti_encoder_int8_qdq.engine
 ```
 
-### 性能说明
-
 - INT8 体积 encoder+decoder 合计 496MB → 299MB，显存占用大幅下降
-- **2080 Ti（Turing）小 batch 下 INT8 因 Q/DQ 开销速度无明显提升**
-- INT8 的速度价值在大 batch 吞吐 + Ampere/Hopper 架构（A10/T4/Orin），部署卡上预期有收益
+- **2080 Ti（Turing）小 batch 下 INT8 因 Q/DQ 开销速度无明显提升**；速度价值在大 batch 吞吐
+  + Ampere/Hopper 架构（A10/T4/Orin），部署卡上预期有收益
+- TODO：真实标注测试集复核 CER；cif/bias int8 精度实测；CER 超标时 decoder 额外排除 `src_attn`
 
-### 待完成（TODO）
+### C. ORT 整体模型（onnx_fp32 / onnx_int8，CPU/兜底）
 
-- 真实标注测试集复核 CER（当前以 fp16 输出为参考基准，偏乐观）
-- cif/bias int8 QDQ 精度实测（cif cumsum 敏感、bias LSTM 量化支持有限，未达标回退 fp16）
-- CER 超标时：decoder 额外排除 `src_attn`（`--exclude-patterns seaco_decoder hotword_output_layer src_attn`）
-- 多 GPU engine 构建（各目标卡分别 build）
+```bash
+# ① 整体导出 fp32 ONNX（models/asr/fp32/{model.onnx, model_eb.onnx}）
+python scripts/export_onnx_whole.py --output-dir ./models/asr
+
+# ② fp32 → int8 动态量化（CPU 部署，体积 -75%）
+python scripts/convert_onnx_int8_dynamic.py --input-dir ./models/asr/fp32 --output-dir ./models/asr/int8
+
+# ③ ONNX vs PT 等价性验证
+python scripts/verify_onnx.py --audio test_data/audio_16000_10s.wav --onnx-dir ./models/asr/fp32 --device cuda
+```
+
+> **启用字级时间戳时**：ORT 不能用整体模型（无 timestamp 输出），会自动切换到 A 步导出的
+> 分段 ONNX 串联（需 `models/asr/split/` 含 timestamp）。`onnx_int8 + 时间戳` 会走 fp32 分段，
+> 失去 int8 体积优势（启动日志有告警）。
+
+### D. PT 原生推理（pt，验证/无 TRT 环境）
+
+无需任何转换，直接加载 `models/asr/pt/` 权重，GPU 优先 / CPU 兜底。适合精度基线核对、
+无 TRT 的环境。字级时间戳由 `predictor.get_upsample_timestamp` 内置支持，无额外产物。
+
+```bash
+MODEL_PRECISION=pt WORKERS=1 bash run.sh
+```
+
+### 通用：VAD 模型
+
+```bash
+python scripts/download_vad.py --output-dir ./models/vad   # 产物 models/vad/silero_vad.onnx
+```
 
 ---
 
-## 热词管理（两路分流 + 运行时热更新）
+## 热词管理
 
 路由按**是否客户端主动传热词**分流（防通用识别误触发）：
 
@@ -331,73 +372,29 @@ models/asr/.hotwords.lock        跨进程互斥锁文件
 
 ---
 
-## v1 推理路径（ORT）
+## 精度与后端矩阵
 
-### 模型准备
+### 后端能力对比
 
-```bash
-# 整体导出 fp32 ONNX
-python scripts/export_onnx_whole.py --output-dir ./models/asr
+| 后端 | MODEL_PRECISION | 设备 | 字级时间戳 | 热词 A | Faiss B | 适用 |
+|------|-----------------|------|:----------:|:------:|:-------:|------|
+| **TRT** | trt_fp16 / trt_fp32 / trt_int8 / trt_int8_enc | GPU | ✅ 第 5 段 engine | ✅ | ✅ | 生产主路径 |
+| **ORT** | onnx_fp32 / onnx_int8 | CPU/GPU | ✅ 分段串联（开启时） | ✅ | ✅ | CPU 部署 / 兜底 |
+| **PT** | pt | GPU 优先/CPU 兜底 | ✅ predictor 内置 | ✅ | ✅ | 验证 / 无 TRT 环境 |
 
-# fp32 → int8 动态量化（CPU 部署）
-python scripts/convert_onnx_int8_dynamic.py --input-dir ./models/asr/fp32 --output-dir ./models/asr/int8
-
-# 下载 VAD 模型
-python scripts/download_vad.py --output-dir ./models/vad
-```
-
-### 启动服务
-
-```bash
-# 本地启动
-python -m uvicorn src.main:app --host 0.0.0.0 --port 8080
-
-# Docker 启动（转换推理合一镜像）
-docker-compose up -d
-```
-
-### 环境变量
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| HOST_PORT | 8099 | 宿主机映射端口 |
-| WORKERS | 11 | uvicorn workers；默认 11（A10 24GB 最优）；★小 GPU（如 2080Ti 11GB）务必调回 1 防 OOM，见 DEPLOY.md 模式 A |
-| BATCH | 12 | 最大 batch size（合法值：1,2,4,8,12） |
-| BATCH_TIMEOUT | 10 | batch 等待超时（毫秒），工业标准 dynamic batching 的 max_queue_delay（实测 10 吞吐最优） |
-| LOG_LEVEL | INFO | 日志级别 |
-| MAX_CONCURRENT_REQUESTS | 2000 | 最大并发请求数 |
-| MAX_AUDIO_DURATION_MS | 7200000 | 音频最大时长（ms），超出返回 1005；默认 2 小时，0=不限 |
-| ACQUIRE_TIMEOUT | 5 | 过载并发等待超时（秒），超时返回 1007；0=无限等待 |
-| MODEL_PRECISION | auto | 模型精度（见下表） |
-| CPU_THREAD_POOL_SIZE | 32 | CPU 流水线线程池（Stage1 VAD + Stage2 特征提取）；默认 32（256 核最优，per-worker）；★对所有后端生效；小核数机器需调小 |
-| ORT_INTRA_OP_THREADS | 0(自动全核) | 主 ASR 单 session 算子并行线程数；**仅 CPU 后端（onnx_fp32/onnx_int8）生效**，TRT/GPU 与 VAD 均不生效 |
-| ORT_INTER_OP_THREADS | 1 | 主 ASR session 间并行线程数；**仅 CPU 后端生效**，同上 |
-| VAD_SESSION_POOL_SIZE | 2 | Silero VAD ORT session 池大小，round-robin 分配（实测最优 2）；VAD 单 session 线程数硬编码为 1，靠多 session 实现并行 |
-| GPU_STREAM_POOL_SIZE | 4 | TRT 多 stream 多 execution_context 池；作用于 encoder/cif/decoder（启用时含 timestamp）；bias_encoder 固定单 context（低频调用不池化） |
-| ENABLE_WORD_TIMESTAMP | false | 字级时间戳（asr[].words）；true 启用第 5 段 timestamp engine，按 GPU_STREAM_POOL_SIZE 池化，吞吐降约 30% |
-| ENABLE_HOTWORD | true | 路径 A（SeACo 在线热词）总开关；false 时忽略客户端传入的 hotwords，不做 SeACo 增强 |
-| ENABLE_FAISS_CORRECTION | true | 路径 B（默认词表 Faiss 纠错）总开关；false 时不构建/不运行 Faiss 后处理，通用识别零后处理开销 |
-| OMP_NUM_THREADS | 1 | ★必须保持 1，防 libgomp 崩溃（run.sh 已固化） |
-| MKL_NUM_THREADS | 1 | 同上 |
-| OPENBLAS_NUM_THREADS | 1 | 同上 |
-
-> 容器内部固定端口 8080，通过 HOST_PORT 映射到宿主机。
-> **两种部署形态**（详见 DEPLOY.md 高并发性能调优）：
-> - **模式 A 单进程**（默认）：WORKERS=1，任何硬件都能跑，QPS ~13
-> - **模式 B 多进程**（大 GPU 生产）：WORKERS=11，QPS 93.92，需 24GB+ 显存
-> 代码已按多 worker 安全设计（词表热更新经文件轮询跨 worker 收敛）。
-> 每个 worker 独立加载 engine + CUDA context，显存占用随 WORKERS 线性增长。
+三大功能开关（`ENABLE_WORD_TIMESTAMP` / `ENABLE_HOTWORD` / `ENABLE_FAISS_CORRECTION`）
+在三后端一致生效，详见 `docs/CONTRIBUTING.md` 三后端支持矩阵。
 
 ### MODEL_PRECISION 取值
 
 | 取值 | 后端 | 各段精度(enc/cif/dec/bias/timestamp) | 说明 |
 |---|---|---|---|
 | auto | 自动 | — | GPU: trt_int8_enc→trt_fp16→trt_fp32→onnx_fp32；CPU: onnx_int8→onnx_fp32 |
-| pt | PT | — | 原始 PyTorch 模型推理（GPU 优先/CPU 兜底；支持热词/Faiss/字级时间戳；无需转换，适合验证/无 TRT 环境） |
+| pt | PT | — | 原始 PyTorch 推理（GPU 优先/CPU 兜底；无需转换，适合验证/无 TRT 环境） |
 | onnx_fp32 | ORT | — | ONNX Runtime fp32（整体模型；启用字级时间戳时切分段串联） |
 | onnx_int8 | ORT | — | ONNX Runtime int8 动态量化（CPU） |
-| trt_fp32 | TRT | fp32/fp32/fp32/fp32/fp32 | 全 fp32 |
-| trt_fp16 | TRT | fp16/fp16/fp16/fp16/fp16 | 全 fp16 |
+| trt_fp32 | TRT | fp32/fp32/fp32/fp32/fp32 | 全 fp32，无损基线 |
+| trt_fp16 | TRT | fp16/fp16/fp16/fp16/fp16 | 全 fp16，生产通用 |
 | trt_int8 | TRT | int8/int8/int8/int8/fp16 | encoder..bias int8（QDQ）+ timestamp fp16。精度损失较大，不推荐线上 |
 | **trt_int8_enc** | TRT | **int8/fp16/fp16/fp16/fp16** | **线上推荐**：encoder 显存减半，热词精度保留 |
 
@@ -407,7 +404,44 @@ docker-compose up -d
 
 ---
 
-## API 示例
+## 服务配置
+
+### 环境变量全表
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| HOST_PORT | 8099 | 宿主机映射端口（容器内固定 8080） |
+| WORKERS | 11 | uvicorn workers；默认 11（A10 24GB 最优）；★小 GPU（如 2080Ti 11GB）务必调回 1 防 OOM |
+| BATCH | 12 | 最大 batch size（合法值：1,2,4,8,12） |
+| BATCH_TIMEOUT | 10 | batch 等待超时（ms），dynamic batching 的 max_queue_delay（实测 10 吞吐最优） |
+| MODEL_PRECISION | auto | 模型精度（见上表；部署脚本默认 trt_fp16） |
+| CPU_THREAD_POOL_SIZE | 32 | CPU 流水线线程池（Stage1 VAD + Stage2 特征）；默认 32（256 核最优，per-worker）；★所有后端生效 |
+| VAD_SESSION_POOL_SIZE | 2 | Silero VAD ORT session 池（round-robin，实测最优 2）；单 session 线程硬编码 1 |
+| GPU_STREAM_POOL_SIZE | 4 | TRT 多 stream 多 context 池；作用于 encoder/cif/decoder(+timestamp)；bias_encoder 固定单 context |
+| ENABLE_WORD_TIMESTAMP | false | 字级时间戳（asr[].words）；true 启用，吞吐降约 30% |
+| ENABLE_HOTWORD | true | 路径 A（SeACo 在线热词）总开关 |
+| ENABLE_FAISS_CORRECTION | true | 路径 B（默认词表 Faiss 纠错）总开关 |
+| ORT_INTRA_OP_THREADS | 0(全核) | 主 ASR 单 session 算子并行；**仅 CPU 后端生效**，TRT/GPU 与 VAD 均无效 |
+| ORT_INTER_OP_THREADS | 1 | 主 ASR session 间并行；**仅 CPU 后端生效** |
+| MAX_CONCURRENT_REQUESTS | 2000 | 最大并发请求数 |
+| MAX_AUDIO_DURATION_MS | 7200000 | 音频最大时长（ms），超出返回 1005；默认 2 小时，0=不限 |
+| ACQUIRE_TIMEOUT | 5 | 过载并发等待超时（秒），超时返回 1007；0=无限等待 |
+| LOG_LEVEL | INFO | 日志级别 |
+| OMP/MKL/OPENBLAS_NUM_THREADS | 1 | ★必须保持 1，防 libgomp 高并发崩溃 |
+
+### 两种部署形态（详见 DEPLOY.md 性能调优）
+
+| 模式 | WORKERS | 适用 | 实测 QPS |
+|------|:-------:|------|:--------:|
+| **模式 A 单进程** | 1 | 小 GPU（2080Ti 11GB）/ 低并发 / 开发调试 | ~13（conc=20） |
+| **模式 B 多进程**（默认） | 11 | 大 GPU（A10 24GB+）/ 高并发生产 | ~94（conc=120） |
+
+> 每个 worker 独立加载 engine + CUDA context，显存随 WORKERS 线性增长。
+> 词表热更新经文件轮询跨 worker 收敛（多 worker 安全）。完整参数调优见 DEPLOY.md。
+
+---
+
+## API 使用
 
 ### curl
 
@@ -456,6 +490,8 @@ print(response.json())
 ```bash
 curl http://localhost:8099/health
 ```
+
+> 完整接口 schema（请求/响应字段、错误码、空/短音频行为、热词热更新接口）见 [API.md](API.md)。
 
 ---
 
