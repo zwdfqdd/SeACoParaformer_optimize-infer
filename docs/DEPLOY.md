@@ -49,18 +49,21 @@ docker-compose logs -f seaco-asr
 通过 `.env` 文件或环境变量覆盖默认配置：
 
 ```bash
-# .env 示例（默认 = 模式 A 单进程，任何硬件都能跑）
+# .env 示例（★模式 A 覆盖：小 GPU/低显存场景，显式把 WORKERS 调回 1）
+# 注：内置默认已是模式 B（WORKERS=11/CPU_POOL=32/VAD_POOL=2，A10 24GB 最优）；
+#     小硬件用下方值覆盖即可。
 HOST_PORT=8099
-WORKERS=1
+WORKERS=1                          # 模式 A：小 GPU 单进程防 OOM
 BATCH=12
 BATCH_TIMEOUT=10
 LOG_LEVEL=INFO
 MAX_CONCURRENT_REQUESTS=2000
-MODEL_PRECISION=trt_int8_enc
+MODEL_PRECISION=trt_int8_enc       # 或 trt_fp16（内置默认）；int8_enc 显存更省
 VERBOSE=0
 
-# 稳定性/性能相关（run.sh 已固化默认值）
-VAD_SESSION_POOL_SIZE=4
+# 稳定性/性能相关
+CPU_THREAD_POOL_SIZE=16            # 模式 A 单进程可用较小值
+VAD_SESSION_POOL_SIZE=2
 GPU_STREAM_POOL_SIZE=4
 OMP_NUM_THREADS=1
 MKL_NUM_THREADS=1
@@ -74,13 +77,14 @@ OPENBLAS_NUM_THREADS=1
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | HOST_PORT | 8099 | 宿主机映射端口 |
-| WORKERS | 1 | uvicorn workers；小 GPU 保持 1，大 GPU 可设 11 见「高并发调优 模式 B」 |
+| WORKERS | 11 | uvicorn workers；默认 11（模式 B，A10 24GB 最优）；★小 GPU 改回 1（模式 A）防 OOM |
 | BATCH | 12 | 最大 batch size（合法值：1,2,4,8,12） |
 | BATCH_TIMEOUT | 10 | batch 等待超时（毫秒），工业标准 dynamic batching 的 max_queue_delay（实测 10 吞吐最优） |
 | LOG_LEVEL | INFO | 日志级别（DEBUG/INFO/WARNING/ERROR） |
 | MAX_CONCURRENT_REQUESTS | 2000 | 最大并发请求数 |
 | MODEL_PRECISION | auto | 模型精度选择（见 README MODEL_PRECISION 取值表） |
-| VAD_SESSION_POOL_SIZE | 4 | Silero VAD ORT session 池大小，round-robin 分配 |
+| CPU_THREAD_POOL_SIZE | 32 | CPU 流水线线程池（Stage1 VAD+Stage2 特征）；默认 32（256 核最优，per-worker）|
+| VAD_SESSION_POOL_SIZE | 2 | Silero VAD ORT session 池大小，round-robin 分配（实测最优 2）|
 | GPU_STREAM_POOL_SIZE | 4 | TRT engine 多 stream 多 execution_context 池 |
 | OMP_NUM_THREADS | 1 | ★必须 1，防 libgomp 崩溃（run.sh 已固化） |
 | MKL_NUM_THREADS | 1 | 同上 |
@@ -105,10 +109,64 @@ OPENBLAS_NUM_THREADS=1
 | **trt_int8_enc** | int8/fp16/fp16/fp16 | **线上推荐**（encoder 显存减半，CER≈0，热词精度保留） |
 | trt_fp16 | fp16×4 | GPU 通用 |
 | trt_fp32 | fp32×4 | GPU 无损基线 |
-| onnx_fp32 | ORT 整体 fp32 | CPU / 兜底 |
+| onnx_fp32 | ORT 整体 fp32 | CPU / 兜底（启用字级时间戳时切分段串联） |
+| pt | 原生 PyTorch | GPU 优先/CPU 兜底；无需转换，适合验证/无 TRT 环境 |
 | onnx_int8 | ORT 整体 int8 动态量化 | CPU |
 
-单段精度可用 `ENCODER_PRECISION`/`CIF_PRECISION`/`DECODER_PRECISION`/`BIAS_PRECISION` 覆盖。
+单段精度可用 `ENCODER_PRECISION`/`CIF_PRECISION`/`DECODER_PRECISION`/`BIAS_PRECISION`/
+`TIMESTAMP_PRECISION` 覆盖。
+
+---
+
+## 各精度/模式 生成 + 运行命令速查
+
+> **核心机制**：`run.sh` 启动前自动调 `prepare_model.py --precision $MODEL_PRECISION`，
+> 按需从本地 PT 权重逐级生成缺失产物（PT → 分段 ONNX →(QDQ ONNX)→ TRT engine）。
+> 因此绝大多数场景「设好环境变量 + `bash run.sh`」即一键完成**生成 + 启动**，无需手动分步。
+
+### 一键式（推荐，容器内 /app 下）
+
+| 场景 | 命令 |
+|------|------|
+| 生产默认（trt_fp16 + 模式B最优） | `bash run.sh` |
+| 线上省显存（encoder int8） | `MODEL_PRECISION=trt_int8_enc bash run.sh` |
+| 无损基线 | `MODEL_PRECISION=trt_fp32 bash run.sh` |
+| 全 int8（备选） | `MODEL_PRECISION=trt_int8 bash run.sh` |
+| CPU 部署 | `MODEL_PRECISION=onnx_int8 WORKERS=1 ORT_INTRA_OP_THREADS=2 bash run.sh` |
+| PT 原生（验证/无 TRT） | `MODEL_PRECISION=pt WORKERS=1 bash run.sh` |
+| 小 GPU（2080Ti 防 OOM） | `MODEL_PRECISION=trt_fp16 WORKERS=1 bash run.sh` |
+| 纯转写极限吞吐 | `ENABLE_HOTWORD=false ENABLE_FAISS_CORRECTION=false bash run.sh` |
+
+### 字级时间戳（任意后端，加 `ENABLE_WORD_TIMESTAMP=true`）
+
+| 后端 | 命令 | 说明 |
+|------|------|------|
+| TRT | `ENABLE_WORD_TIMESTAMP=true MODEL_PRECISION=trt_fp16 WORKERS=10 bash run.sh` | 额外构建第 5 段 timestamp engine（fp16）；WORKERS 降 10 防 OOM |
+| TRT（timestamp fp32） | `ENABLE_WORD_TIMESTAMP=true TIMESTAMP_PRECISION=fp32 MODEL_PRECISION=trt_fp32 bash run.sh` | 时间戳段 fp32 |
+| ORT | `ENABLE_WORD_TIMESTAMP=true MODEL_PRECISION=onnx_fp32 WORKERS=1 bash run.sh` | 自动切 fp32 分段串联 |
+| PT | `ENABLE_WORD_TIMESTAMP=true MODEL_PRECISION=pt WORKERS=1 bash run.sh` | predictor 内置，无额外产物 |
+
+> `onnx_int8 + ENABLE_WORD_TIMESTAMP=true` 会静默切 fp32 分段串联（无 int8 量化分段产物），
+> 失去 int8 体积/速度优势（启动日志有告警）。需 int8 体积请关字级时间戳。
+
+### 手动分步生成（调试/单独验证用）
+
+```bash
+# 1. 导出分段 ONNX（含 timestamp 第 5 段，clamp=60000）
+python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 60000
+
+# 2. 转 TRT engine（逐段，--precision fp16/fp32/int8，--profile encoder/cif/decoder/bias/timestamp）
+python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp16 --profile encoder
+python scripts/convert_trt.py --input ./models/asr/split/timestamp.onnx --precision fp16 --profile timestamp
+#   （其余段同理；int8 段需先经 QDQ 量化，见 README v2 阶段 2）
+
+# 3. 仅生成不启动（提前预热/打包镜像）
+python scripts/prepare_model.py --precision trt_fp16
+ENABLE_WORD_TIMESTAMP=true python scripts/prepare_model.py --precision trt_fp16  # 含 timestamp
+
+# 4. 启动服务
+python -m uvicorn src.main:app --host 0.0.0.0 --port 8080 --workers 11
+```
 
 ---
 
@@ -311,6 +369,9 @@ docker-compose logs -f seaco-asr
 | **trt_int8_enc** | int8/fp16/fp16/fp16 | 更省 | **线上推荐** |
 | trt_int8 | int8×4（QDQ） | 最省 | 实测可跑但精度损失较大，不推荐线上 |
 
+> 第 5 段 timestamp（字级时间戳，`ENABLE_WORD_TIMESTAMP=true` 时启用）仅 fp16/fp32
+> （含 BLSTM 不量化，int8 自动回退 fp16），不计入上表 4 段量化组合。
+
 ---
 
 ## 日志管理
@@ -485,7 +546,8 @@ docker-compose logs -f seaco-asr
 MODEL_PRECISION=trt_int8_enc     # 或 trt_fp16
 WORKERS=1                        # 单进程独占 GPU
 BATCH_TIMEOUT=10
-VAD_SESSION_POOL_SIZE=4
+CPU_THREAD_POOL_SIZE=16          # 单进程可用较小值
+VAD_SESSION_POOL_SIZE=2
 GPU_STREAM_POOL_SIZE=4
 OMP_NUM_THREADS=1
 MKL_NUM_THREADS=1
@@ -505,7 +567,8 @@ OPENBLAS_NUM_THREADS=1
 MODEL_PRECISION=trt_fp16
 WORKERS=11                       # ★关键：多进程隔离 CPU 竞争
 BATCH_TIMEOUT=10
-VAD_SESSION_POOL_SIZE=4
+CPU_THREAD_POOL_SIZE=32          # 256 核实测最优
+VAD_SESSION_POOL_SIZE=2
 GPU_STREAM_POOL_SIZE=4
 OMP_NUM_THREADS=1
 MKL_NUM_THREADS=1

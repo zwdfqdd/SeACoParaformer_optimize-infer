@@ -1,6 +1,8 @@
 # SeACo-Paraformer ASR 服务
 
-基于 SeACo-Paraformer 的工业级中文语音识别服务，支持热词定制、动态 Batch 推理、GPU 加速。
+基于 SeACo-Paraformer 的工业级中文语音识别服务：热词定制（SeACo 在线 + Faiss 后处理双路）、
+字级时间戳、动态 Batch 推理、多后端（TensorRT / ONNX Runtime / PyTorch）、GPU 加速。
+三大功能（字级时间戳 / 热词 / Faiss）均由环境变量参数控制，可按需裁剪。
 
 ## 环境准备
 
@@ -359,7 +361,7 @@ docker-compose up -d
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | HOST_PORT | 8099 | 宿主机映射端口 |
-| WORKERS | 1 | uvicorn workers；小 GPU 保持 1，大 GPU（≥24GB）可设 11 见 DEPLOY.md 模式 B |
+| WORKERS | 11 | uvicorn workers；默认 11（A10 24GB 最优）；★小 GPU（如 2080Ti 11GB）务必调回 1 防 OOM，见 DEPLOY.md 模式 A |
 | BATCH | 12 | 最大 batch size（合法值：1,2,4,8,12） |
 | BATCH_TIMEOUT | 10 | batch 等待超时（毫秒），工业标准 dynamic batching 的 max_queue_delay（实测 10 吞吐最优） |
 | LOG_LEVEL | INFO | 日志级别 |
@@ -367,10 +369,10 @@ docker-compose up -d
 | MAX_AUDIO_DURATION_MS | 7200000 | 音频最大时长（ms），超出返回 1005；默认 2 小时，0=不限 |
 | ACQUIRE_TIMEOUT | 5 | 过载并发等待超时（秒），超时返回 1007；0=无限等待 |
 | MODEL_PRECISION | auto | 模型精度（见下表） |
-| CPU_THREAD_POOL_SIZE | 0(自动全核) | CPU 流水线线程池（Stage1 VAD + Stage2 特征提取）；★对所有后端生效；多 worker 务必设小 |
+| CPU_THREAD_POOL_SIZE | 32 | CPU 流水线线程池（Stage1 VAD + Stage2 特征提取）；默认 32（256 核最优，per-worker）；★对所有后端生效；小核数机器需调小 |
 | ORT_INTRA_OP_THREADS | 0(自动全核) | 主 ASR 单 session 算子并行线程数；**仅 CPU 后端（onnx_fp32/onnx_int8）生效**，TRT/GPU 与 VAD 均不生效 |
 | ORT_INTER_OP_THREADS | 1 | 主 ASR session 间并行线程数；**仅 CPU 后端生效**，同上 |
-| VAD_SESSION_POOL_SIZE | 4 | Silero VAD ORT session 池大小，round-robin 分配；VAD 单 session 线程数硬编码为 1，靠多 session 实现并行 |
+| VAD_SESSION_POOL_SIZE | 2 | Silero VAD ORT session 池大小，round-robin 分配（实测最优 2）；VAD 单 session 线程数硬编码为 1，靠多 session 实现并行 |
 | GPU_STREAM_POOL_SIZE | 4 | TRT 多 stream 多 execution_context 池；作用于 encoder/cif/decoder（启用时含 timestamp）；bias_encoder 固定单 context（低频调用不池化） |
 | ENABLE_WORD_TIMESTAMP | false | 字级时间戳（asr[].words）；true 启用第 5 段 timestamp engine，按 GPU_STREAM_POOL_SIZE 池化，吞吐降约 30% |
 | ENABLE_HOTWORD | true | 路径 A（SeACo 在线热词）总开关；false 时忽略客户端传入的 hotwords，不做 SeACo 增强 |
@@ -388,18 +390,20 @@ docker-compose up -d
 
 ### MODEL_PRECISION 取值
 
-| 取值 | 后端 | 各段精度(enc/cif/dec/bias) | 说明 |
+| 取值 | 后端 | 各段精度(enc/cif/dec/bias/timestamp) | 说明 |
 |---|---|---|---|
 | auto | 自动 | — | GPU: trt_int8_enc→trt_fp16→trt_fp32→onnx_fp32；CPU: onnx_int8→onnx_fp32 |
 | pt | PT | — | 原始 PyTorch 模型推理（GPU 优先/CPU 兜底；支持热词/Faiss/字级时间戳；无需转换，适合验证/无 TRT 环境） |
-| onnx_fp32 | ORT | — | ONNX Runtime fp32（v1 整体模型） |
+| onnx_fp32 | ORT | — | ONNX Runtime fp32（整体模型；启用字级时间戳时切分段串联） |
 | onnx_int8 | ORT | — | ONNX Runtime int8 动态量化（CPU） |
-| trt_fp32 | TRT | fp32/fp32/fp32/fp32 | 4 段全 fp32 |
-| trt_fp16 | TRT | fp16/fp16/fp16/fp16 | 4 段全 fp16 |
-| trt_int8 | TRT | int8/int8/int8/int8 | 4 段全 int8（QDQ）。实测可运行但**精度损失较大**，不推荐线上，仅显存极紧张时用 |
-| **trt_int8_enc** | TRT | **int8/fp16/fp16/fp16** | **线上推荐**：encoder 显存减半，热词精度保留 |
+| trt_fp32 | TRT | fp32/fp32/fp32/fp32/fp32 | 全 fp32 |
+| trt_fp16 | TRT | fp16/fp16/fp16/fp16/fp16 | 全 fp16 |
+| trt_int8 | TRT | int8/int8/int8/int8/fp16 | encoder..bias int8（QDQ）+ timestamp fp16。精度损失较大，不推荐线上 |
+| **trt_int8_enc** | TRT | **int8/fp16/fp16/fp16/fp16** | **线上推荐**：encoder 显存减半，热词精度保留 |
 
-单段精度可用环境变量覆盖（优先级最高）：`ENCODER_PRECISION` / `CIF_PRECISION` / `DECODER_PRECISION` / `BIAS_PRECISION`，取值 `fp32`/`fp16`/`int8`。
+单段精度可用环境变量覆盖（优先级最高）：`ENCODER_PRECISION` / `CIF_PRECISION` /
+`DECODER_PRECISION` / `BIAS_PRECISION` / `TIMESTAMP_PRECISION`，取值 `fp32`/`fp16`/`int8`
+（timestamp 仅 fp32/fp16，含 BLSTM 不量化，int8 自动回退 fp16）。
 
 ---
 
@@ -479,8 +483,10 @@ SeACoParaformer/
 │   ├── tokenizer.py          # vocab8404 解码
 │   ├── vad.py                # Silero VAD ONNX
 │   ├── audio_segment.py      # 固定桶边界切分（桶边界从 config 派生）
-│   ├── asr_engine.py         # ORT/TRT 双后端路由 + 热词编码
+│   ├── asr_engine.py         # 多后端路由（trt/ort/ort_split/pt）+ 热词编码
 │   ├── trt_engine.py         # TensorRT 推理引擎（4 段主 + 可选 timestamp 第 5 段）
+│   ├── ort_engine.py         # ONNX Runtime 分段串联（时间戳启用时替代整体模型）
+│   ├── pt_engine.py          # PyTorch 原生推理（GPU 优先/CPU 兜底）
 │   ├── scheduler.py          # GPU Scheduler（bias-aware 分桶 + dynamic batch）
 │   ├── hotword_manager.py    # 默认词表加载 + 预编码缓存 + 热更新
 │   └── hotword_faiss.py      # 路径 B：拼音检索纠错

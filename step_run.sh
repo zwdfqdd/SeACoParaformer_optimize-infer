@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================
-# SeACo-Paraformer v2 阶段 1 完整执行流程
-# 最终方案：opset 17 + clamp 60000 + 纯 fp16
+# SeACo-Paraformer 完整执行流程（分步手册）
+# 覆盖：TRT 分段(fp32/fp16/int8/int8_enc) + 第5段timestamp + ORT整体/分段 + PT 原生
+# TRT fp16 方案：opset 17 + clamp 60000 + 纯 fp16
+# step1-3 TRT分段导出转换 / step4-5 INT8 QDQ / step6 ORT整体 / step7 VAD
+# step8 服务接口冒烟 / step9 三后端一键启动+功能开关
+# 生产一键启动见 step9 或 docs/DEPLOY.md 命令速查；本手册主用于分步调试验证。
 # ============================================================
 
 step 1:
@@ -37,6 +41,13 @@ step 3:
     python scripts/convert_trt.py --input ./models/asr/split/cif.onnx --precision fp16 --profile cif
     python scripts/convert_trt.py --input ./models/asr/split/decoder.onnx --precision fp16 --profile decoder
     python scripts/convert_trt.py --input ./models/asr/split/bias_encoder.onnx --precision fp16 --profile bias
+
+    # ─── 第 5 段 timestamp engine（字级时间戳，可选）─────────
+    #   仅 ENABLE_WORD_TIMESTAMP=true 时需要；含 BLSTM 不量化，只 fp16/fp32
+    #   （fp32 profile 下用 fp32，其余用 fp16；TIMESTAMP_PRECISION 可覆盖）
+    python scripts/convert_trt.py --input ./models/asr/split/timestamp.onnx --precision fp16 --profile timestamp
+    # 验证字级时间戳（PT baseline 对齐 FunASR ts_prediction_lfr6_standard）
+    python scripts/verify_timestamp.py --audio test_data/audio_16000_10s.wav --method alphas2
 
     # 全 fp16 端到端
     python tests/test_trt_pipeline.py --audio test_data/audio_16000_10s.wav \
@@ -280,6 +291,32 @@ step 8:
     # 并发压测（10 并发，共 50 请求）
     python tests/test_service.py --audio test_data/audio_16000_30s.wav \
         --url http://localhost:8080 --concurrency 10 --total 50
+
+step 9:
+    # ============================================================
+    # 三后端一键启动（run.sh 自动 prepare_model 生成产物）+ 功能开关
+    #   完整命令速查见 docs/DEPLOY.md「各精度/模式 生成+运行命令速查」
+    # ============================================================
+    # ─── 一键生成 + 启动（run.sh 内部按 MODEL_PRECISION 自动转换缺失产物）───
+    bash run.sh                                             # 默认 trt_fp16 + 模式B最优
+    MODEL_PRECISION=trt_int8_enc bash run.sh                # 线上省显存
+    MODEL_PRECISION=onnx_int8 WORKERS=1 bash run.sh         # CPU 部署
+    MODEL_PRECISION=pt WORKERS=1 bash run.sh                # PT 原生（GPU 优先/CPU 兜底）
+
+    # ─── 字级时间戳（三后端，加 ENABLE_WORD_TIMESTAMP=true）───
+    ENABLE_WORD_TIMESTAMP=true MODEL_PRECISION=trt_fp16 WORKERS=10 bash run.sh   # TRT 第5段engine
+    ENABLE_WORD_TIMESTAMP=true MODEL_PRECISION=onnx_fp32 WORKERS=1 bash run.sh   # ORT 分段串联
+    ENABLE_WORD_TIMESTAMP=true MODEL_PRECISION=pt WORKERS=1 bash run.sh          # PT predictor内置
+
+    # ─── 热词/Faiss 模块开关 ───
+    ENABLE_HOTWORD=false ENABLE_FAISS_CORRECTION=false bash run.sh   # 纯转写极限吞吐
+
+    # ─── 仅生成产物不启动（提前预热/打包镜像）───
+    python scripts/prepare_model.py --precision trt_fp16
+    ENABLE_WORD_TIMESTAMP=true python scripts/prepare_model.py --precision trt_fp16  # 含timestamp
+
+    # ─── 字级时间戳 API 验证（服务启动后，words 字段非空）───
+    python tests/test_single.py --audio test_data/audio_16000_10s.wav --url http://localhost:8080
 
 # ============================================================
 # 测试脚本依赖说明
