@@ -591,10 +591,12 @@ class Settings:
 
     @classmethod
     def dump_effective_config(cls) -> list[str]:
-        """收集所有实际生效的运行配置，返回逐行字符串列表（供启动时打印）。
+        """收集实际生效的运行配置，返回逐行字符串列表（供启动时整体打印）。
 
-        用于复现与排错：一眼确认环境变量是否按预期生效、实际走哪个后端/精度/设备、
-        各功能开关与池化参数最终取值。分组输出，含 per-worker 换算与 engine 路径。
+        ★按实际启用的模块动态组装：仅输出当前生效的分组。例如未开启热词模块
+        （ENABLE_HOTWORD=false）则不输出热词参数；未开 Faiss 则不输出 Faiss 参数；
+        非 CPU 后端不输出 ORT 线程数；非 PT 后端不输出 PT 权重目录。
+        便于按实际运行状态复现与核对配置正确性。
         """
         precision = cls.get_model_precision()
         backend = cls.get_inference_backend()
@@ -604,7 +606,9 @@ class Settings:
 
         lines: list[str] = []
         lines.append("=" * 60)
-        lines.append("[后端/精度]")
+
+        # ── 模型精度（始终）──
+        lines.append("[模型精度]")
         lines.append(f"  MODEL_PRECISION（请求值）: {cls.MODEL_PRECISION}")
         lines.append(f"  实际精度 / 后端 / 设备   : {precision} / {backend} / {device}")
         if backend == "trt":
@@ -613,48 +617,83 @@ class Settings:
                          f"cif={prec_map['cif']} dec={prec_map['decoder']} "
                          f"bias={prec_map['bias_encoder']} ts={prec_map['timestamp']}")
 
-        lines.append("[服务/并发]")
+        # ── 服务运行参数（始终）──
+        lines.append("[服务运行参数]")
         lines.append(f"  WORKERS                  : {cls.WORKERS}")
         lines.append(f"  BATCH / BATCH_TIMEOUT    : {cls.BATCH} / {cls.BATCH_TIMEOUT}ms")
         lines.append(f"  MAX_CONCURRENT_REQUESTS  : {cls.MAX_CONCURRENT_REQUESTS}")
         lines.append(f"  ACQUIRE_TIMEOUT          : {cls.ACQUIRE_TIMEOUT}s")
         lines.append(f"  MAX_AUDIO_DURATION_MS    : {cls.MAX_AUDIO_DURATION_MS}")
-
-        lines.append("[线程/池化]（per-worker）")
         lines.append(f"  CPU_THREAD_POOL_SIZE     : {cls.CPU_THREAD_POOL_SIZE}"
                      f"（实际 {cpu_pool}；总线程≈WORKERS×值={cls.WORKERS * cpu_pool}）")
         lines.append(f"  VAD_SESSION_POOL_SIZE    : {cls.VAD_SESSION_POOL_SIZE}")
-        lines.append(f"  GPU_STREAM_POOL_SIZE     : {cls.GPU_STREAM_POOL_SIZE}")
-        lines.append(f"  ORT_INTRA/INTER_OP       : {cls.ORT_INTRA_OP_THREADS}/"
-                     f"{cls.ORT_INTER_OP_THREADS}（仅 CPU 后端生效）")
+        if backend == "trt":
+            lines.append(f"  GPU_STREAM_POOL_SIZE     : {cls.GPU_STREAM_POOL_SIZE}")
+
+        # ── CPU 推理线程数（仅 CPU 后端 onnx_* 生效）──
+        if backend == "ort" and device == "cpu":
+            lines.append("[CPU 推理线程数]（仅 CPU 后端生效）")
+            lines.append(f"  ORT_INTRA_OP_THREADS     : {cls.ORT_INTRA_OP_THREADS}"
+                         f"（0=自动全核）")
+            lines.append(f"  ORT_INTER_OP_THREADS     : {cls.ORT_INTER_OP_THREADS}")
+
+        # ── OMP / BLAS 线程数（始终，稳定性红线）──
+        lines.append("[OMP / BLAS 线程数]")
         lines.append(f"  OMP/MKL/OPENBLAS         : "
                      f"{_os.getenv('OMP_NUM_THREADS', '?')}/"
                      f"{_os.getenv('MKL_NUM_THREADS', '?')}/"
                      f"{_os.getenv('OPENBLAS_NUM_THREADS', '?')}")
 
-        lines.append("[功能开关]")
-        lines.append(f"  ENABLE_WORD_TIMESTAMP    : {cls.ENABLE_WORD_TIMESTAMP}"
-                     f"（upsample_times={cls.TIMESTAMP_UPSAMPLE_TIMES}）")
-        lines.append(f"  ENABLE_HOTWORD           : {cls.ENABLE_HOTWORD}")
-        lines.append(f"  ENABLE_FAISS_CORRECTION  : {cls.ENABLE_FAISS_CORRECTION}")
+        # ── 字级时间戳（仅启用时）──
+        if cls.ENABLE_WORD_TIMESTAMP:
+            lines.append("[字级时间戳]（ENABLE_WORD_TIMESTAMP=true）")
+            lines.append(f"  TIMESTAMP_UPSAMPLE_TIMES : {cls.TIMESTAMP_UPSAMPLE_TIMES}")
+            if backend == "trt":
+                lines.append(f"  TIMESTAMP 精度           : "
+                             f"{cls.get_trt_precision_map()['timestamp']}")
 
-        lines.append("[热词参数]")
-        lines.append(f"  MAX/OPT_HOTWORD_NUM      : {cls.MAX_HOTWORD_NUM}/{cls.OPT_HOTWORD_NUM}")
-        lines.append(f"  NFILTER / MAX_HOTWORD_LEN: {cls.NFILTER}/{cls.MAX_HOTWORD_LEN}")
-        lines.append(f"  DEFAULT_HOTWORD_PATH     : {cls.DEFAULT_HOTWORD_PATH}")
+        # ── 热词模块（路径 A，仅启用时）──
+        if cls.ENABLE_HOTWORD:
+            lines.append("[热词模块 · 路径A SeACo]（ENABLE_HOTWORD=true）")
+            lines.append(f"  MAX/OPT_HOTWORD_NUM      : {cls.MAX_HOTWORD_NUM}/{cls.OPT_HOTWORD_NUM}")
+            lines.append(f"  NFILTER / MAX_HOTWORD_LEN: {cls.NFILTER}/{cls.MAX_HOTWORD_LEN}")
 
-        lines.append("[Bucket/Batch]")
+        # ── Faiss 大词库纠错（路径 B，仅启用时）──
+        if cls.ENABLE_FAISS_CORRECTION:
+            lines.append("[Faiss 大词库纠错 · 路径B]（ENABLE_FAISS_CORRECTION=true）")
+            lines.append(f"  FAISS_WINDOW_SIZES       : {cls.FAISS_WINDOW_SIZES}")
+            lines.append(f"  FAISS_TOPK               : {cls.FAISS_TOPK}")
+            lines.append(f"  拼音/编辑距离权重         : "
+                         f"{cls.FAISS_PINYIN_WEIGHT}/{cls.FAISS_EDIT_WEIGHT}")
+            lines.append(f"  三重判定阈值(faiss/gap/final): "
+                         f"{cls.FAISS_SCORE_THRESHOLD}/{cls.GAP_THRESHOLD}/{cls.FINAL_SCORE_THRESHOLD}")
+
+        # ── 词表 + 热更新（热词或 Faiss 任一启用时，默认词表才有意义）──
+        if cls.ENABLE_HOTWORD or cls.ENABLE_FAISS_CORRECTION:
+            lines.append("[词表 / 热更新]")
+            lines.append(f"  DEFAULT_HOTWORD_PATH     : {cls.DEFAULT_HOTWORD_PATH}")
+            lines.append(f"  HOTWORD_RELOAD_ENABLED   : {cls.HOTWORD_RELOAD_ENABLED}")
+            if cls.HOTWORD_RELOAD_ENABLED:
+                lines.append(f"  HOTWORD_POLL_INTERVAL    : {cls.HOTWORD_POLL_INTERVAL}s")
+
+        # ── Bucket / Batch（始终）──
+        lines.append("[Bucket / Batch]")
         lines.append(f"  BUCKET_SEQ_LENS          : {cls.BUCKET_SEQ_LENS}")
         lines.append(f"  VALID_BATCH_SIZES        : {cls.VALID_BATCH_SIZES}")
         lines.append(f"  TRT_OPT_SEQ / TRT_MAX_SEQ: {cls.TRT_OPT_SEQ}/{cls.TRT_MAX_SEQ}")
 
-        # engine / 模型路径（确认真的加载了预期产物）
+        # ── 本地 PT 权重目录（仅 PT 后端）──
+        if backend == "pt":
+            lines.append("[本地 PT 权重目录]")
+            lines.append(f"  PT_MODEL_DIR             : {cls.PT_MODEL_DIR}")
+
+        # ── 模型路径（始终，确认真的加载了预期产物）──
         lines.append("[模型路径]")
         if backend == "trt":
             for m, p in cls.get_trt_engine_paths().items():
                 lines.append(f"  {m:<12}: {p or '（缺失/未启用）'}")
         elif backend == "pt":
-            lines.append(f"  PT_MODEL_DIR : {cls.PT_MODEL_DIR}")
+            lines.append(f"  PT 权重目录  : {cls.PT_MODEL_DIR}")
         else:  # ort
             if cls.use_ort_split():
                 lines.append("  ORT 模式     : 分段串联（字级时间戳）")
