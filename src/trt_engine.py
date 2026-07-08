@@ -14,7 +14,7 @@ TensorRT 推理引擎（v2：4 段主 engine + 1 段可选 timestamp）
     详见 docs/README.md 的 v2 推理路径。
 
 对外接口（与 src/asr_engine.py 一致）：
-    infer_batch_raw(padded_feats, lengths, bias_embeddings) → list[logits]
+    infer_batch_raw(padded_feats, lengths, bias_embeddings) → list[(logits, ts_data)]
     encode_hotwords(hotword_token_ids) → bias_embed (1, num_hw, 512)
 """
 

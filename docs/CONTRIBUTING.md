@@ -101,6 +101,31 @@ python scripts/evaluate_cer.py --audio-dir calib_data/audio_data --csv report_ce
 > （实测 2800→2000 req/s）。拆为独立 engine + 环境开关，不启用时零成本。
 > 字级时间戳算法对齐 FunASR ts_prediction_lfr6_standard（见 src/timestamp.py）。
 
+## 三后端功能支持矩阵
+
+三个推理后端（TRT / ORT / PT）均支持字级时间戳、热词（路径 A SeACo）、Faiss（路径 B），
+且均由环境变量参数控制开关，功能对齐。
+
+| 后端 | MODEL_PRECISION | 字级时间戳 | 热词 A | Faiss B | 说明 |
+|------|-----------------|:----------:|:------:|:-------:|------|
+| TRT | trt_fp16 / trt_fp32 / trt_int8 / trt_int8_enc | ✅ 第 5 段 engine | ✅ | ✅ | GPU 生产主路径；timestamp 仅 fp16/fp32（BLSTM 不量化） |
+| ORT | onnx_fp32 / onnx_int8 | ✅ 分段串联 | ✅ | ✅ | 时间戳**开**→分段 ONNX 串联（encoder→cif→decoder+bias+timestamp）；**关**→整体模型兜底 |
+| PT | pt | ✅ predictor 内置 | ✅ | ✅ | 原生 PyTorch，GPU 优先/CPU 兜底；无需转换，适合验证/无 TRT 环境 |
+
+开关（三后端通用）：
+- `ENABLE_WORD_TIMESTAMP`（默认 false）：字级时间戳（asr[].words）
+- `ENABLE_HOTWORD`（默认 true）：客户端热词 SeACo 在线增强（路径 A）
+- `ENABLE_FAISS_CORRECTION`（默认 true）：默认词表 Faiss 后处理纠错（路径 B）
+
+要点：
+- **ORT 时间戳依赖分段 ONNX**：`onnx_fp32 + ENABLE_WORD_TIMESTAMP=true` 时 prepare_model
+  会自动确保 `models/asr/split/*.onnx`（含 timestamp）存在；整体模型 model.onnx 无法输出时间戳。
+- **onnx_int8 + 时间戳的降级**：分段 ONNX 只有 fp32 产物（无 int8 量化分段），故
+  `onnx_int8 + ENABLE_WORD_TIMESTAMP=true` 会静默切到 **fp32 分段串联**，失去 int8 的
+  体积（-75%）/速度特性（启动日志有告警）。需 int8 体积优势请关闭字级时间戳。
+- **TRT timestamp 精度**：跟随 profile（trt_fp32→fp32，其余→fp16），可用 `TIMESTAMP_PRECISION` 覆盖；int8 非法自动回退 fp16。
+- **PT timestamp 无额外产物**：直接调用 `predictor.get_upsample_timestamp`，只需 PT 权重。
+
 > 历史问题：早期 encoder/decoder 全 fp16 会精度崩溃（残差 Add 溢出 inf）。
 > 现已通过 **opset 17 原生 LayerNormalization + encoder 残差 Add clamp 60000**
 > 实现纯 fp16，无需任何 fp32 fallback（详见 docs/README.md）。

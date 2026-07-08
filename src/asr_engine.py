@@ -1,14 +1,15 @@
 """
-ASR 推理引擎（ORT / TRT 双后端路由）
+ASR 推理引擎（TRT / ORT / PT 多后端路由）
 
-- ORT：v1 整体模型（model.onnx + model_eb.onnx），fp32 或 int8 精度
-- TRT：v2 阶段 1 分段架构（encoder + cif + decoder + bias_encoder），纯 fp16
+- TRT：分段架构 engine（encoder/cif/decoder/bias_encoder + 可选 timestamp），GPU 主路径
+- ORT：整体模型（model.onnx，无时间戳，兜底）；启用字级时间戳时切分段串联（ort_split）
+- PT ：原生 PyTorch 推理（GPU 优先/CPU 兜底），无需转换
 
-接口对外统一：
-    infer_batch_raw(padded_feats, lengths, bias_embeddings) → list[logits]
+四种 backend：trt / ort / ort_split / pt。三后端均支持字级时间戳 + 热词 + Faiss（参数可选）。
+
+接口对外统一（scheduler 不感知后端差异）：
+    infer_batch_raw(padded_feats, lengths, bias_embeddings) → list[(logits, ts_data)]
     encode_hotwords(hotword_token_ids) → bias_embed (1, num_hw, 512) | None
-
-scheduler.py 不感知后端差异。
 """
 
 import os
@@ -22,7 +23,7 @@ from src.logger import logger
 
 
 class ASREngine:
-    """ASR 推理引擎（ORT + TRT 双后端）。"""
+    """ASR 推理引擎（TRT / ORT / ort_split / PT 多后端路由）。"""
 
     def __init__(self):
         # ORT 后端
@@ -77,6 +78,14 @@ class ASREngine:
     def _load_ort_backend(self):
         """加载 ORT 后端：启用字级时间戳且分段 ONNX 齐全 → 分段串联；否则整体模型。"""
         if settings.use_ort_split():
+            # 静默降级告警：onnx_int8 本意是 CPU 小模型（体积-75%），但启用字级时间戳后
+            # 走 fp32 分段串联（split 目录只有 fp32 产物），失去 int8 的体积/速度特性。
+            if settings.get_model_precision() == "onnx_int8":
+                logger.warning(
+                    "onnx_int8 + ENABLE_WORD_TIMESTAMP：已切换到 fp32 分段串联"
+                    "（无 int8 量化分段产物），体积/速度不再是 int8 特性。"
+                    "若需 int8 体积优势请关闭字级时间戳。"
+                )
             if self._load_ort_split():
                 self._backend = "ort_split"
                 logger.info("ORT 后端使用分段串联模式（支持字级时间戳）")
