@@ -37,9 +37,11 @@ class ASREngine:
         self._trt_engine = None  # src.trt_engine.TRTEngine 实例
         # ORT 分段后端（启用字级时间戳时用，替代整体模型）
         self._ort_split = None  # src.ort_engine.ORTSplitEngine 实例
+        # PT 原生后端（MODEL_PRECISION=pt）
+        self._pt_engine = None  # src.pt_engine.PTEngine 实例
 
         self._device: str = "cpu"
-        self._backend: str = "ort"  # "ort" / "trt" / "ort_split"
+        self._backend: str = "ort"  # "ort" / "trt" / "ort_split" / "pt"
 
     # ============================================================
     # 加载入口
@@ -51,9 +53,15 @@ class ASREngine:
         logger.info(f"模型精度策略: {precision} (设备: {self._device}, 后端: {backend})")
 
         if backend == "pt":
-            # PT 原始模型仅用于转换环境，推理服务不支持，回退 ORT fp32
-            logger.warning("backend=pt 在推理服务中不支持，回退 ORT onnx_fp32")
-            backend = "ort"
+            # PT 原生推理（GPU 优先/CPU 兜底）；加载失败回退 ORT
+            if self._load_pt_engine():
+                self._backend = "pt"
+                self._warmup()
+                return
+            logger.warning("PT engine 加载失败，回退 ORT")
+            self._load_ort_backend()
+            self._warmup()
+            return
 
         if backend == "trt":
             if self._load_trt_engines():
@@ -107,6 +115,8 @@ class ASREngine:
             return self._trt_engine is not None and self._trt_engine.is_loaded
         if self._backend == "ort_split":
             return self._ort_split is not None and self._ort_split.is_loaded
+        if self._backend == "pt":
+            return self._pt_engine is not None and self._pt_engine.is_loaded
         return self._session is not None
 
     @property
@@ -115,6 +125,8 @@ class ASREngine:
             return self._trt_engine is not None and self._trt_engine.has_bias_encoder
         if self._backend == "ort_split":
             return self._ort_split is not None and self._ort_split.has_bias_encoder
+        if self._backend == "pt":
+            return self._pt_engine is not None and self._pt_engine.has_bias_encoder
         return self._bias_session is not None
 
     # ============================================================
@@ -141,6 +153,22 @@ class ASREngine:
         except Exception as e:
             logger.warning(f"TRT engine 加载异常: {e}")
             self._trt_engine = None
+            return False
+
+    # ============================================================
+    # PT 加载（原生 PyTorch 推理，GPU 优先/CPU 兜底）
+    # ============================================================
+    def _load_pt_engine(self) -> bool:
+        try:
+            from src.pt_engine import PTEngine
+            engine = PTEngine()
+            engine.load(device=None)  # None = GPU 优先/CPU 兜底
+            self._pt_engine = engine
+            self._device = engine._device
+            return True
+        except Exception as e:
+            logger.warning(f"PT engine 加载异常: {e}")
+            self._pt_engine = None
             return False
 
     # ============================================================
@@ -221,6 +249,10 @@ class ASREngine:
             self._ort_split.warmup(bucket_seq_lens, batch_sizes)
             return
 
+        if self._backend == "pt" and self._pt_engine is not None:
+            self._pt_engine.warmup(bucket_seq_lens, batch_sizes)
+            return
+
         if self._session is None:
             return
 
@@ -284,6 +316,15 @@ class ASREngine:
                 logger.warning(f"ORT 分段 bias encoder 推理失败: {e}")
                 return None
 
+        if self._backend == "pt":
+            if self._pt_engine is None or not self._pt_engine.has_bias_encoder:
+                return None
+            try:
+                return self._pt_engine.encode_hotwords(hotword_token_ids)
+            except Exception as e:
+                logger.warning(f"PT bias encoder 推理失败: {e}")
+                return None
+
         # ORT 后端
         if self._bias_session is None:
             return None
@@ -331,6 +372,8 @@ class ASREngine:
             return self._trt_engine.infer_batch_raw(padded_feats, lengths, bias_embeddings)
         if self._backend == "ort_split" and self._ort_split is not None:
             return self._ort_split.infer_batch_raw(padded_feats, lengths, bias_embeddings)
+        if self._backend == "pt" and self._pt_engine is not None:
+            return self._pt_engine.infer_batch_raw(padded_feats, lengths, bias_embeddings)
         return self._infer_batch_raw_ort(padded_feats, lengths, bias_embeddings)
 
     def _infer_batch_raw_ort(

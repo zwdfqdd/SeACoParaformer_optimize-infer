@@ -157,6 +157,8 @@ class Settings:
 
     # 固定参数（模型已打包进镜像）
     MODEL_DIR: str = "./models"
+    # PT 后端权重目录（MODEL_PRECISION=pt 时用；GPU 优先/CPU 兜底）
+    PT_MODEL_DIR: str = os.getenv("PT_MODEL_DIR", os.path.join("models", "asr", "pt"))
 
     # ============================================================
     # Bucket / Batch 参数（单一数据源）

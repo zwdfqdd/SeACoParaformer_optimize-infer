@@ -391,7 +391,7 @@ docker-compose up -d
 | 取值 | 后端 | 各段精度(enc/cif/dec/bias) | 说明 |
 |---|---|---|---|
 | auto | 自动 | — | GPU: trt_int8_enc→trt_fp16→trt_fp32→onnx_fp32；CPU: onnx_int8→onnx_fp32 |
-| pt | PT | — | 原始 PyTorch 模型（转换环境用，服务回退 onnx_fp32） |
+| pt | PT | — | 原始 PyTorch 模型推理（GPU 优先/CPU 兜底；支持热词/Faiss/字级时间戳；无需转换，适合验证/无 TRT 环境） |
 | onnx_fp32 | ORT | — | ONNX Runtime fp32（v1 整体模型） |
 | onnx_int8 | ORT | — | ONNX Runtime int8 动态量化（CPU） |
 | trt_fp32 | TRT | fp32/fp32/fp32/fp32 | 4 段全 fp32 |
