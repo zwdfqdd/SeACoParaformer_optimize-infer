@@ -9,6 +9,7 @@ SeACo-Paraformer FastAPI 服务入口
 import asyncio
 import base64
 import io
+import logging
 import signal
 import time
 from contextlib import asynccontextmanager
@@ -161,8 +162,13 @@ async def lifespan(app: FastAPI):
         pass  # 静音可能无 VAD 段，忽略
     logger.info("端到端预热完成")
 
-    # 打印所有实际生效的运行配置（复现 / 排错用；每 worker 各打一份，整体一次输出）
-    logger.info("实际生效运行配置：\n" + "\n".join(settings.dump_effective_config()))
+    # 打印所有实际生效的运行配置（复现 / 排错用；结构化 JSON 字段，按启用模块动态组装）
+    _cfg_record = logger.makeRecord(
+        name=logger.name, level=logging.INFO, fn="", lno=0,
+        msg="实际生效运行配置", args=(), exc_info=None,
+    )
+    _cfg_record.extra_fields = {"effective_config": settings.dump_effective_config()}
+    logger.handle(_cfg_record)
 
     logger.info(f"服务启动完成, CPU 线程池: {_cpu_executor._max_workers} workers")
 
