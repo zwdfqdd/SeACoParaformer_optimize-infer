@@ -1,11 +1,12 @@
 #!/bin/bash
 # ============================================================
-# 临时网格压测脚本（对比 CPU 侧线程池参数对 TRT 吞吐的影响）
+# 网格压测脚本（CPU 侧线程池参数 × 功能模块开关对照系统）
 #
 # 固定：BATCH / WORKERS / BATCH_TIMEOUT / GPU_STREAM_POOL_SIZE / MODEL_PRECISION
-# 变量：CPU_THREAD_POOL_SIZE / VAD_SESSION_POOL_SIZE
+#       ENABLE_WORD_TIMESTAMP / ENABLE_HOTWORD / ENABLE_FAISS_CORRECTION（均可环境变量覆盖）
+# 变量：CPU_THREAD_POOL_SIZE / VAD_SESSION_POOL_SIZE（下方 CONFIGS 笛卡尔积）
 #
-# 【为何只扫这两个】TRT 后端下：
+# 【为何只扫 CPU_POOL / VAD_POOL】TRT 后端下：
 #   - ORT_INTRA_OP_THREADS / ORT_INTER_OP_THREADS 只作用于主 ASR 的 CPU 后端
 #     （onnx_*），TRT/GPU 推理不经过 ORT CPU session，故对本网格无效；
 #   - Silero VAD 的 session 线程数在 vad.py 硬编码为 1，也不读上述两个参数。
@@ -20,20 +21,55 @@
 # 每组：启动 run.sh → 等 /health 就绪 → 压测 → 解析结果 → 杀 run.sh → 等显存释放
 # 全部跑完输出汇总表 + CSV。
 #
-# 用法（容器内 /app 下）：
-#   bash tests/benchmark_grid.sh
+# ============================================================
+# 【测试对照系统】容器内 /app 下执行。各命令对应报告《性能网格测试报告》章节：
+#
+#   ── A. CPU 线程池网格（时间戳关，WORKERS=10）───────────── 报告第四章
+#      bash tests/benchmark_grid.sh
+#
+#   ── B. CPU 线程池网格（时间戳开，WORKERS=10）───────────── 报告第六章
+#      ENABLE_WORD_TIMESTAMP=true bash tests/benchmark_grid.sh
+#      # A vs B = 时间戳+Faiss 组合的开销（同 WORKERS，干净对照）
+#
+#   ── C. 显存换吞吐（时间戳关，WORKERS=11）───────────────── 报告第七章
+#      WORKERS=11 bash tests/benchmark_grid.sh
+#      # 关时间戳省显存，可多开 1 个 worker
+#
+#   ── D. 全模块关闭极限吞吐（WORKERS=11）─────────────────── 报告第八章
+#      WORKERS=11 bash tests/benchmark_grid.sh
+#      # 默认三模块全关，即纯 ASR 峰值基线
+#
+#   ── E. 纯时间戳单项开销（时间戳开 / Faiss关 / 热词关）──── 待补（报告 6.4 待精确化）
+#      WORKERS=11 ENABLE_WORD_TIMESTAMP=true bash tests/benchmark_grid.sh
+#      # E vs D = 纯时间戳开销（同 WORKERS，扣除 Faiss 干扰）
+#      # 注意：开时间戳显存吃紧，WORKERS=11 若 OOM 则降到 10 重跑
+#
+#   ── F. 仅默认词表 Faiss 开销 ──────────────────────────── 报告第八章 8.2
+#      WORKERS=11 ENABLE_FAISS_CORRECTION=true bash tests/benchmark_grid.sh
+#      # F vs D = Faiss 后处理开销（实测约 -11%）
+#
+#   ── G. 热词路径 A（SeACo 在线）开销 ───────────────────── 待补（报告 9.2 未测）
+#      # 本脚本压测不带 hotwords，路径 A 不会触发；需手动带 --hotwords 压测：
+#      WORKERS=11 ENABLE_HOTWORD=true bash run.sh   # 另开终端启动服务
+#      python tests/test_service.py --hotwords 词1 词2 ... --concurrency 150 --total 3000
+#
+# 说明：C/D 配置相同（默认全关），差异仅在“是否显式认知为极限基线”，实测数据可复用。
 # ============================================================
 
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-# ─── 固定参数 ───
-export BATCH=12
-export WORKERS=10
-export BATCH_TIMEOUT=10
-export GPU_STREAM_POOL_SIZE=4
-export MODEL_PRECISION=trt_fp16
+# ─── 固定参数（均可通过环境变量覆盖，便于做模块开关对照实验）───
+export BATCH=${BATCH:-12}
+export WORKERS=${WORKERS:-10}
+export BATCH_TIMEOUT=${BATCH_TIMEOUT:-10}
+export GPU_STREAM_POOL_SIZE=${GPU_STREAM_POOL_SIZE:-4}
+export MODEL_PRECISION=${MODEL_PRECISION:-trt_fp16}
+# 功能模块开关（默认全关，测纯 ASR / 单项开销对照时按需覆盖）
 export ENABLE_WORD_TIMESTAMP=${ENABLE_WORD_TIMESTAMP:-false}
+export ENABLE_HOTWORD=${ENABLE_HOTWORD:-false}
+export ENABLE_FAISS_CORRECTION=${ENABLE_FAISS_CORRECTION:-false}
+# 对照实验命令见文件头「测试对照系统」；只跑少数线程组则精简下方 CONFIGS。
 
 # ─── 压测参数 ───
 CONCURRENCY=120
@@ -118,6 +154,7 @@ echo "======================================================================"
 echo "网格压测开始：固定 BATCH=$BATCH WORKERS=$WORKERS BATCH_TIMEOUT=$BATCH_TIMEOUT"
 echo "             GPU_STREAM_POOL_SIZE=$GPU_STREAM_POOL_SIZE PRECISION=$MODEL_PRECISION"
 echo "             ENABLE_WORD_TIMESTAMP=$ENABLE_WORD_TIMESTAMP"
+echo "             ENABLE_HOTWORD=$ENABLE_HOTWORD ENABLE_FAISS_CORRECTION=$ENABLE_FAISS_CORRECTION"
 echo "共 ${#CONFIGS[@]} 组实验"
 echo "======================================================================"
 
