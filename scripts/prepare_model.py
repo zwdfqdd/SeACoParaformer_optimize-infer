@@ -346,10 +346,12 @@ def prepare(precision: str, check_only: bool = False) -> bool:
         # bias_encoder 缺失仅影响热词，不阻断
         if not ensure_trt_engine("bias_encoder", prec_map["bias_encoder"]):
             print("[警告] bias_encoder engine 缺失，热词功能不可用")
-        # timestamp 第 5 段：仅 ENABLE_WORD_TIMESTAMP 开启时构建（fp16，含 blstm 不量化）
-        # 缺失仅影响字级时间戳，不阻断主链路
+        # timestamp 第 5 段：仅 ENABLE_WORD_TIMESTAMP 开启时构建。
+        # 精度由 prec_map 决定（trt_fp32→fp32，其余→fp16；BLSTM 不量化，int8 已在
+        # config 兜底回退 fp16）。缺失仅影响字级时间戳，不阻断主链路。
         if Settings.ENABLE_WORD_TIMESTAMP:
-            if not ensure_trt_engine("timestamp", "fp16"):
+            ts_prec = Settings.get_trt_precision_map().get("timestamp", "fp16")
+            if not ensure_trt_engine("timestamp", ts_prec):
                 print("[警告] timestamp engine 缺失，字级时间戳不可用（words 为空）")
         return ok
 

@@ -5,20 +5,20 @@
 
 MODEL_PRECISION 支持的完整精度矩阵：
 
-  后端     取值                  各段精度(encoder/cif/decoder/bias)   说明
-  ------  --------------------  -----------------------------------  ----------------------------
-  自动     auto                  —                                    自动探测（见 get_model_precision）
-  PT      pt                    —                                    原始 PyTorch 模型（转换环境，服务不支持，回退 onnx_fp32）
-  ORT     onnx_fp32             —                                    ONNX Runtime fp32（v1 整体模型）
-  ORT     onnx_int8             —                                    ONNX Runtime int8 动态量化（CPU）
-  TRT     trt_fp32              fp32/fp32/fp32/fp32                   4 段全 fp32
-  TRT     trt_fp16              fp16/fp16/fp16/fp16                   4 段全 fp16
-  TRT     trt_int8              int8/int8/int8/int8                   4 段全 int8 QDQ（实测可跑，精度损失较大，不推荐线上）
-  TRT     trt_int8_enc          int8/fp16/fp16/fp16                   仅 encoder int8（★线上推荐）
+  后端     取值                  各段精度(encoder/cif/decoder/bias/timestamp)  说明
+  ------  --------------------  --------------------------------------------  ----------------------------
+  自动     auto                  —                                            自动探测（见 get_model_precision）
+  PT      pt                    —                                            原始 PyTorch 模型（GPU 优先/CPU 兜底）
+  ORT     onnx_fp32             —                                            ONNX Runtime fp32（分段串联）
+  ORT     onnx_int8             —                                            ONNX Runtime int8 动态量化（CPU）
+  TRT     trt_fp32              fp32/fp32/fp32/fp32/fp32                      全 fp32
+  TRT     trt_fp16              fp16/fp16/fp16/fp16/fp16                      全 fp16
+  TRT     trt_int8              int8/int8/int8/int8/fp16                      encoder..bias int8 QDQ + timestamp fp16（精度损失较大，不推荐线上）
+  TRT     trt_int8_enc          int8/fp16/fp16/fp16/fp16                      仅 encoder int8（★线上推荐）
 
-各 TRT 段精度也可用环境变量单独覆盖（优先级最高）：
-    ENCODER_PRECISION / CIF_PRECISION / DECODER_PRECISION / BIAS_PRECISION
-    取值：fp32 / fp16 / int8
+各段精度可用环境变量单独覆盖（优先级最高）：
+    ENCODER_PRECISION / CIF_PRECISION / DECODER_PRECISION / BIAS_PRECISION / TIMESTAMP_PRECISION
+    取值：fp32 / fp16 / int8（timestamp 仅 fp32/fp16，含 BLSTM 不量化，int8 会回退 fp16）
 """
 
 import os
@@ -28,15 +28,22 @@ import os
 # TRT 各段精度组合（per-module）
 # ============================================================
 # int8 段实际加载时优先匹配 int8_qdq engine（QDQ Explicit 量化）
+# timestamp（第 5 段，字级时间戳）精度说明：
+#   含双向 BLSTM，int8 量化精度损失大且 TRT 对 LSTM int8 支持差，故不支持 int8。
+#   只支持 fp32 / fp16：trt_fp32 profile 下用 fp32，其余（含 int8 系列）一律 fp16。
+#   可用 TIMESTAMP_PRECISION 环境变量强制覆盖（仅 fp32/fp16 生效，int8 会被拒绝回退 fp16）。
 TRT_PRECISION_PROFILES = {
-    "trt_fp32": {"encoder": "fp32", "cif": "fp32", "decoder": "fp32", "bias_encoder": "fp32"},
-    "trt_fp16": {"encoder": "fp16", "cif": "fp16", "decoder": "fp16", "bias_encoder": "fp16"},
-    # 全 int8（4 段都 QDQ 量化：encoder/decoder + cif/bias）
+    "trt_fp32": {"encoder": "fp32", "cif": "fp32", "decoder": "fp32", "bias_encoder": "fp32", "timestamp": "fp32"},
+    "trt_fp16": {"encoder": "fp16", "cif": "fp16", "decoder": "fp16", "bias_encoder": "fp16", "timestamp": "fp16"},
+    # 全 int8（4 段都 QDQ 量化：encoder/decoder + cif/bias；timestamp 不量化，保持 fp16）
     # 实测 4 段 engine 可正常运行，但精度损失较大（cif cumsum + bias LSTM 量化），不推荐线上
-    "trt_int8": {"encoder": "int8", "cif": "int8", "decoder": "int8", "bias_encoder": "int8"},
+    "trt_int8": {"encoder": "int8", "cif": "int8", "decoder": "int8", "bias_encoder": "int8", "timestamp": "fp16"},
     # ★线上推荐：仅 encoder int8，其余 fp16（encoder 显存减半，热词精度保留，CER≈0）
-    "trt_int8_enc": {"encoder": "int8", "cif": "fp16", "decoder": "fp16", "bias_encoder": "fp16"},
+    "trt_int8_enc": {"encoder": "int8", "cif": "fp16", "decoder": "fp16", "bias_encoder": "fp16", "timestamp": "fp16"},
 }
+
+# timestamp 段允许的精度（BLSTM 不量化）
+TIMESTAMP_ALLOWED_PRECISIONS = {"fp16", "fp32"}
 
 # 所有合法的 TRT profile 名称
 TRT_PROFILE_NAMES = set(TRT_PRECISION_PROFILES.keys())
@@ -67,7 +74,9 @@ class Settings:
     # 过载拒绝：并发信号量等待超时（秒），超时返回 SERVICE_BUSY(1007)。0 = 无限等待（不拒绝）。
     ACQUIRE_TIMEOUT: float = float(os.getenv("ACQUIRE_TIMEOUT", "5"))
 
-    # 模型精度（见文件头精度矩阵）
+    # 模型精度（见文件头精度矩阵）。
+    # 默认 auto：代码层兜底，按硬件自动探测（GPU→trt_int8_enc/trt_fp16，CPU→onnx_int8）。
+    # 部署脚本会显式覆盖：run.sh 与 docker-compose.yml 默认均为 trt_fp16（GPU 生产稳定基线）。
     MODEL_PRECISION: str = os.getenv("MODEL_PRECISION", "auto")
 
     # CPU 推理线程数。
@@ -187,8 +196,10 @@ class Settings:
     #   - model.py ASF 过滤保留 top-NFILTER 注入 decoder
     # 显存上界由 MAX_HOTWORD_NUM 固定，engine 无需随词表规模重建。
     # ============================================================
-    # SeACo 在线热词硬上限 / 路径切换点（客户端热词超限截断 Top-N + 告警；
-    # 默认词表 ≤ 此值走路径 A SeACo，> 此值走路径 B Faiss）
+    # 客户端热词（路径 A SeACo）硬上限 / 截断点：客户端传入 hotwords 超过此值时
+    # 截断保留 Top-N + 告警。engine bias profile 的热词维度 max = 此值 + 1（含哨兵）。
+    # 注：默认词表恒走路径 B（Faiss，见 _determine_route），此值不再是默认词表的
+    # 路由切换点，仅约束客户端在线热词的数量上限。
     MAX_HOTWORD_NUM: int = int(os.getenv("MAX_HOTWORD_NUM", "256"))
     # TRT profile opt point 的热词数（主力工作点）
     OPT_HOTWORD_NUM: int = int(os.getenv("OPT_HOTWORD_NUM", "64"))
@@ -409,10 +420,15 @@ class Settings:
             "cif": os.getenv("CIF_PRECISION"),
             "decoder": os.getenv("DECODER_PRECISION"),
             "bias_encoder": os.getenv("BIAS_PRECISION"),
+            "timestamp": os.getenv("TIMESTAMP_PRECISION"),
         }
         for module, val in env_map.items():
             if val:
                 base[module] = val.lower()
+
+        # timestamp 段兜底：BLSTM 不支持 int8，非法精度回退 fp16
+        if base.get("timestamp") not in TIMESTAMP_ALLOWED_PRECISIONS:
+            base["timestamp"] = "fp16"
         return base
 
     @classmethod
@@ -431,10 +447,11 @@ class Settings:
             module: cls._find_trt_engine(prec_map[module], module)
             for module in ("encoder", "cif", "decoder", "bias_encoder")
         }
-        # 第 5 段 timestamp engine：仅 ENABLE_WORD_TIMESTAMP 开启时查找
-        # timestamp 含 blstm，固定 fp16（不量化）
+        # 第 5 段 timestamp engine：仅 ENABLE_WORD_TIMESTAMP 开启时查找。
+        # timestamp 含 blstm，只支持 fp32/fp16（见 TIMESTAMP_ALLOWED_PRECISIONS），
+        # 精度由 precision_map 决定（trt_fp32→fp32，其余→fp16，或 TIMESTAMP_PRECISION 覆盖）。
         if cls.ENABLE_WORD_TIMESTAMP:
-            paths["timestamp"] = cls._find_trt_engine("fp16", "timestamp")
+            paths["timestamp"] = cls._find_trt_engine(prec_map["timestamp"], "timestamp")
         else:
             paths["timestamp"] = None
         return paths
