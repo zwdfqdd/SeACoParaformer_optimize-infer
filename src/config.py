@@ -56,8 +56,8 @@ PT_PRECISIONS = {"pt"}
 class Settings:
     """服务配置。运行时可调参数从环境变量读取，固定参数硬编码。"""
 
-    # 运行时可调
-    WORKERS: int = int(os.getenv("WORKERS", "1"))
+    # 运行时可调（默认取 A10 24GB 实测最优；小显存需显式调小 WORKERS 防 OOM）
+    WORKERS: int = int(os.getenv("WORKERS", "11"))
     BATCH: int = int(os.getenv("BATCH", "12"))
     PORT: int = int(os.getenv("PORT", "8080"))  # 容器内部固定端口（entrypoint 硬编码 8080，对外由 HOST_PORT 映射）
     # 工业标准 dynamic batching 参数（Triton/TF-Serving 模式）：
@@ -95,8 +95,9 @@ class Settings:
     ORT_INTER_OP_THREADS: int = int(os.getenv("ORT_INTER_OP_THREADS", "1"))
 
     # CPU 流水线线程池大小（Stage1 VAD + Stage2 特征提取）。0=自动取 cpu_count。
+    # 默认 32（256 核 + WORKERS=11 实测最优，per-worker）；小核数机器需调小。
     # 多 worker（WORKERS>1）时务必显式设小，避免每 worker 各开满核导致线程超额订阅。
-    CPU_THREAD_POOL_SIZE: int = int(os.getenv("CPU_THREAD_POOL_SIZE", "0"))
+    CPU_THREAD_POOL_SIZE: int = int(os.getenv("CPU_THREAD_POOL_SIZE", "32"))
 
     # ============================================================
     # 热词模块开关（按需裁剪推理路径，纯通用识别可全关省开销）
@@ -152,8 +153,8 @@ class Settings:
     #   pool=8  QPS=12.48   pool=16 QPS=12.32          pool=32 QPS=12.08
     # 反直觉发现：pool 越大 QPS 反而略降，因为 OMP=1 后单 session 已高效，
     # 多 session 增加内存分配/缓存 miss/上下文切换开销。
-    # 默认 4：Pool=2 QPS 最高但太紧，Pool=4 留余量应对突发；差距仅 1.6%。
-    VAD_SESSION_POOL_SIZE: int = int(os.getenv("VAD_SESSION_POOL_SIZE", "4"))
+    # 默认 2：性能网格实测 WORKERS=11 下 VAD_POOL=2 最优（详见性能网格测试报告）。
+    VAD_SESSION_POOL_SIZE: int = int(os.getenv("VAD_SESSION_POOL_SIZE", "2"))
 
     # 固定参数（模型已打包进镜像）
     MODEL_DIR: str = "./models"

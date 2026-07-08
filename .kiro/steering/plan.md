@@ -131,12 +131,15 @@ vad.py Silero VAD ONNX 推理：
     WORKERS=11，实测 QPS 93.92（conc=120，A10+），显存 ~15-20GB
     大 GPU 上多进程隔离 CPU 竞争 > CUDA context 切换开销
 
-必须固化的环境变量（run.sh 已默认）：
+必须固化的环境变量（run.sh/compose/config 默认，A10 24GB 最优）：
     OMP_NUM_THREADS=1 / MKL_NUM_THREADS=1 / OPENBLAS_NUM_THREADS=1
       （防 libgomp 崩溃，Silero VAD 是串行 LSTM，OMP 内并行无收益）
-    VAD_SESSION_POOL_SIZE=4
+    WORKERS=11（模式 B；★小显存改回 1）
+    CPU_THREAD_POOL_SIZE=32（256 核最优，per-worker）
+    VAD_SESSION_POOL_SIZE=2（实测最优）
     GPU_STREAM_POOL_SIZE=4
-    BATCH_TIMEOUT=10
+    BATCH_TIMEOUT=10（实测吞吐最优）
+    MODEL_PRECISION=trt_fp16（部署默认；config 兜底 auto）
 
 # 六、API 规约（POST /chinese_asr）
 

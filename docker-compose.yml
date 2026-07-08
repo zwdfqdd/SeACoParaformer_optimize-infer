@@ -11,9 +11,9 @@ services:
       - "${HOST_PORT:-8099}:8080"
     environment:
       # ─── 部署形态（详见 docs/DEPLOY.md 高并发性能调优）───
-      # 模式 A（默认）：WORKERS=1，小 GPU/低并发场景，QPS ~13（conc=20）
-      # 模式 B（大 GPU 生产）：WORKERS=11，需 24GB+ 显存，QPS 93.92（conc=120）
-      - WORKERS=${WORKERS:-1}
+      # 默认 WORKERS=11（模式 B，A10 24GB 最优，QPS ~93/conc=120）
+      # ★小 GPU/低显存（如 2080Ti 11GB）务必改回 WORKERS=1（模式 A）防 OOM
+      - WORKERS=${WORKERS:-11}
       - BATCH=${BATCH:-12}
       # BATCH_TIMEOUT：工业标准 dynamic batching 的 max_queue_delay（ms），实测 10 吞吐最优
       - BATCH_TIMEOUT=${BATCH_TIMEOUT:-10}
@@ -28,8 +28,10 @@ services:
       #   可选 trt_fp16 / trt_fp32 / trt_int8 / onnx_fp32 / onnx_int8 / auto
       - MODEL_PRECISION=${MODEL_PRECISION:-trt_fp16}
       # ─── 稳定性/性能池化参数（★必须显式设，防 libgomp 崩溃 + 榨干 GPU）───
-      # VAD ORT session 池（round-robin 让多请求 VAD 真正并行）
-      - VAD_SESSION_POOL_SIZE=${VAD_SESSION_POOL_SIZE:-4}
+      # CPU 流水线线程池（Stage1 VAD + Stage2 特征提取）；默认 32（256 核最优，per-worker）
+      - CPU_THREAD_POOL_SIZE=${CPU_THREAD_POOL_SIZE:-32}
+      # VAD ORT session 池（round-robin 让多请求 VAD 真正并行）；默认 2（实测最优）
+      - VAD_SESSION_POOL_SIZE=${VAD_SESSION_POOL_SIZE:-2}
       # TRT engine 多 stream 多 execution_context 池（weights 共享，activation 独立）
       - GPU_STREAM_POOL_SIZE=${GPU_STREAM_POOL_SIZE:-4}
       # 字级时间戳（asr[].words）：true 启用第 5 段 timestamp engine，吞吐降约 30%
