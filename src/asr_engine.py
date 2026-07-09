@@ -207,7 +207,9 @@ class ASREngine:
             providers = [
                 ("CUDAExecutionProvider", {
                     "device_id": 0,
-                    "arena_extend_strategy": "kNextPowerOfTwo",
+                    # 按需分配，不按 2 的幂翻倍预占 arena：多 worker 场景显存占用显著降低
+                    # （kNextPowerOfTwo 会激进预占，fp32 整体模型多开时易 OOM）。
+                    "arena_extend_strategy": "kSameAsRequested",
                 }),
                 "CPUExecutionProvider",
             ]

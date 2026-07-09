@@ -55,8 +55,9 @@ class ORTSplitEngine:
     def _providers(self, device: str) -> list:
         if device == "cuda":
             return [
+                # kSameAsRequested：按需分配 arena，不翻倍预占，多 worker 省显存
                 ("CUDAExecutionProvider", {"device_id": 0,
-                                           "arena_extend_strategy": "kNextPowerOfTwo"}),
+                                           "arena_extend_strategy": "kSameAsRequested"}),
                 "CPUExecutionProvider",
             ]
         return ["CPUExecutionProvider"]
