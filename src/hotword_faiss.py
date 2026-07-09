@@ -168,20 +168,29 @@ class FaissCorrector:
         return spans
 
     def correct(self, text: str) -> str:
+        """对 ASR 文本做拼音检索纠错，返回纠错后文本（无命中则原样返回）。"""
+        corrected, _ = self.correct_with_spans(text)
+        return corrected
+
+    def correct_with_spans(self, text: str) -> tuple[str, list[tuple[int, int, str]]]:
         """
-        对 ASR 文本做拼音检索纠错。返回纠错后文本（无命中则原样返回）。
+        对 ASR 文本做拼音检索纠错，返回 (纠错后文本, 替换区间列表)。
+
+        替换区间列表元素为 (start, end, cand)：text[start:end] 被替换为 cand，
+        按 start 升序、区间互不重叠。供上层把同一替换映射到字级时间戳 words，
+        保证 words 与段 text 纠错后一致（I3）。无命中返回 (原文, [])。
 
         逐候选片段检索，三重联合判定通过则记录替换。
         同一位置只替换一次（最长片段优先），最后按非重叠区间重组文本。
         """
         st = self._state  # 一次性原子读取快照，后续全程用 st（避免中途被 build 替换）
         if not _HAS_DEPS or st is None or not st.words or not text:
-            return text
+            return text, []
 
         try:
             spans = self._gen_candidates(text)
             if not spans:
-                return text
+                return text, []
 
             # 长片段优先（更具体，减少误纠）
             spans.sort(key=lambda s: s[1] - s[0], reverse=True)
@@ -237,23 +246,25 @@ class FaissCorrector:
                     )
 
             if not replacements:
-                return text
+                return text, []
 
-            # 按非重叠区间重组文本
+            # 按非重叠区间重组文本 + 收集替换区间（按 start 升序）
             out_parts: list[str] = []
+            span_list: list[tuple[int, int, str]] = []
             i = 0
             while i < len(text):
                 if i in replacements:
                     end, cand = replacements[i]
                     out_parts.append(cand)
+                    span_list.append((i, end, cand))
                     i = end
                 else:
                     out_parts.append(text[i])
                     i += 1
-            return "".join(out_parts)
+            return "".join(out_parts), span_list
         except Exception as e:
             logger.warning(f"Faiss 纠错执行失败，返回原文: {e}")
-            return text
+            return text, []
 
 
 # 全局单例

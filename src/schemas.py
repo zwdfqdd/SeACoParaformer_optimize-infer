@@ -82,10 +82,21 @@ class ErrorResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """健康检查响应。"""
+    """健康检查响应。
+
+    status 语义：
+        ok       — 模型已加载且运行时健康
+        degraded — 模型未加载 / 运行时连续推理失败超阈值（GPU 卡死）/ 加载阶段静默降级
+    runtime 字段暴露运行时健康明细（连续失败数、累计成功/失败、静默降级原因），
+    供探针与运维判定实例是否需摘除。
+    """
     status: str = Field(default="ok")
     device: str = Field(..., description="当前推理设备")
     models_loaded: bool = Field(..., description="模型是否已加载")
+    runtime: dict | None = Field(
+        default=None,
+        description="运行时健康明细（backend/连续失败数/累计成功失败/静默降级原因等）",
+    )
 
 
 class HotwordReloadRequest(BaseModel):

@@ -44,6 +44,18 @@ class ASREngine:
         self._device: str = "cpu"
         self._backend: str = "ort"  # "ort" / "trt" / "ort_split" / "pt"
 
+        # ── 运行时健康状态（R12/R14：/health 除加载态外反映运行时卡死/降级）──
+        # 由 scheduler 在每次推理成功/失败后打点（record_infer_success/failure）。
+        import threading as _threading
+        self._health_lock = _threading.Lock()
+        self._consecutive_failures: int = 0   # 连续失败计数（含超时），成功即清零
+        self._last_success_ts: float = 0.0     # 最近一次推理成功时刻（monotonic）
+        self._total_infer_ok: int = 0
+        self._total_infer_fail: int = 0
+        # 静默降级标记（R14）：加载阶段发生后端回退（TRT→ORT / PT→ORT / ORT分段→整体）时置位，
+        # 记录原因，供 /health 与 dump_config 暴露（避免实例在低性能/降功能模式下无人察觉）。
+        self._degraded_reason: str | None = None
+
     # ============================================================
     # 加载入口
     # ============================================================
@@ -60,6 +72,7 @@ class ASREngine:
                 self._warmup()
                 return
             logger.warning("PT engine 加载失败，回退 ORT")
+            self._mark_degraded("PT engine 加载失败，已回退 ORT 后端")
             self._load_ort_backend()
             self._warmup()
             return
@@ -69,6 +82,7 @@ class ASREngine:
                 self._backend = "trt"
             else:
                 logger.warning("TRT engines 加载失败，回退到 ORT")
+                self._mark_degraded("TRT engines 加载失败，已回退 ORT 后端")
                 self._load_ort_backend()
         else:
             self._load_ort_backend()
@@ -91,6 +105,7 @@ class ASREngine:
                 logger.info("ORT 后端使用分段串联模式（支持字级时间戳）")
                 return
             logger.warning("ORT 分段加载失败，回退整体模型（字级时间戳不可用）")
+            self._mark_degraded("ORT 分段加载失败，已回退整体模型（字级时间戳不可用）")
         self._backend = "ort"
         self._load_ort_main()
         self._load_ort_bias()
@@ -137,6 +152,67 @@ class ASREngine:
         if self._backend == "pt":
             return self._pt_engine is not None and self._pt_engine.has_bias_encoder
         return self._bias_session is not None
+
+    # ============================================================
+    # 运行时健康状态（R12/R14）
+    # ============================================================
+    def _mark_degraded(self, reason: str):
+        """标记静默降级（加载阶段后端回退），供 /health 与 dump_config 暴露。"""
+        with self._health_lock:
+            self._degraded_reason = reason
+
+    def record_infer_success(self):
+        """记录一次推理成功（scheduler 调用）：连续失败清零 + 刷新成功时刻。"""
+        import time as _t
+        with self._health_lock:
+            self._consecutive_failures = 0
+            self._last_success_ts = _t.monotonic()
+            self._total_infer_ok += 1
+
+    def record_infer_failure(self):
+        """记录一次推理失败/超时（scheduler 调用）：连续失败 +1。"""
+        with self._health_lock:
+            self._consecutive_failures += 1
+            self._total_infer_fail += 1
+
+    def runtime_health(self) -> dict:
+        """返回运行时健康快照（供 /health 判定 + 可观测）。
+
+        healthy 判定：连续失败数 < HEALTH_MAX_CONSECUTIVE_FAILURES 且无静默降级。
+        注：静默降级（后端回退）不算 unhealthy（服务仍可用），但通过 degraded_reason
+        单独暴露，便于运维察觉实例运行在低性能/降功能模式。
+        """
+        with self._health_lock:
+            cf = self._consecutive_failures
+            reason = self._degraded_reason
+            snapshot = {
+                "backend": self._backend,
+                "consecutive_failures": cf,
+                "total_infer_ok": self._total_infer_ok,
+                "total_infer_fail": self._total_infer_fail,
+                "degraded_reason": reason,
+            }
+        runtime_ok = cf < settings.HEALTH_MAX_CONSECUTIVE_FAILURES
+        snapshot["runtime_ok"] = runtime_ok
+        return snapshot
+
+    def active_probe(self) -> bool:
+        """主动探针：跑一次极小 dummy 推理验证 GPU 链路存活（HEALTH_ACTIVE_PROBE=true 时）。
+
+        成功返回 True 并记 success；异常返回 False 并记 failure。同步执行（调用方在
+        线程池/超时保护下调用），不引入对 scheduler 的循环依赖。
+        """
+        try:
+            seq = min(settings.BUCKET_SEQ_LENS)
+            feats = np.zeros((1, seq, settings.FEAT_DIM), dtype=np.float32)
+            lengths = np.array([seq], dtype=np.int32)
+            self.infer_batch_raw(feats, lengths, None)
+            self.record_infer_success()
+            return True
+        except Exception as e:
+            logger.warning(f"健康主动探针失败: {e}")
+            self.record_infer_failure()
+            return False
 
     # ============================================================
     # TRT 加载

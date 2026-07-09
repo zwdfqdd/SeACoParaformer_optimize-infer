@@ -245,6 +245,8 @@ class GPUScheduler:
         try:
             return await asyncio.wait_for(request.future, timeout=settings.INFER_TIMEOUT)
         except asyncio.TimeoutError:
+            # 超时是 GPU 卡死/调度阻塞的典型症状 → 计入运行时健康失败（连续超阈值 /health 转 degraded）
+            asr_engine.record_infer_failure()
             raise ASRException(
                 ErrorCode.ASR_INFER_FAILED,
                 f"推理超时（>{settings.INFER_TIMEOUT}s），可能调度阻塞或 GPU 卡死",
@@ -351,6 +353,8 @@ class GPUScheduler:
             for i, req in enumerate(batch):
                 if not req.future.done():
                     req.future.set_result(results[i])
+            # 运行时健康打点：本批推理成功 → 连续失败清零（R12）
+            asr_engine.record_infer_success()
 
         except Exception as e:
             if _is_oom_error(e):
@@ -359,6 +363,8 @@ class GPUScheduler:
                 await self._oom_fallback(batch, bucket_idx, bias_embeddings)
             else:
                 # 非 OOM（含 buffer/shape 等）：全 batch 兜底 set_exception，防挂起
+                # 运行时健康打点：推理失败 → 连续失败 +1（连续超阈值 /health 转 degraded，R12）
+                asr_engine.record_infer_failure()
                 for req in batch:
                     if not req.future.done():
                         req.future.set_exception(
@@ -413,6 +419,7 @@ class GPUScheduler:
                 for i, req in enumerate(sub_batch):
                     if not req.future.done():
                         req.future.set_result(results[i])
+                asr_engine.record_infer_success()
             except Exception as e1:
                 if _is_oom_error(e1):
                     # Step 2: 逐条推理
@@ -430,15 +437,18 @@ class GPUScheduler:
                             )
                             if not req.future.done():
                                 req.future.set_result(result[0])
+                            asr_engine.record_infer_success()
                         except Exception as e2:
                             # Step 3: 返回错误
                             logger.error(f"OOM Fallback Step3: 逐条推理也失败: {e2}")
+                            asr_engine.record_infer_failure()
                             if not req.future.done():
                                 req.future.set_exception(
                                     ASRException(ErrorCode.ASR_INFER_FAILED, f"推理失败(OOM fallback): {e2}")
                                 )
                 else:
                     # 非 OOM 错误，直接返回失败
+                    asr_engine.record_infer_failure()
                     for req in sub_batch:
                         if not req.future.done():
                             req.future.set_exception(

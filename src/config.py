@@ -77,6 +77,27 @@ class Settings:
     # 超时返回 ASR_INFER_FAILED(1004)。默认 120s（远大于正常单 chunk 推理，仅兜底极端卡死）。
     INFER_TIMEOUT: float = float(os.getenv("INFER_TIMEOUT", "120"))
 
+    # 单请求 GPU 提交在途 chunk 上限（M3 超长音频分片限流）。
+    # 超长音频（数小时）VAD 切段后可达上千 chunk，若一次性 gather 全部 submit，
+    # 会瞬间灌满调度器 group、挤占其他请求 batch 名额、上千 future 同时挂起抬高内存峰值。
+    # 用 per-request 信号量限制同时在途（已 submit 未完成）的 chunk 数：完成一个再放一个，
+    # 保持流水线连续（非分批 barrier）。必须 >= max(VALID_BATCH_SIZES) 以免限流反而压不满 batch。
+    # 默认 64（远大于 batch=12，正常请求几乎不触发；仅约束超长音频）。0 = 不限流（旧行为）。
+    MAX_INFLIGHT_CHUNKS_PER_REQUEST: int = int(os.getenv("MAX_INFLIGHT_CHUNKS_PER_REQUEST", "64"))
+
+    # ============================================================
+    # 运行时健康探针（R12/R14：/health 除加载态外，反映运行时 GPU 卡死 / 静默降级）
+    # ============================================================
+    # 连续推理失败（含 INFER_TIMEOUT 超时）达到此阈值时，/health 返回 degraded，
+    # 供 K8s/负载均衡摘除已卡死实例（GPU hang 表现为推理持续超时/失败）。
+    # 任一次推理成功即清零。默认 20（避免偶发抖动误摘，连续 20 次才判定运行时不健康）。
+    HEALTH_MAX_CONSECUTIVE_FAILURES: int = int(os.getenv("HEALTH_MAX_CONSECUTIVE_FAILURES", "20"))
+    # /health 主动探针：每次健康检查真跑一次极小 dummy 推理（带 INFER_TIMEOUT 超时）验证
+    # GPU 链路存活。默认 false（被动统计已足够，主动探针给每次健康检查加推理开销）。
+    HEALTH_ACTIVE_PROBE: bool = os.getenv("HEALTH_ACTIVE_PROBE", "false").lower() in (
+        "1", "true", "yes"
+    )
+
     # 模型精度（见文件头精度矩阵）。
     # 默认 auto：代码层兜底，按硬件自动探测（GPU→trt_int8_enc/trt_fp16，CPU→onnx_int8）。
     # 部署脚本会显式覆盖：run.sh 与 docker-compose.yml 默认均为 trt_fp16（GPU 生产稳定基线）。
@@ -632,11 +653,14 @@ class Settings:
             "MAX_CONCURRENT_REQUESTS": cls.MAX_CONCURRENT_REQUESTS,
             "ACQUIRE_TIMEOUT_s": cls.ACQUIRE_TIMEOUT,
             "INFER_TIMEOUT_s": cls.INFER_TIMEOUT,
+            "MAX_INFLIGHT_CHUNKS_PER_REQUEST": cls.MAX_INFLIGHT_CHUNKS_PER_REQUEST,
             "MAX_AUDIO_DURATION_MS": cls.MAX_AUDIO_DURATION_MS,
             "CPU_THREAD_POOL_SIZE": cls.CPU_THREAD_POOL_SIZE,
             "CPU_THREAD_POOL_effective": cpu_pool,
             "CPU_threads_total_est": cls.WORKERS * cpu_pool,
             "VAD_SESSION_POOL_SIZE": cls.VAD_SESSION_POOL_SIZE,
+            "HEALTH_MAX_CONSECUTIVE_FAILURES": cls.HEALTH_MAX_CONSECUTIVE_FAILURES,
+            "HEALTH_ACTIVE_PROBE": cls.HEALTH_ACTIVE_PROBE,
         }
         if backend == "trt":
             svc["GPU_STREAM_POOL_SIZE"] = cls.GPU_STREAM_POOL_SIZE

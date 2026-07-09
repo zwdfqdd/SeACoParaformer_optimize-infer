@@ -318,18 +318,48 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 # ============================================================
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """健康检查接口。
+    """健康检查接口（加载态 + 运行时健康，R12/R14）。
 
-    status 反映模型实际加载状态：models_loaded=False 时返回 "degraded"（供探针识别
-    加载失败/半死状态）；models_loaded=True 返回 "ok"。
-    注：GPU 运行时卡死本接口无法探测（需业务级探针），此处只保证加载态真实。
+    status 判定：
+        - 模型未加载 → degraded（供探针识别加载失败/半死状态）
+        - 运行时连续推理失败超 HEALTH_MAX_CONSECUTIVE_FAILURES（GPU 卡死典型症状）→ degraded
+        - 加载阶段发生静默降级（后端回退，如 TRT→ORT）→ 仍 ok（服务可用），
+          但 runtime.degraded_reason 暴露原因供运维察觉低性能/降功能模式
+        - 否则 ok
+
+    HEALTH_ACTIVE_PROBE=true 时额外主动跑一次极小 dummy 推理（带 INFER_TIMEOUT 超时），
+    直接验证 GPU 链路存活（探测被动统计未覆盖的“无流量期间”卡死）。
     """
     loaded = vad_engine.is_loaded and asr_engine.is_loaded
-    return HealthResponse(
-        status="ok" if loaded else "degraded",
+    runtime = asr_engine.runtime_health()
+
+    # 主动探针（可选）：真跑一次极小推理验证 GPU 链路（超时视为不健康）
+    if loaded and settings.HEALTH_ACTIVE_PROBE:
+        loop = asyncio.get_event_loop()
+        try:
+            probe_ok = await asyncio.wait_for(
+                loop.run_in_executor(_cpu_executor, asr_engine.active_probe),
+                timeout=settings.INFER_TIMEOUT,
+            )
+            runtime = asr_engine.runtime_health()
+            runtime["active_probe_ok"] = probe_ok
+        except asyncio.TimeoutError:
+            asr_engine.record_infer_failure()
+            runtime = asr_engine.runtime_health()
+            runtime["active_probe_ok"] = False
+
+    healthy = loaded and runtime.get("runtime_ok", True)
+    body = HealthResponse(
+        status="ok" if healthy else "degraded",
         device=settings.get_device(),
         models_loaded=loaded,
+        runtime=runtime,
     )
+    # 不健康时返回 HTTP 503，使 K8s readiness/liveness 探针（按状态码判定）真正摘除
+    # 卡死/未加载实例；健康返回 200。静默降级（degraded_reason 有值但 runtime_ok=True）
+    # 仍算健康（服务可用），只在 body 暴露原因，不触发探针摘除。
+    status_code = 200 if healthy else 503
+    return JSONResponse(status_code=status_code, content=body.model_dump())
 
 
 @app.get("/metrics")
@@ -561,12 +591,23 @@ async def asr_recognize(req: ASRRequest):
             )
 
         # ====== Stage 3: GPU 推理（Scheduler: 固定 shape bucket + batch_timeout） ======
+        # M3 超长音频分片限流：用 per-request 信号量约束同时在途（已 submit 未完成）的
+        # chunk 数，避免超长音频（上千 chunk）一次性灌满调度器、饿死其他请求、内存峰值飙高。
+        # 完成一个 chunk 立即放行下一个，保持流水线连续（非分批 barrier，无停顿）。
+        # 限流值 0 或 >= chunk 数时退化为旧的一次性 gather 行为。
         _t_s3 = time.time()
         with asr_inference_duration.time():
-            tasks = []
-            for features in features_list:
-                task = gpu_scheduler.submit(features, bias_embeddings)
-                tasks.append(task)
+            inflight_limit = settings.MAX_INFLIGHT_CHUNKS_PER_REQUEST
+            if inflight_limit and inflight_limit > 0 and len(features_list) > inflight_limit:
+                chunk_sem = asyncio.Semaphore(inflight_limit)
+
+                async def _submit_throttled(feats):
+                    async with chunk_sem:
+                        return await gpu_scheduler.submit(feats, bias_embeddings)
+
+                tasks = [asyncio.ensure_future(_submit_throttled(f)) for f in features_list]
+            else:
+                tasks = [gpu_scheduler.submit(f, bias_embeddings) for f in features_list]
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
         asr_stage_duration.labels(stage="stage3_gpu").observe(time.time() - _t_s3)
@@ -760,7 +801,16 @@ def _clamp_words_monotonic(words: list[ASRWord], prev_end_s: float) -> float:
 
 
 def _decode_char_list(token_ids: np.ndarray) -> list[str]:
-    """token_ids → 有效字符列表（过滤 <blank>/<sos>/<eos>，用 _token_list 逐字取）。"""
+    """token_ids → 有效字符列表（过滤 <blank>/<sos>/<eos>，用 _token_list 逐字取）。
+
+    字级时间戳按 CIF fire 对齐（每个声学 token 一次 fire），故须保持“一 token 一项”，
+    数量与 fire 数一致，不能在此合并 BPE subword（否则时间戳与字错位）。
+
+    但显示口径须与 tokenizer.decode（段 text）一致：清理 BPE 连接标记 `@@` 与
+    sentencepiece 前缀 `▁`（I5 中英混合错位修复）。这样英文 subword 如 `and@@`/`roid`
+    显示为 `and`/`roid`（各自带时间戳），拼接后与段 text 的 `android` 字面一致，
+    仅粒度更细（按 subword 切分）；中文逐字 1 token=1 字，行为不变。
+    """
     chars = []
     tl = getattr(tokenizer, "_token_list", None)
     for tid in token_ids.tolist():
@@ -768,8 +818,84 @@ def _decode_char_list(token_ids: np.ndarray) -> list[str]:
         if tid <= 2:  # blank/sos/eos
             continue
         if tl is not None and 0 <= tid < len(tl) and tl[tid]:
-            chars.append(tl[tid])
+            tok = tl[tid]
+            # 跳过 <...> 特殊标记（与 tokenizer.decode 一致）
+            if tok.startswith("<") and tok.endswith(">"):
+                continue
+            # 清理 BPE 连接标记，保持与段 text 显示口径一致
+            tok = tok[:-2] if tok.endswith("@@") else tok
+            tok = tok.replace("▁", "")
+            if tok:
+                chars.append(tok)
     return chars
+
+
+def _apply_faiss_to_words(
+    words: list[ASRWord],
+    orig_text: str,
+    spans: list[tuple[int, int, str]],
+) -> list[ASRWord]:
+    """将 Faiss 替换区间同步映射到字级 words，保证 words 与纠错后 text 一致（I3）。
+
+    orig_text 为纠错前段文本（Faiss 检索所用），spans 为按 start 升序、互不重叠的
+    替换区间 (start, end, cand)：orig_text[start:end] → cand。
+
+    对齐策略：字级 words 的 text 逐个拼接理论上等于 orig_text（纯中文 1 字 1 word 严格
+    成立）。据此建立“word 序号 → orig_text 字符偏移”映射：
+      - 命中区间被 cand 逐字替换：被覆盖 words 的时间区间合并为 [t0,t1]，按 cand 字数
+        等分重新切分，生成新的字级 words（时间单调、与 cand 字面一致）。
+      - 未命中区间的 words 原样保留。
+    若拼接与 orig_text 不一致（中英混合含空格等边界情形），无法可靠对齐，则放弃 words
+    改写、保持原样（text 仍已纠错），避免破坏时间戳（保守降级）。
+    """
+    # 建立 word → 字符区间映射（按 word.text 长度累加）
+    concat = "".join(w.text for w in words)
+    if concat != orig_text:
+        # 口径不一致（空格/BPE 边界），无法可靠对齐 → 放弃 words 改写（保守降级）
+        return words
+
+    # 每个 word 覆盖的字符区间 [cstart, cend)
+    word_char_ranges: list[tuple[int, int]] = []
+    pos = 0
+    for w in words:
+        word_char_ranges.append((pos, pos + len(w.text)))
+        pos += len(w.text)
+
+    span_map = {s[0]: (s[1], s[2]) for s in spans}
+    out: list[ASRWord] = []
+    wi = 0
+    n = len(words)
+    while wi < n:
+        cstart = word_char_ranges[wi][0]
+        if cstart in span_map:
+            end, cand = span_map[cstart]
+            # 收集覆盖 [cstart, end) 的所有 word
+            covered = []
+            j = wi
+            while j < n and word_char_ranges[j][1] <= end:
+                covered.append(words[j])
+                j += 1
+            if covered:
+                t0 = covered[0].timestamp[0]
+                t1 = covered[-1].timestamp[1]
+                # 按 cand 字数等分时间区间
+                m = len(cand)
+                if m <= 0:
+                    wi = j
+                    continue
+                step = (t1 - t0) / m
+                for k, ch in enumerate(cand):
+                    s = round(t0 + step * k, 3)
+                    e = round(t0 + step * (k + 1), 3) if k < m - 1 else round(t1, 3)
+                    out.append(ASRWord(text=ch, timestamp=[s, e]))
+                wi = j
+            else:
+                out.append(words[wi])
+                wi += 1
+        else:
+            out.append(words[wi])
+            wi += 1
+    return out
 
 
 def _build_response(
@@ -819,9 +945,13 @@ def _build_response(
             if words_pyd:
                 prev_word_end_s = _clamp_words_monotonic(words_pyd, prev_word_end_s)
 
-        # 路径 B：Faiss 后处理纠错（仅纠正文本，不改字级时间戳）
+        # 路径 B：Faiss 后处理纠错。返回替换区间，同步回写字级 words，
+        # 保证 words 拼接 == 纠错后 text（I3：消除 words 反映纠错前、text 纠错后的不一致）。
         if corrector is not None and text:
-            text = corrector.correct(text)
+            corrected_text, corr_spans = corrector.correct_with_spans(text)
+            if corr_spans and words_pyd:
+                words_pyd = _apply_faiss_to_words(words_pyd, text, corr_spans)
+            text = corrected_text
 
         # 段级时间戳用原始 VAD 时间戳（ms → s，保留 3 位小数与外部标准对齐）
         start_s = round(chunk.effective_start_ms / 1000.0, 3)
