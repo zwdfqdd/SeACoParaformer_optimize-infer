@@ -192,6 +192,14 @@ async def lifespan(app: FastAPI):
     logger.info("服务关闭中...")
     hotword_manager.stop_polling()
     await gpu_scheduler.stop()
+    # 关闭 CPU 线程池（Stage1/2）+ GPU 线程池（scheduler），释放线程资源
+    if _cpu_executor is not None:
+        _cpu_executor.shutdown(wait=False, cancel_futures=True)
+    try:
+        from src.scheduler import _gpu_executor
+        _gpu_executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
     logger.info("服务已关闭")
 
 
@@ -288,16 +296,39 @@ async def asr_exception_handler(request: Request, exc: ASRException):
     )
 
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """兜底异常处理：未被 ASRException 包装的异常（切段/特征/解码等）统一转为
+    结构化 500（ASR_INFER_FAILED），避免 FastAPI 默认处理器返回无 code/asr 字段的
+    原生 500 破坏 API 契约。"""
+    logger.error(f"未处理异常: {type(exc).__name__}: {exc}")
+    asr_request_total.labels(status="error").inc()
+    content = {"code": int(ErrorCode.ASR_INFER_FAILED)}
+    if request.url.path == "/chinese_asr":
+        content["article_url"] = None
+        content["istar_asr"] = ""
+        content["asr"] = []
+    content["error"] = ErrorCode.ASR_INFER_FAILED.name
+    content["message"] = f"服务内部错误: {type(exc).__name__}"
+    return JSONResponse(status_code=500, content=content)
+
+
 # ============================================================
 # 路由
 # ============================================================
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """健康检查接口。"""
+    """健康检查接口。
+
+    status 反映模型实际加载状态：models_loaded=False 时返回 "degraded"（供探针识别
+    加载失败/半死状态）；models_loaded=True 返回 "ok"。
+    注：GPU 运行时卡死本接口无法探测（需业务级探针），此处只保证加载态真实。
+    """
+    loaded = vad_engine.is_loaded and asr_engine.is_loaded
     return HealthResponse(
-        status="ok",
+        status="ok" if loaded else "degraded",
         device=settings.get_device(),
-        models_loaded=vad_engine.is_loaded and asr_engine.is_loaded,
+        models_loaded=loaded,
     )
 
 

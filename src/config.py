@@ -631,6 +631,7 @@ class Settings:
             "BATCH_TIMEOUT_ms": cls.BATCH_TIMEOUT,
             "MAX_CONCURRENT_REQUESTS": cls.MAX_CONCURRENT_REQUESTS,
             "ACQUIRE_TIMEOUT_s": cls.ACQUIRE_TIMEOUT,
+            "INFER_TIMEOUT_s": cls.INFER_TIMEOUT,
             "MAX_AUDIO_DURATION_MS": cls.MAX_AUDIO_DURATION_MS,
             "CPU_THREAD_POOL_SIZE": cls.CPU_THREAD_POOL_SIZE,
             "CPU_THREAD_POOL_effective": cpu_pool,

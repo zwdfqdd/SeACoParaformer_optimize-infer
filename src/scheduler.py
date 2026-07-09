@@ -356,7 +356,7 @@ class GPUScheduler:
             if _is_oom_error(e):
                 # OOM Fallback：减半 batch 重试 → 逐条推理 → 返回错误
                 logger.warning(f"GPU OOM (batch={actual_count})，尝试减半 batch 重试")
-                await self._oom_fallback(batch, actual_lengths, bucket_idx, bias_embeddings)
+                await self._oom_fallback(batch, bucket_idx, bias_embeddings)
             else:
                 # 非 OOM（含 buffer/shape 等）：全 batch 兜底 set_exception，防挂起
                 for req in batch:
@@ -366,8 +366,7 @@ class GPUScheduler:
                         )
 
     async def _oom_fallback(
-        self, batch: list[InferRequest], actual_lengths: list[int],
-        bucket_idx: int, bias_embeddings
+        self, batch: list[InferRequest], bucket_idx: int, bias_embeddings
     ):
         """
         OOM 恢复策略：
