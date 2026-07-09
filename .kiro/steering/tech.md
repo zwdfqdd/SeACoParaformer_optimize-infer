@@ -51,7 +51,7 @@ python scripts/export_onnx_whole.py --skip-fp16 --output-dir ./models/asr
 python scripts/convert_onnx_int8_dynamic.py --input-dir ./models/asr/fp32 --output-dir ./models/asr/int8
 
 # 分段 ONNX 导出 + TRT 转换（trt 系列）
-python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 30000
+python scripts/export_onnx_split.py --output-dir ./models/asr/split --clamp-value 60000
 python scripts/convert_trt.py --input ./models/asr/split/encoder.onnx --precision fp16 --profile encoder
 ```
 

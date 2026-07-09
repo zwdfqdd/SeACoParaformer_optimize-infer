@@ -245,7 +245,7 @@ curl http://<node-ip>:30960/health
 | BATCH | 增大可提高 GPU 利用率，但增加单请求延迟。合法值：1,2,4,8,12 |
 | BATCH_TIMEOUT | 减小可降低延迟，但降低 batch 填充率。默认 10ms（实测吞吐最优） |
 | MAX_CONCURRENT_REQUESTS | 控制最大并发，防止内存溢出。默认 2000 |
-| VAD_SESSION_POOL_SIZE | 默认 4；单进程 20+ 并发可调 8 |
+| VAD_SESSION_POOL_SIZE | 默认 2（实测最优）；单进程 20+ 并发可调 4-8 |
 | GPU_STREAM_POOL_SIZE | 默认 4；显存充足可扩到 8 |
 | OMP_NUM_THREADS | ★必须 1，防 libgomp 崩溃 |
 | VERBOSE | 开启后输出各阶段详细耗时，便于性能分析 |

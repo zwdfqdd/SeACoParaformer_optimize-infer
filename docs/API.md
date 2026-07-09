@@ -254,7 +254,6 @@
   "md5": "a1b2c3...",
   "count": 3,
   "route": "B",
-  "dropped_oov": ["xxx"],
   "message": "词表更新成功，已切换至 version 4"
 }
 ```
@@ -265,7 +264,8 @@
 | md5 | string | 词表内容哈希 |
 | count | int | 有效词条数（去重 + 剔除 OOV 后） |
 | route | string | 默认词表生效路径，恒为 B（Faiss）；路径 A 仅客户端传热词时使用 |
-| dropped_oov | string[] | 被剔除的无法编码词 |
+
+> 被剔除的 OOV 词不单独返回，可通过 count 变化 + 服务日志（含剔除详情）核对。
 
 **校验失败响应（HTTP 400）：**
 
