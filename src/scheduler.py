@@ -1,20 +1,21 @@
 """
 GPU Scheduler — 工业标准 dynamic batching（Triton/TF-Serving 模式）
 
-设计：
-- VAD 后音频经 audio_segment 合并/切分，Scheduler 将特征 pad 到桶边界
-- 桶边界：2s/4s/8s（LFR 帧数 34/67/134）
-- 每个 (bucket, bias) 独立 group 队列
+设计（配合 audio_segment Uniform Chunking）：
+- VAD 后音频经 audio_segment 均匀切段（所有 chunk 统一到 opt≈67 帧），submit 不 pad，
+  _execute_batch 按 batch 内 max(lengths) 动态 pad 到最近合法 batch size
+- 分组键 = (0, bias_key)：只按 bias 身份分组（桶维度固定 0，不再按桶分组），
+  避免跨请求热词串扰，同时最大化合批（相同 bias 的 chunk 全部可合并）
 
 触发条件（OR 逻辑，先到者优先）：
     1. 满 batch：group.size >= MAX_BATCH_SIZE → 立即触发（不等）
-    2. 超时：now - group[0].enqueue_time >= BATCH_TIMEOUT
-       → 按当前 group 大小 pad 到最近合法 batch 触发
+    2. 超时：now - group 最早 chunk.enqueue_time >= BATCH_TIMEOUT → 兜底触发
 
 关键点：
-- 超时按"最早入队 chunk"计算，保证严格延迟上限（不是全局定时抖动）
+- 超时按"最早入队 chunk"计算，保证严格延迟上限（1ms 高精度 tick 扫描）
 - 满 batch 立即触发（再等也不能更大）
-- 触发后剩余 chunk（>MAX_BATCH_SIZE 部分）重新入队，enqueue_time 重置
+- 触发后剩余 chunk（>MAX_BATCH_SIZE 部分）保留在 group，enqueue_time 不变，
+  由下一轮扫描按原计时继续判定（不重置，避免饿死）
 
 OOM Fallback：减半 batch 重试 → 逐条推理 → 返回错误
 """

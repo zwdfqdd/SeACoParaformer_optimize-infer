@@ -1,12 +1,11 @@
 """
-ONNX 模型精度验证脚本（导出环境）
+ONNX 模型精度验证脚本
 
 对比方式：
-- PT 推理：FunASR AutoModel.generate()（基准）
-- ONNX 推理：onnxruntime + 内联特征提取 + tokenizer（模拟线上部署）
+- PT 推理：独立 seaco_paraformer 包 load_model（基准，不依赖 FunASR 运行时）
+- ONNX 推理：onnxruntime + src 特征提取 + tokenizer（模拟线上部署）
 
-运行环境：转换容器内（含 funasr + onnxruntime）
-不依赖 src/ 目录。
+运行环境：含 torch + onnxruntime + seaco_paraformer + src。
 
 用法：
     python scripts/verify_onnx.py --audio test.wav

@@ -52,8 +52,8 @@ class HotwordCache:
     version: int
     md5: str
     words: tuple[str, ...]          # 有效词条（去重 + 剔 OOV 后）
-    route: str                       # "A"（SeACo 预编码）或 "B"（Faiss）
-    bias_embed: np.ndarray | None    # route=A 时的预编码 bias_embed (1, N+1, 512)，否则 None
+    route: str                       # 默认词表恒为 "B"（Faiss）；"A"（SeACo）仅客户端传热词时用
+    bias_embed: np.ndarray | None    # 默认词表恒走 B，故恒为 None（route=A 才有预编码 bias_embed）
     loaded_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
     @property

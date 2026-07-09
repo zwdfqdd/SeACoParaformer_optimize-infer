@@ -3,10 +3,10 @@ Timestamp 验证脚本
 
 对比两种字级时间戳方案：
   --method main    ：main head alphas 反推（60ms 粒度，粗，字间停顿归前字）
-  --method alphas2 ：upsample timestamp head（12ms 粒度，对齐 FunASR 官方 ts_prediction）
+  --method alphas2 ：upsample timestamp head（20ms 粒度，对齐 FunASR 官方 ts_prediction）
 
 alphas2 方案（推荐）流程：
-  1. predictor.get_upsample_timestamp → us_alphas(上采样5x) + us_cif_peak(fire峰值)
+  1. predictor.get_upsample_timestamp → us_alphas(上采样 upsample_times=3) + us_cif_peak(fire峰值)
   2. ts_prediction_lfr6_standard 后处理：
      - fire_place = where(peak>=1-1e-4) + force_time_shift
      - 相邻 fire 之间作为前一 token 的时长（不重叠）

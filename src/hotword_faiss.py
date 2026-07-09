@@ -1,7 +1,8 @@
 """
 路径 B：Faiss 大词库后处理纠错
 
-触发条件：客户端未传 hotwords 且服务端默认词表 > MAX_HOTWORD_NUM。
+触发条件：客户端未传 hotwords（默认词表恒走本路径，不再按 MAX_HOTWORD_NUM 大小切换）
+    且 ENABLE_FAISS_CORRECTION=true。
 
 流程：
     普通 ASR 输出 text

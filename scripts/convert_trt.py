@@ -31,6 +31,9 @@ ONNX → TensorRT Engine 转换脚本
     # 4. Bias Encoder（33MB → ~17MB，热词编码 LSTM）
     python scripts/convert_trt.py --input ./models/asr/split/bias_encoder.onnx --precision fp16 --profile bias
 
+    # 5. Timestamp（第 5 段，字级时间戳，可选；含 BLSTM 仅 fp16/fp32，不支持 int8）
+    python scripts/convert_trt.py --input ./models/asr/split/timestamp.onnx --precision fp16 --profile timestamp
+
 完整模型转换（不拆分，可能遇到 Cask/NonZero 问题）：
 
     python scripts/convert_trt.py --input ./models/asr/fp32/model.onnx --precision fp16 --profile asr

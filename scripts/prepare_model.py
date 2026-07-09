@@ -9,18 +9,19 @@ PT 权重需提前下载并打包进镜像（不在运行时下载）：
     PT 权重（本地预打包 PT_MODEL_DIR）
     ├── 整体 ONNX            export_onnx_whole.py          → models/asr/fp32/model.onnx
     │   └── ONNX int8        convert_onnx_int8_dynamic.py  → models/asr/int8/model.onnx
-    └── 分段 ONNX            export_onnx_split.py          → models/asr/split/{encoder,cif,decoder,bias_encoder}.onnx
+    └── 分段 ONNX            export_onnx_split.py          → models/asr/split/{encoder,cif,decoder,bias_encoder,timestamp}.onnx
         ├── TRT fp32/fp16    convert_trt.py                → models/asr/trt/{gpu}_{module}_{prec}.engine
         └── QDQ ONNX         export_{encoder,cif,decoder,bias}_qdq → models/asr/split/{module}_qdq.onnx
             └── TRT int8     convert_trt.py                → models/asr/trt/{gpu}_{module}_int8_qdq.engine
 
-各 MODEL_PRECISION 需要的产物：
-    pt                 → PT 权重（本地）
-    onnx_fp32          → 整体 fp32 ONNX
+各 MODEL_PRECISION 需要的产物（4 段主 engine；ENABLE_WORD_TIMESTAMP=true 时额外构建
+timestamp 第 5 段，仅 fp16/fp32）：
+    pt                 → PT 权重（本地，无需转换）
+    onnx_fp32          → 整体 fp32 ONNX（启用时间戳时另需分段 ONNX 含 timestamp）
     onnx_int8          → 整体 fp32 ONNX → int8 ONNX
-    trt_fp32           → 分段 ONNX → 4 段 fp32 engine
-    trt_fp16           → 分段 ONNX → 4 段 fp16 engine
-    trt_int8           → 分段 ONNX + 4 段 QDQ ONNX → 4 段 int8 engine
+    trt_fp32           → 分段 ONNX → 4 段 fp32 engine（+timestamp fp32）
+    trt_fp16           → 分段 ONNX → 4 段 fp16 engine（+timestamp fp16）
+    trt_int8           → 分段 ONNX + 4 段 QDQ ONNX → 4 段 int8 engine（+timestamp fp16）
     trt_int8_enc       → 分段 ONNX + encoder QDQ → encoder int8 + 其余 fp16 engine（★线上推荐）
 
 用法：

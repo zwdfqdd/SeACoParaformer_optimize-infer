@@ -1,9 +1,16 @@
 """
 SeACo-Paraformer FastAPI 服务入口
 
-提供：
-- POST /chinese_asr — 中文语音识别接口
-- GET /health — 健康检查接口
+三级流水线（Stage1 解码/VAD/切段 → Stage2 特征提取 → Stage3 GPU 推理）+
+热词双路路由（A: SeACo 在线 / B: Faiss 后处理）+ 词表运行时热更新。
+
+接口：
+- POST /chinese_asr      — 中文语音识别（base64 音频 + 可选 hotwords/article_url）
+- GET  /health           — 健康检查
+- GET  /metrics          — Prometheus 指标
+- POST /hotwords/reload   — 重载默认词表（运行时热更新）
+- GET  /hotwords/status   — 查看当前词表版本状态
+- POST /hotwords/rollback — 回滚到上一版词表
 """
 
 import asyncio

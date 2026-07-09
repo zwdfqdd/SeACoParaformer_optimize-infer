@@ -1,12 +1,14 @@
 """
-SeACo-Paraformer 模型 ONNX 导出脚本
+SeACo-Paraformer 整体模型 ONNX 导出脚本（v1 整体路径，ORT 后端用）
 
 流程：
-1. 使用 FunASR AutoModel.export() 导出 fp32 ONNX
-2. 使用 onnxconverter-common mixed precision 转为 fp16
-   - keep_io_types=True 保持输入输出为 fp32
-   - op_block_list 保留精度敏感算子为 fp32
-3. opset_version=17
+1. 用独立 seaco_paraformer 包加载本地 PT 权重，导出 fp32 整体 ONNX
+   （model.onnx 主模型 + model_eb.onnx 热词编码），opset_version=17
+2. 可选转 fp16（onnxruntime.transformers.float16，多方案 fallback；
+   keep_io_types=True 保持 IO 为 fp32，精度敏感算子/子图保留 fp32）
+   —— 线上 CPU 部署一般用 --skip-fp16 导 fp32，再由 convert_onnx_int8_dynamic 动态量化 int8
+
+注：不依赖 FunASR 运行时；分段 ONNX（TRT 路径）见 export_onnx_split.py。
 """
 
 import argparse
