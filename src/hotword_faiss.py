@@ -24,11 +24,22 @@
 from __future__ import annotations
 
 import threading
+from typing import NamedTuple
 
 import numpy as np
 
 from src.config import settings
 from src.logger import logger
+
+
+class _FaissState(NamedTuple):
+    """索引快照（不可变，一次性原子切换，避免 correct 读到 build 中间态）。"""
+    index: object                    # faiss.IndexFlatIP
+    words: tuple[str, ...]           # 词表（与 index 行对齐）
+    word_pinyin: tuple[str, ...]     # 各词拼音串（编辑距离用）
+    syllable_to_idx: dict            # 音节 → 列索引
+    dim: int
+    version: int
 
 # 懒加载第三方依赖（缺失时禁用纠错，不阻塞服务）
 try:
@@ -53,21 +64,19 @@ class FaissCorrector:
     """大词库拼音检索纠错器。原子切换索引，支持随词表热更新重建。"""
 
     def __init__(self):
-        self._index = None                       # faiss.IndexFlatIP
-        self._words: tuple[str, ...] = ()         # 词表（与 index 行对齐）
-        self._word_pinyin: tuple[str, ...] = ()   # 各词的拼音串（编辑距离用）
-        self._syllable_to_idx: dict[str, int] = {}
-        self._dim = 0
-        self._version = -1
+        # 单一状态快照引用（None=未就绪）；build 原子替换，correct 原子读取。
+        self._state: _FaissState | None = None
         self._build_lock = threading.Lock()
 
     @property
     def is_ready(self) -> bool:
-        return _HAS_DEPS and self._index is not None and len(self._words) > 0
+        st = self._state
+        return _HAS_DEPS and st is not None and len(st.words) > 0
 
     @property
     def version(self) -> int:
-        return self._version
+        st = self._state
+        return st.version if st is not None else -1
 
     # --------------------------------------------------------
     # 索引构建（原子切换）
@@ -110,13 +119,16 @@ class FaissCorrector:
 
                 word_pinyin = ["".join(syls) for syls in word_syllables]
 
-                # 原子切换
-                self._index = index
-                self._words = tuple(words)
-                self._word_pinyin = tuple(word_pinyin)
-                self._syllable_to_idx = syllable_to_idx
-                self._dim = dim
-                self._version = version
+                # 原子切换：打包成不可变快照，单次引用赋值（GIL 原子），
+                # correct 读一次 self._state 即得一致视图，杜绝读到 index 新/词表旧的中间态
+                self._state = _FaissState(
+                    index=index,
+                    words=tuple(words),
+                    word_pinyin=tuple(word_pinyin),
+                    syllable_to_idx=syllable_to_idx,
+                    dim=dim,
+                    version=version,
+                )
 
                 logger.info(
                     f"Faiss 纠错索引构建完成: version={version}, 词条={len(words)}, dim={dim}"
@@ -127,15 +139,15 @@ class FaissCorrector:
     # --------------------------------------------------------
     # 文本纠错
     # --------------------------------------------------------
-    def _vectorize(self, text: str) -> np.ndarray | None:
-        """候选片段 → 拼音向量（在已有音节词表上）。"""
+    def _vectorize(self, text: str, st: _FaissState) -> np.ndarray | None:
+        """候选片段 → 拼音向量（在快照 st 的音节词表上）。"""
         syls = _to_pinyin_syllables(text)
         if not syls:
             return None
-        vec = np.zeros((1, self._dim), dtype=np.float32)
+        vec = np.zeros((1, st.dim), dtype=np.float32)
         hit = False
         for s in syls:
-            idx = self._syllable_to_idx.get(s)
+            idx = st.syllable_to_idx.get(s)
             if idx is not None:
                 vec[0, idx] += 1.0
                 hit = True
@@ -162,7 +174,8 @@ class FaissCorrector:
         逐候选片段检索，三重联合判定通过则记录替换。
         同一位置只替换一次（最长片段优先），最后按非重叠区间重组文本。
         """
-        if not self.is_ready or not text:
+        st = self._state  # 一次性原子读取快照，后续全程用 st（避免中途被 build 替换）
+        if not _HAS_DEPS or st is None or not st.words or not text:
             return text
 
         try:
@@ -183,23 +196,23 @@ class FaissCorrector:
                 if any(occupied[start:end]):
                     continue
                 frag = text[start:end]
-                vec = self._vectorize(frag)
+                vec = self._vectorize(frag, st)
                 if vec is None:
                     continue
 
-                k = min(topk, len(self._words))
-                scores, idxs = self._index.search(vec, k)
+                k = min(topk, len(st.words))
+                scores, idxs = st.index.search(vec, k)
                 scores, idxs = scores[0], idxs[0]
                 if len(idxs) == 0 or idxs[0] < 0:
                     continue
 
                 top1_score = float(scores[0])
                 top2_score = float(scores[1]) if len(scores) > 1 else 0.0
-                cand = self._words[idxs[0]]
+                cand = st.words[idxs[0]]
 
                 # 编辑距离分（基于拼音串）
                 frag_py = "".join(_to_pinyin_syllables(frag))
-                cand_py = self._word_pinyin[idxs[0]]
+                cand_py = st.word_pinyin[idxs[0]]
                 maxlen = max(len(frag_py), len(cand_py), 1)
                 edit_score = 1.0 - Levenshtein.distance(frag_py, cand_py) / maxlen
 

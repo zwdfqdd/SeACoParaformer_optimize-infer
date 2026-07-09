@@ -73,6 +73,9 @@ class Settings:
     MAX_AUDIO_DURATION_MS: int = int(os.getenv("MAX_AUDIO_DURATION_MS", "7200000"))
     # 过载拒绝：并发信号量等待超时（秒），超时返回 SERVICE_BUSY(1007)。0 = 无限等待（不拒绝）。
     ACQUIRE_TIMEOUT: float = float(os.getenv("ACQUIRE_TIMEOUT", "5"))
+    # 单 chunk GPU 推理 future 等待超时（秒），防调度异常导致请求永久挂起（占用信号量）。
+    # 超时返回 ASR_INFER_FAILED(1004)。默认 120s（远大于正常单 chunk 推理，仅兜底极端卡死）。
+    INFER_TIMEOUT: float = float(os.getenv("INFER_TIMEOUT", "120"))
 
     # 模型精度（见文件头精度矩阵）。
     # 默认 auto：代码层兜底，按硬件自动探测（GPU→trt_int8_enc/trt_fp16，CPU→onnx_int8）。

@@ -52,6 +52,18 @@ _gpu_executor = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="gpu",
 )
 
+# OOM 判定：匹配多种显存不足文案（torch/CUDA/TRT/cudaMalloc/bad_alloc）
+_OOM_MARKERS = (
+    "out of memory", "oom", "cuda_error_out_of_memory", "cudamalloc",
+    "bad_alloc", "cublas_status_alloc_failed", "failed to allocate",
+)
+
+
+def _is_oom_error(err: Exception) -> bool:
+    """鲁棒判定是否显存不足错误（比单一 'out of memory' 字符串匹配更全）。"""
+    msg = str(err).lower()
+    return any(m in msg for m in _OOM_MARKERS)
+
 
 def encode_hotwords_on_gpu(hotword_token_ids: np.ndarray) -> np.ndarray | None:
     """
@@ -228,7 +240,15 @@ class GPUScheduler:
                     del self._groups[group_key]
                 asyncio.create_task(self._execute_batch(batch, bucket_idx, bias_embeddings))
 
-        return await request.future
+        # 加超时兜底：正常路径 future 由 _execute_batch/_oom_fallback set；
+        # 极端调度异常（如 batch 从未被触发执行）时避免请求永久挂起、占用并发信号量。
+        try:
+            return await asyncio.wait_for(request.future, timeout=settings.INFER_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise ASRException(
+                ErrorCode.ASR_INFER_FAILED,
+                f"推理超时（>{settings.INFER_TIMEOUT}s），可能调度阻塞或 GPU 卡死",
+            )
 
     async def _schedule_loop(self):
         """
@@ -283,34 +303,34 @@ class GPUScheduler:
         - 同一 batch 内所有 chunk 共享同一 bias（由分组键保证），无热词串扰。
         """
         actual_count = len(batch)
-        # batch 内实际最大帧数（≥ min_seq 兜底，避免 profile 下越界）
-        target_seq_len = max(req.length for req in batch)
-        target_seq_len = max(target_seq_len, min(BUCKET_SEQ_LENS))
-        feat_dim = batch[0].features.shape[1]
-
-        # pad 到合法 batch size
-        pad_batch_size = get_pad_batch_size(actual_count)
-        # 填充率统计（诊断 GPU 是否空跑 padding）
-        self._stat_batches += 1
-        self._stat_actual += actual_count
-        self._stat_padded += pad_batch_size
-        padded_feats = np.zeros((pad_batch_size, target_seq_len, feat_dim), dtype=np.float32)
-        lengths = np.zeros(pad_batch_size, dtype=np.int32)
-        actual_lengths = []
-
-        for i, req in enumerate(batch):
-            L = req.length
-            padded_feats[i, :L] = req.features[:L]
-            lengths[i] = L  # 真实有效帧数（CIF mask 据此排除 padding 帧，避免多 fire token）
-            actual_lengths.append(L)
-
-        # dummy padding（复制最后一条的数据，长度对齐 target_seq_len）
-        last_L = batch[-1].length
-        for i in range(actual_count, pad_batch_size):
-            padded_feats[i, :last_L] = batch[-1].features[:last_L]
-            lengths[i] = last_L
-
+        actual_lengths = [req.length for req in batch]
         try:
+            # ── buffer 分配纳入 try：任何异常（含 buffer/shape 错）都能兜底 set_exception，
+            #    避免 batch 内 future 永不完成导致请求永久挂起（H3）──
+            # batch 内实际最大帧数（≥ min_seq 兜底，避免 profile 下越界）
+            target_seq_len = max(actual_lengths)
+            target_seq_len = max(target_seq_len, min(BUCKET_SEQ_LENS))
+            feat_dim = batch[0].features.shape[1]
+
+            pad_batch_size = get_pad_batch_size(actual_count)
+            # 填充率统计（诊断 GPU 是否空跑 padding）
+            self._stat_batches += 1
+            self._stat_actual += actual_count
+            self._stat_padded += pad_batch_size
+            padded_feats = np.zeros((pad_batch_size, target_seq_len, feat_dim), dtype=np.float32)
+            lengths = np.zeros(pad_batch_size, dtype=np.int32)
+
+            for i, req in enumerate(batch):
+                L = req.length
+                padded_feats[i, :L] = req.features[:L]
+                lengths[i] = L  # 真实有效帧数（CIF mask 据此排除 padding 帧）
+
+            # dummy padding（复制最后一条，长度对齐 target_seq_len；切片赋值防形状不匹配）
+            last_L = batch[-1].length
+            for i in range(actual_count, pad_batch_size):
+                padded_feats[i, :last_L] = batch[-1].features[:last_L]
+                lengths[i] = last_L
+
             t0 = _time.perf_counter()
             results = await asyncio.get_event_loop().run_in_executor(
                 _gpu_executor,
@@ -323,24 +343,22 @@ class GPUScheduler:
 
             if settings.VERBOSE:
                 logger.debug(
-                    f"[Stage3] bucket={bucket_idx}({target_seq_len}帧), "
-                    f"batch={pad_batch_size}(实际{actual_count}), "
-                    f"推理={infer_ms:.1f}ms"
+                    f"[Stage3] seq={target_seq_len}帧, "
+                    f"batch={pad_batch_size}(实际{actual_count}), 推理={infer_ms:.1f}ms"
                 )
 
-            # engine 内部已按 token_num 截断（TRT 4 段架构）或返回完整 logits（ORT）
-            # scheduler 不再做帧级截断
+            # engine 内部已按 token_num 截断（TRT 分段）或返回完整 logits（ORT）
             for i, req in enumerate(batch):
                 if not req.future.done():
                     req.future.set_result(results[i])
 
         except Exception as e:
-            error_msg = str(e).lower()
-            if "out of memory" in error_msg or "oom" in error_msg:
+            if _is_oom_error(e):
                 # OOM Fallback：减半 batch 重试 → 逐条推理 → 返回错误
-                logger.warning(f"GPU OOM (batch={pad_batch_size})，尝试减半 batch 重试")
+                logger.warning(f"GPU OOM (batch={actual_count})，尝试减半 batch 重试")
                 await self._oom_fallback(batch, actual_lengths, bucket_idx, bias_embeddings)
             else:
+                # 非 OOM（含 buffer/shape 等）：全 batch 兜底 set_exception，防挂起
                 for req in batch:
                     if not req.future.done():
                         req.future.set_exception(
@@ -357,7 +375,6 @@ class GPUScheduler:
         2. 仍失败则逐条推理
         3. 仍失败则返回 ASR_INFER_FAILED 错误
         """
-        target_seq_len = BUCKET_SEQ_LENS[bucket_idx]
         feat_dim = batch[0].features.shape[1]
         actual_count = len(batch)
 
@@ -367,18 +384,24 @@ class GPUScheduler:
 
         for start in range(0, actual_count, half_size):
             sub_batch = batch[start:start + half_size]
-            sub_lengths = actual_lengths[start:start + half_size]
             sub_count = len(sub_batch)
             pad_size = get_pad_batch_size(sub_count)
+
+            # 与主路径一致：target_seq_len 取子 batch 内动态最大帧数（≥ 最小桶兜底），
+            # 切片赋值 padded_feats[i,:L]=req.features[:L]（防 features 未 pad 与 buffer 形状不匹配，H2）
+            sub_max_len = max(req.length for req in sub_batch)
+            target_seq_len = max(sub_max_len, min(BUCKET_SEQ_LENS))
 
             padded_feats = np.zeros((pad_size, target_seq_len, feat_dim), dtype=np.float32)
             lengths = np.zeros(pad_size, dtype=np.int32)
             for i, req in enumerate(sub_batch):
-                padded_feats[i] = req.features
-                lengths[i] = req.length  # 真实有效帧数
+                L = req.length
+                padded_feats[i, :L] = req.features[:L]
+                lengths[i] = L  # 真实有效帧数
+            last_L = sub_batch[-1].length
             for i in range(sub_count, pad_size):
-                padded_feats[i] = sub_batch[-1].features
-                lengths[i] = sub_batch[-1].length
+                padded_feats[i, :last_L] = sub_batch[-1].features[:last_L]
+                lengths[i] = last_L
 
             try:
                 results = await asyncio.get_event_loop().run_in_executor(
@@ -392,8 +415,7 @@ class GPUScheduler:
                     if not req.future.done():
                         req.future.set_result(results[i])
             except Exception as e1:
-                error_msg = str(e1).lower()
-                if "out of memory" in error_msg or "oom" in error_msg:
+                if _is_oom_error(e1):
                     # Step 2: 逐条推理
                     logger.warning(f"OOM Fallback Step2: 减半仍 OOM，降级为逐条推理")
                     for i, req in enumerate(sub_batch):
