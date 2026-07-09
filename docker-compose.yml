@@ -23,6 +23,8 @@ services:
       - MAX_AUDIO_DURATION_MS=${MAX_AUDIO_DURATION_MS:-7200000}
       # 过载拒绝：并发等待超时（秒），超时返回 1007；0=无限等待
       - ACQUIRE_TIMEOUT=${ACQUIRE_TIMEOUT:-5}
+      # 单 chunk 推理 future 超时（秒），防调度卡死导致请求永久挂起
+      - INFER_TIMEOUT=${INFER_TIMEOUT:-120}
       # 精度方案：
       #   线上推荐 trt_int8_enc = encoder int8(QDQ) + cif/decoder/bias fp16
       #   可选 trt_fp16 / trt_fp32 / trt_int8 / onnx_fp32 / onnx_int8 / auto
@@ -57,7 +59,7 @@ services:
       # - TRT_OPT_SEQ=67
       # - TRT_OPT_BATCH=4
       # ─── 热词参数（路径 A：SeACo 在线热词，改动 MAX/OPT 后需重新转 engine）───
-      # - MAX_HOTWORD_NUM=256   # 在线热词硬上限 / 路径切换点（≤A SeACo，>B Faiss）
+      # - MAX_HOTWORD_NUM=256   # 客户端热词硬上限/截断点（默认词表恒走 Faiss，不作路由切换）
       # - OPT_HOTWORD_NUM=64    # TRT profile opt point
       # - NFILTER=50            # ASF 过滤注入 decoder 的 top-K
       # ─── 词表热更新（默认词表 + 多 worker 轮询收敛）───

@@ -226,11 +226,22 @@ v2.5 三后端统一 + 最优默认（已完成，当前）：
     - ORT CUDA arena kSameAsRequested 降显存；启动 dump 生效配置
     - 各精度/后端横向对比（trt_fp16>trt_fp32>onnx_fp32>pt>onnx_int8）
 
+v2.5.x 健壮性加固（已完成，三轮终审修复）：
+    - 请求级端到端超时：INFER_TIMEOUT（默认 120s，asyncio.wait_for），防调度卡死请求永久挂起
+    - 通用异常兜底 handler：非 ASRException（切段/特征/解码）统一转结构化 500
+    - OOM fallback 形状修复（动态 target_seq_len + 切片赋值）+ 多标记 OOM 判定
+    - Faiss 索引 _FaissState 原子快照切换（消除 reload 与 correct 并发中间态）
+    - 关闭时线程池 shutdown；/health 未加载返回 degraded（供探针识别）
+    - .env WORKERS 拼写修复（原 WORKS 静默失效）
+
 下一阶段（未实施）：
     - 句子级时间戳 sentences[]（静音 + 标点分句器）
     - trt_int8_enc GPU 吞吐/显存实测、热词路径 A（带 hotwords）吞吐实测
     - 真实标注测试集 CER 复核（当前以 fp16 输出为参考基准）
-    - 请求级端到端超时 + 超长音频 chunk 分片限流（M3 风险点）
+    - 超长音频 chunk 分片限流（单请求 ~1800 chunk 一次性 gather，M3 风险点）
+    - 字级时间戳与 Faiss 纠错文本一致性（I3：words 反映纠错前，text 纠错后）
+    - 中英混合字级时间戳错位复核（I5：_decode_char_list 与 tokenizer.decode 口径差异）
+    - 运行时 GPU 卡死的业务级健康探针（R12/R14：/health 仅反映加载态）
 
 ######################### 交付物 ######################################
 

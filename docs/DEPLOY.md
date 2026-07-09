@@ -508,14 +508,14 @@ docker-compose logs -f seaco-asr
 - **`CPU_THREAD_POOL_SIZE` 取值建议**（256 核机器，WORKERS=10）：总线程 ≈ WORKERS × 值，
   不超订分界 ≈ 256/10 ≈ 25/worker；推荐扫描 `{8, 16, 24, 32}`，勿到 64（10×64=640 严重超订）。
 
-#### `VAD_SESSION_POOL_SIZE`（推荐 4，可调 2-8）
+#### `VAD_SESSION_POOL_SIZE`（推荐 2，可调 2-8）
 - 作用：Silero VAD ORT session 池大小，多请求 round-robin 分配
 - 影响范围：仅 Stage1 VAD
 - **单 session 线程数硬编码 intra=inter=1**（见 vad.py），并行度完全由本 pool 提供
-- 建议值：**4**（默认）
+- 建议值：**2**（默认，实测最优）
 - 调优场景：
-  - 低并发（<10）：可降到 2 省内存
-  - 高并发（>30）：可升到 8，但收益递减
+  - 高并发（>30）：可升到 4-8，但收益递减
+  - 观测 stage1_vad 均值 >800ms 时考虑增大
   - 观测 `stage1_vad_sum/count` 均值：>800ms 时考虑增大 pool
 - **注意**：与 OMP 相关：`OMP × Pool ≈ 有效线程数`，OMP=1 时 Pool 数直接对应真实并发
 
