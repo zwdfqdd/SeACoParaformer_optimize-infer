@@ -427,6 +427,9 @@ models/asr/.hotwords.lock        跨进程互斥锁文件
 | MAX_AUDIO_DURATION_MS | 7200000 | 音频最大时长（ms），超出返回 1005；默认 2 小时，0=不限 |
 | ACQUIRE_TIMEOUT | 5 | 过载并发等待超时（秒），超时返回 1007；0=无限等待 |
 | INFER_TIMEOUT | 120 | 单 chunk 推理 future 超时（秒），防调度卡死请求永久挂起，超时返回 1004 |
+| MAX_INFLIGHT_CHUNKS_PER_REQUEST | 64 | 单请求 GPU 在途 chunk 上限（超长音频分片限流）；0=不限 |
+| HEALTH_MAX_CONSECUTIVE_FAILURES | 20 | 连续推理失败达此值 /health 转 degraded（GPU 卡死摘除）；一次成功清零 |
+| HEALTH_ACTIVE_PROBE | false | /health 主动跑一次极小 dummy 推理验证 GPU 链路存活 |
 | LOG_LEVEL | INFO | 日志级别 |
 | OMP/MKL/OPENBLAS_NUM_THREADS | 1 | ★必须保持 1，防 libgomp 高并发崩溃 |
 

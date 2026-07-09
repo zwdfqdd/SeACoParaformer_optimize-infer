@@ -25,6 +25,12 @@ services:
       - ACQUIRE_TIMEOUT=${ACQUIRE_TIMEOUT:-5}
       # 单 chunk 推理 future 超时（秒），防调度卡死导致请求永久挂起
       - INFER_TIMEOUT=${INFER_TIMEOUT:-120}
+      # 单请求 GPU 在途 chunk 上限（M3 超长音频分片限流）；默认 64；0=不限
+      - MAX_INFLIGHT_CHUNKS_PER_REQUEST=${MAX_INFLIGHT_CHUNKS_PER_REQUEST:-64}
+      # 运行时健康探针（R12/R14）：连续推理失败达此值 /health 转 degraded（GPU 卡死摘除）
+      - HEALTH_MAX_CONSECUTIVE_FAILURES=${HEALTH_MAX_CONSECUTIVE_FAILURES:-20}
+      # /health 主动探针：跑一次极小 dummy 推理验证 GPU 链路（默认 false）
+      - HEALTH_ACTIVE_PROBE=${HEALTH_ACTIVE_PROBE:-false}
       # 精度方案：
       #   线上推荐 trt_int8_enc = encoder int8(QDQ) + cif/decoder/bias fp16
       #   可选 trt_fp16 / trt_fp32 / trt_int8 / onnx_fp32 / onnx_int8 / auto

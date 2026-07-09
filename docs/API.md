@@ -100,6 +100,11 @@
   - 启用后加载第 5 段 timestamp engine，吞吐下降约 30%（含 blstm 计算）
   - 关闭时 `words: []` 空数组，主链路吞吐不受影响
 - ORT 整体模型（onnx_fp32/onnx_int8）不支持字级时间戳，`words: []`
+- **与 Faiss 纠错一致**（I3）：路径 B 命中替换时，替换同步映射到 `words`（替换段时间
+  区间按纠错词字数等分重切），保证 `words` 拼接 == 段 `text`。若字级与段文本口径无法
+  可靠对齐（中英混合含空格等边界），保守保留原 `words`（段 `text` 仍已纠错）。
+- **中英混合口径统一**（I5）：`words[].text` 已清理 BPE 连接标记（`@@`）与 sentencepiece
+  前缀（`▁`），英文按 subword 各自带时间戳，拼接字面与段 `text` 一致；中文逐字一一对应。
 
 ### 失败响应
 
@@ -187,21 +192,47 @@
 
 ## GET /health — 健康检查
 
-### 响应（HTTP 200）
+反映**加载态 + 运行时健康**（不仅是模型加载成功与否）。健康返回 **HTTP 200**，
+不健康（未加载 / 运行时卡死）返回 **HTTP 503**，供 K8s readiness/liveness 探针
+（按状态码判定）真正摘除实例。
+
+### 响应（健康：HTTP 200）
 
 ```json
 {
   "status": "ok",
   "device": "cuda",
-  "models_loaded": true
+  "models_loaded": true,
+  "runtime": {
+    "backend": "trt",
+    "consecutive_failures": 0,
+    "total_infer_ok": 12345,
+    "total_infer_fail": 0,
+    "degraded_reason": null,
+    "runtime_ok": true
+  }
 }
 ```
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| status | string | 服务状态 |
+| status | string | `ok` / `degraded` |
 | device | string | 当前推理设备（cuda/cpu） |
 | models_loaded | bool | 模型是否已加载 |
+| runtime.backend | string | 实际生效后端（trt/ort/ort_split/pt） |
+| runtime.consecutive_failures | int | 当前连续推理失败次数（含超时），一次成功清零 |
+| runtime.total_infer_ok/fail | int | 累计推理成功/失败次数 |
+| runtime.degraded_reason | string\|null | 加载阶段静默降级原因（后端回退，如 TRT→ORT）；无降级为 null |
+| runtime.runtime_ok | bool | 运行时是否健康（连续失败 < `HEALTH_MAX_CONSECUTIVE_FAILURES`） |
+
+**status 判定规则：**
+
+- 模型未加载 → `degraded`（探针识别加载失败/半死状态）
+- 运行时连续推理失败超 `HEALTH_MAX_CONSECUTIVE_FAILURES`（默认 20，GPU 卡死典型症状）→ `degraded`，供 K8s/LB 摘除卡死实例
+- 加载阶段发生静默降级（后端回退）→ 仍 `ok`（服务可用），但 `runtime.degraded_reason` 暴露原因供运维察觉低性能/降功能模式
+- 否则 `ok`
+
+> 开启 `HEALTH_ACTIVE_PROBE=true` 后，每次 `/health` 额外真跑一次极小 dummy 推理（带 `INFER_TIMEOUT` 超时），直接验证 GPU 链路存活（覆盖无流量期间的卡死）。默认 false（被动统计已足够，主动探针给每次健康检查加推理开销）。
 
 ---
 
