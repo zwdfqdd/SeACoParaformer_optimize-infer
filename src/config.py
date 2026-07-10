@@ -150,7 +150,7 @@ class Settings:
     TIMESTAMP_UPSAMPLE_TIMES: int = int(os.getenv("TIMESTAMP_UPSAMPLE_TIMES", "3"))
 
     # ============================================================
-    # 句子级时间戳（sentences[]）：标点分句器 + 字级时间戳映射
+    # 句子级时间戳（asr[] 粒度变为子句）：标点分句器 + 字级时间戳映射
     # ============================================================
     # 句子级时间戳总开关。默认 false。
     #   true：对全文跑 CT-Transformer 标点模型逐 token 恢复标点，任何标点（，。？、）都切成
@@ -167,8 +167,8 @@ class Settings:
     PUNC_MODEL_DIR: str = os.getenv("PUNC_MODEL_DIR", os.path.join("models", "punc"))
     # CT-Transformer 标点模型 ONNX 文件名（默认量化版，体积/速度均衡；如需非量化用 model.onnx）
     PUNC_ONNX_NAME: str = os.getenv("PUNC_ONNX_NAME", "model_quant.onnx")
-    # 单窗推理最大字符数（CT-Transformer 逐 token 分类，长文本按此滑窗，避免超长张量）。
-    # CT 无 n-gram 的困惑度阈值失效问题，200 足够（实测 186 字重复口语一次推理即正确断句）。
+    # 单窗推理最大字符数（CT-Transformer 逐 token 分类，长文本按此长度无重叠分块推理，
+    # 避免超长张量）。CT 无 n-gram 困惑度阈值失效问题，200 足够（实测 186 字重复口语一次即正确断句）。
     PUNC_MAX_LEN: int = int(os.getenv("PUNC_MAX_LEN", "200"))
     # CT 标点 onnxruntime session 单次推理算子并行线程数。★默认 1（关键）：
     # CT 单条推理仅几 ms，单线程足够；ORT CPU EP 默认 intra_op=物理核数，多 worker ×

@@ -27,7 +27,8 @@ from pathlib import Path
 MODEL_ID = "iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727-onnx"
 MS_RESOLVE = "https://modelscope.cn/models/{repo}/resolve/master/{path}"
 
-# 核心文件（onnx 按参数选量化/非量化）；config.yaml 提供 punc_list 等元信息
+# 核心文件（onnx 按参数选量化/非量化）。运行时仅需 onnx + tokens.json；
+# config.yaml 仅作模型溯源/参考（punc_list 已固化于 sentence_segmenter._PUNC_LIST，运行时不解析）。
 CORE_FILES = ("tokens.json", "config.yaml")
 
 
@@ -110,14 +111,16 @@ def download_punc(output_dir: Path, onnx_name: str):
     print(f"模型: {MODEL_ID}")
     print("=" * 60)
 
-    if not dst_onnx.exists():
+    # 逐文件用 _ok（大小校验）判断：残缺文件（中断的部分下载）会重新下载，
+    # 而非因"存在"被跳过（否则残缺文件永不替换，且与顶层跳过/加载侧校验形成死循环）。
+    if not _ok(dst_onnx):
         _download(onnx_name, dst_onnx)
     else:
-        print(f"  已存在，跳过: {onnx_name}")
+        print(f"  已存在（完整），跳过: {onnx_name}")
     for name in CORE_FILES:
         dst = output_dir / name
-        if dst.exists():
-            print(f"  已存在，跳过: {name}")
+        if _ok(dst):
+            print(f"  已存在（完整），跳过: {name}")
             continue
         _download(name, dst)
 

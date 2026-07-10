@@ -1039,17 +1039,20 @@ def _build_sentence_segments(seg_list: list[ASRSegment]) -> list[ASRSegment] | N
     """将段级结果重组为子句级 asr[]（句子级时间戳）。
 
     CT-Transformer 标点模型逐 token 分类，对长文本无失效问题（内部按 PUNC_MAX_LEN
-    滑窗），故直接汇总全局字级 words → 全文一次分句，无需按 VAD 段分窗。
+    无重叠分块推理），故直接汇总全局字级 words → 全文一次分句，无需按 VAD 段分窗。
 
     流程：
         1. 汇总所有段的字级 words 为全局有序序列（words 拼接 = 全文无标点文本）；
         2. split_sentences 恢复标点并按标点切子句，返回每子句 [c_start, c_end) 字符区间；
-        3. 字符区间映射到全局 words 下标 → 子句 timestamp=[首字 start, 末字 end]，
-           子句 words = 该区间字级 words（text 用带标点子句）。
+        3. 每个 word 按其「起始字符」唯一归属一个子句 → 子句 timestamp=[首字 start, 末字 end]，
+           子句 words = 归属本子句的字级 words（text 用带标点子句）。
 
-    对齐口径：字级 words 逐字（或英文 subword），split_sentences 内部同样逐字（去空白）
-    对齐，全文无空白时字符偏移与 word 下标一一对应。
-    返回 None 表示无法构造（无字级 words），上层保持段级输出。
+    对齐口径：字级 words 逐字（中文）或英文 subword，split_sentences 内部按去空白逐字对齐。
+    正常情况 word.text 无空白（_decode_char_list 已清理 ▁/@@），字符偏移与拼接口径一致；
+    若出现空白则口径不一致，保守降级回段级（见下方 whitespace 保护）。
+    word 按「起始字符」唯一归属子句（而非区间重叠），避免横跨子句边界的多字符英文 subword
+    被相邻两子句重复收入（造成 word 重复、timestamp 重叠）。
+    返回 None 表示无法构造（无字级 words / 含空白口径不一致），上层保持段级输出。
     """
     all_words: list[ASRWord] = []
     for seg in seg_list:
@@ -1059,6 +1062,13 @@ def _build_sentence_segments(seg_list: list[ASRSegment]) -> list[ASRSegment] | N
 
     full_text = "".join(w.text for w in all_words)
     if not full_text:
+        return None
+
+    # Bug B 保护：split_sentences 内部按「去空白逐字」对齐，其返回的字符区间以无空白字符
+    # 序列为基准。此处 full_text 由字级 words 拼接，正常无空白（_decode_char_list 已清理
+    # ▁/@@）。若出现空白（异常 word.text），字符偏移口径不一致会导致映射错位，保守降级回段级。
+    if any(ch.isspace() for ch in full_text):
+        logger.warning("字级 words 含空白字符，句子级映射口径不一致，降级回段级输出")
         return None
 
     # 每个 word 覆盖的全局字符结束偏移（word.text 可能是多字符英文 subword）
@@ -1073,21 +1083,25 @@ def _build_sentence_segments(seg_list: list[ASRSegment]) -> list[ASRSegment] | N
     if not sentences:
         return None
 
+    # 每个 word 唯一归属其「起始字符」所在的子句（Bug A 修复）：
+    # 用起始字符 wstart 归属，而非「区间重叠」判定——否则横跨子句边界的多字符英文
+    # subword 会被相邻两子句同时收入，造成 word 重复、子句 timestamp 重叠。
+    # 子句字符区间 [c_start,c_end) 连续无缝覆盖 [0,total_chars)，故每个 wstart 唯一落在一个子句。
+    word_start = [word_char_end[i] - len(all_words[i].text) for i in range(len(all_words))]
+
     out: list[ASRSegment] = []
     idx = 0
     for sent_text, (c_start, c_end) in sentences:
         c_start = max(0, min(c_start, total_chars))
         c_end = max(c_start, min(c_end, total_chars))
-        w_lo = w_hi = None
-        for wi, wend in enumerate(word_char_end):
-            wstart = wend - len(all_words[wi].text)
-            if wend > c_start and wstart < c_end:
-                if w_lo is None:
-                    w_lo = wi
-                w_hi = wi
-        if w_lo is None or w_hi is None:
+        # 收集起始字符落在本子句区间内的 word（唯一归属，无重复无重叠）
+        sent_words = [
+            all_words[wi] for wi in range(len(all_words))
+            if c_start <= word_start[wi] < c_end
+        ]
+        if not sent_words:
+            # 子句区间过短（夹在一个 subword 内部），无 word 起点落入 → 并入相邻，跳过
             continue
-        sent_words = all_words[w_lo:w_hi + 1]
         out.append(ASRSegment(
             idx=idx,
             slid="",

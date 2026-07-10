@@ -232,7 +232,7 @@ def ensure_trt_engine(module: str, precision: str) -> bool:
 
 
 def ensure_pt() -> bool:
-    """确保本地 PT 权重目录存在（不在运行时下载，需提前打包进镜像）。"""
+    """确保本地 PT 权重目录就绪。推荐提前打包进镜像；缺失时自动调 download_asr.py 下载。"""
     ckpt_found = False
     if os.path.isdir(PT_MODEL_DIR):
         for name in ("model.pt", "model.pth", "pytorch_model.bin"):
@@ -331,13 +331,19 @@ PUNC_DIR = os.path.join(MODEL_DIR, "punc")
 
 
 def _has_punc_model() -> bool:
-    """判断 models/punc 下 CT-Transformer 标点模型是否齐全（onnx + tokens.json + config.yaml）。"""
+    """判断 models/punc 下 CT-Transformer 标点模型是否齐全且完整。
+
+    与 download_punc._ok / sentence_segmenter._files_ready 同口径：按大小下限校验
+    onnx(≥200MB) + tokens.json(≥1MB)，避免残缺下载（如中断的 33MB onnx）被误判就绪。
+    config.yaml 仅作溯源、运行时不解析，只查存在性。
+    """
     if not os.path.isdir(PUNC_DIR):
         return False
     onnx = os.path.join(PUNC_DIR, Settings.PUNC_ONNX_NAME)
     tokens = os.path.join(PUNC_DIR, "tokens.json")
-    config = os.path.join(PUNC_DIR, "config.yaml")
-    return os.path.exists(onnx) and os.path.exists(tokens) and os.path.exists(config)
+    onnx_ok = os.path.exists(onnx) and os.path.getsize(onnx) >= 200 * 1024 * 1024
+    tok_ok = os.path.exists(tokens) and os.path.getsize(tokens) >= 1 * 1024 * 1024
+    return onnx_ok and tok_ok
 
 
 def ensure_punc() -> bool:

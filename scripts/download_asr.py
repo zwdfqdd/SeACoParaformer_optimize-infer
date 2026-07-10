@@ -10,7 +10,9 @@ prepare_model.py 转换 ONNX/TRT engine 的上游。
     iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
 
 核心文件（扁平放置到 models/asr/pt/）:
-    model.pt / config.yaml / am.mvn / tokens.json / seg_dict / configuration.json
+    model.pt / config.yaml / am.mvn / tokens.json / seg_dict
+可选文件（下载失败不阻断）:
+    configuration.json（ModelScope 元数据）
 
 用法:
     python scripts/download_asr.py                       # 默认下载到 models/asr/pt
@@ -33,13 +35,22 @@ CORE_FILES = ("model.pt", "config.yaml", "am.mvn", "tokens.json", "seg_dict")
 OPTIONAL_FILES = ("configuration.json",)
 
 
+# PT 权重最小合理大小（字节）：SeACo model.pt ~840MB，低于此判定为残缺下载
+_MIN_PT_BYTES = 300 * 1024 * 1024
+
+
 def _has_weights(output_dir: Path) -> bool:
-    """判断目录内是否已有 PT 权重（model.pt 或任意 .pt/.pth）。"""
-    if (output_dir / "model.pt").exists():
+    """判断目录内是否已有完整 PT 权重（model.pt 或任意 .pt/.pth，按大小下限校验）。
+
+    残缺（部分下载）的权重不算就绪，会触发重新下载，避免残缺文件被误判可用。
+    """
+    mp = output_dir / "model.pt"
+    if mp.exists() and mp.stat().st_size >= _MIN_PT_BYTES:
         return True
     for ext in ("*.pt", "*.pth"):
-        if list(output_dir.rglob(ext)):
-            return True
+        for p in output_dir.rglob(ext):
+            if p.stat().st_size >= _MIN_PT_BYTES:
+                return True
     return False
 
 

@@ -526,7 +526,7 @@ docker-compose logs -f seaco-asr
 - **性能**：实测 20000+ 字/秒（纯 CPU onnxruntime，单线程）；相对字级时间戳几乎零开销
   （120 并发实测吞吐 -0.7%，GPU/CPU 几乎不变，详见性能报告第九章）；结果合并走 CPU 线程池
   不阻塞事件循环
-- 长文本按 `PUNC_MAX_LEN` 滑窗推理（模型内建逐 token 分类，无需按 VAD 段分窗）
+- 长文本按 `PUNC_MAX_LEN` 无重叠分块推理（模型内建逐 token 分类，无需按 VAD 段分窗）
 
 #### `CPU_THREAD_POOL_SIZE` / `ORT_INTRA_OP_THREADS` / `ORT_INTER_OP_THREADS`（CPU 侧线程）
 三个参数职责与**生效后端**不同，务必区分：

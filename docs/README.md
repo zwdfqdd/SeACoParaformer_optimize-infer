@@ -422,7 +422,7 @@ models/asr/.hotwords.lock        跨进程互斥锁文件
 | ENABLE_SENTENCE_TIMESTAMP | false | 句子级时间戳（asr[] 粒度变为子句，任何标点都切）；★强依赖 ENABLE_WORD_TIMESTAMP=true，否则自动降级回段级 |
 | PUNC_MODEL_DIR | models/punc | CT-Transformer 标点模型目录（缺失自动下载） |
 | PUNC_ONNX_NAME | model_quant.onnx | 标点 ONNX 文件名（量化版；非量化用 model.onnx） |
-| PUNC_MAX_LEN | 200 | 单窗推理最大字符数（长文本按此滑窗） |
+| PUNC_MAX_LEN | 200 | 单窗推理最大字符数（长文本按此长度无重叠分块推理） |
 | PUNC_INTRA_OP_THREADS | 1 | CT 标点 session 算子并行线程；★保持 1，调大会致高并发 CPU 超订、吞吐暴跌 |
 | ENABLE_HOTWORD | true | 路径 A（SeACo 在线热词）总开关 |
 | ENABLE_FAISS_CORRECTION | true | 路径 B（默认词表 Faiss 纠错）总开关 |
