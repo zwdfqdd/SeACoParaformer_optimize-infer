@@ -331,30 +331,27 @@ PUNC_DIR = os.path.join(MODEL_DIR, "punc")
 
 
 def _has_punc_model() -> bool:
-    """判断 models/punc 下扁平结构标点模型是否齐全（prune*.bin + vocab.json + merges.txt）。"""
+    """判断 models/punc 下 CT-Transformer 标点模型是否齐全（onnx + tokens.json + config.yaml）。"""
     if not os.path.isdir(PUNC_DIR):
         return False
-    order = Settings.PUNC_NGRAM_ORDER
-    prune = os.path.join(PUNC_DIR, f"prune{''.join(map(str, range(order)))}.bin")
-    vocab = os.path.join(PUNC_DIR, "vocab.json")
-    merges = os.path.join(PUNC_DIR, "merges.txt")
-    return os.path.exists(prune) and os.path.exists(vocab) and os.path.exists(merges)
+    onnx = os.path.join(PUNC_DIR, Settings.PUNC_ONNX_NAME)
+    tokens = os.path.join(PUNC_DIR, "tokens.json")
+    config = os.path.join(PUNC_DIR, "config.yaml")
+    return os.path.exists(onnx) and os.path.exists(tokens) and os.path.exists(config)
 
 
 def ensure_punc() -> bool:
-    """确保 ngram 标点模型存在（仅 ENABLE_SENTENCE_TIMESTAMP 启用时需要）。缺失则下载。
+    """确保 CT-Transformer 标点模型存在（仅 ENABLE_SENTENCE_TIMESTAMP 启用时需要）。缺失则下载。
 
     句子级时间戳强依赖字级时间戳；此处仅负责标点模型产物就绪，开关校验在服务侧。
     缺失仅告警不阻断（句子级会降级回段级）。
     """
     if _has_punc_model():
-        print("[OK] ngram 标点模型已存在")
+        print("[OK] CT-Transformer 标点模型已存在")
         return True
-    order = Settings.PUNC_NGRAM_ORDER
-    print(f"[构建] ngram 标点模型缺失，尝试下载到 {PUNC_DIR}（order={order}）...")
+    print(f"[构建] 标点模型缺失，尝试下载到 {PUNC_DIR} ...")
     ok = _run([sys.executable, "scripts/download_punc.py",
-               "--output-dir", PUNC_DIR, "--order", str(order),
-               "--tokenizer-id", Settings.PUNC_TOKENIZER_ID])
+               "--output-dir", PUNC_DIR, "--onnx", Settings.PUNC_ONNX_NAME])
     if not ok:
         print(f"[警告] 标点模型下载失败，句子级时间戳将降级回段级: {PUNC_DIR}")
     return ok

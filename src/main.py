@@ -8,8 +8,9 @@ SeACo-Paraformer FastAPI 服务入口
 时间戳三级粒度（按开关递进）：
     - 段级（默认）：asr[] 每项为 VAD 切段，timestamp 源自 VAD 时间轴
     - 字级（ENABLE_WORD_TIMESTAMP）：asr[].words 每字时间戳（CIF timestamp head）
-    - 句子级（ENABLE_SENTENCE_TIMESTAMP，强依赖字级）：asr[] 每项为一句话，
-      ngram 标点模型断句 + 字级时间戳定位句子边界（见 src/sentence_segmenter.py）
+    - 子句级（ENABLE_SENTENCE_TIMESTAMP，强依赖字级）：asr[] 每项为一子句，
+      CT-Transformer 标点模型（纯 onnxruntime）逐 token 恢复标点，任何标点（，。？、）
+      都切成独立子句 + 字级时间戳定位子句边界（见 src/sentence_segmenter.py）
 
 接口：
 - POST /chinese_asr      — 中文语音识别（base64 音频 + 可选 hotwords/article_url）
@@ -509,7 +510,7 @@ async def asr_recognize(req: ASRRequest):
         - 单 chunk future 超时 INFER_TIMEOUT（防 GPU 卡死永久挂起）
         - 字级时间戳 ENABLE_WORD_TIMESTAMP（第 5 段 timestamp engine 输出 us_alphas/us_cif_peak）
     结果合并 (CPU 线程池): _build_response —— 贪心解码 → 字级时间戳 → Faiss 纠错（I3 回写 words）
-        → 句子级分句（ENABLE_SENTENCE_TIMESTAMP，KenLM 标点断句，asr[] 粒度变为句）
+        → 子句级分句（ENABLE_SENTENCE_TIMESTAMP，CT-Transformer 标点分类，asr[] 粒度变为子句）
         （CPU 密集，放线程池避免阻塞事件循环）
 
     多请求间各 Stage 独立并行，CPU/GPU 同时满载。
@@ -654,10 +655,9 @@ async def asr_recognize(req: ASRRequest):
             chunk_results.append(result)
 
         # ====== 结果合并（CPU 线程池） ======
-        # _build_response 含解码 + Faiss 纠错 + 句子级标点分句（KenLM 打分，CPU 密集，
-        # 单条中等文本 16-40ms）。放线程池执行，避免在事件循环线程阻塞几十毫秒、
-        # 拖累本 worker 其他请求的 async 调度（GPU 结果回收 / 新请求接入）。
-        # KenLM/Faiss 均为 C++ 后端会释放 GIL，可与其他 CPU 任务真正并行。
+        # _build_response 含解码 + Faiss 纠错 + 子句级标点分句（CT-Transformer onnx 推理，
+        # CPU 密集）。放线程池执行，避免在事件循环线程阻塞、拖累本 worker 其他请求的
+        # async 调度（GPU 结果回收 / 新请求接入）。onnxruntime/Faiss 均释放 GIL，可并行。
         response = await loop.run_in_executor(
             _cpu_executor,
             lambda: _build_response(
@@ -1036,17 +1036,21 @@ def _build_response(
 
 
 def _build_sentence_segments(seg_list: list[ASRSegment]) -> list[ASRSegment] | None:
-    """将段级结果重组为句子级 asr[]（句子级时间戳）。
+    """将段级结果重组为子句级 asr[]（句子级时间戳）。
 
-    输入：段级 ASRSegment 列表（每段含字级 words，时间已全局单调）。
+    CT-Transformer 标点模型逐 token 分类，对长文本无失效问题（内部按 PUNC_MAX_LEN
+    滑窗），故直接汇总全局字级 words → 全文一次分句，无需按 VAD 段分窗。
+
     流程：
         1. 汇总所有段的字级 words 为全局有序序列（words 拼接 = 全文无标点文本）；
-        2. 对全文跑标点模型断句，得到每句 [char_start, char_end) 原文字符区间；
-        3. 句子字符区间映射到全局 words 下标 → 句子 timestamp = [首字 start, 末字 end]，
-           句子 words = 该区间字级 words（text 用带标点句子）。
-    返回 None 表示无法构造（无字级 words / 字符数不匹配），上层保持段级输出。
+        2. split_sentences 恢复标点并按标点切子句，返回每子句 [c_start, c_end) 字符区间；
+        3. 字符区间映射到全局 words 下标 → 子句 timestamp=[首字 start, 末字 end]，
+           子句 words = 该区间字级 words（text 用带标点子句）。
+
+    对齐口径：字级 words 逐字（或英文 subword），split_sentences 内部同样逐字（去空白）
+    对齐，全文无空白时字符偏移与 word 下标一一对应。
+    返回 None 表示无法构造（无字级 words），上层保持段级输出。
     """
-    # 汇总全局字级 words
     all_words: list[ASRWord] = []
     for seg in seg_list:
         all_words.extend(seg.words)
@@ -1057,13 +1061,12 @@ def _build_sentence_segments(seg_list: list[ASRSegment]) -> list[ASRSegment] | N
     if not full_text:
         return None
 
-    # words 与全文字符的对齐：逐 word 记录其覆盖的全局字符区间
-    # （word.text 可能是多字符英文 subword，故按字符长度累加）
+    # 每个 word 覆盖的全局字符结束偏移（word.text 可能是多字符英文 subword）
     word_char_end: list[int] = []
     pos = 0
     for w in all_words:
         pos += len(w.text)
-        word_char_end.append(pos)  # 该 word 结束字符偏移（不含）
+        word_char_end.append(pos)
     total_chars = pos
 
     sentences = sentence_segmenter.split_sentences(full_text)
@@ -1073,12 +1076,9 @@ def _build_sentence_segments(seg_list: list[ASRSegment]) -> list[ASRSegment] | N
     out: list[ASRSegment] = []
     idx = 0
     for sent_text, (c_start, c_end) in sentences:
-        # 字符区间 [c_start, c_end) → 覆盖的 word 下标区间
         c_start = max(0, min(c_start, total_chars))
         c_end = max(c_start, min(c_end, total_chars))
-        # 找首个结束偏移 > c_start 的 word 作为起始 word
-        w_lo = None
-        w_hi = None
+        w_lo = w_hi = None
         for wi, wend in enumerate(word_char_end):
             wstart = wend - len(all_words[wi].text)
             if wend > c_start and wstart < c_end:
@@ -1088,14 +1088,13 @@ def _build_sentence_segments(seg_list: list[ASRSegment]) -> list[ASRSegment] | N
         if w_lo is None or w_hi is None:
             continue
         sent_words = all_words[w_lo:w_hi + 1]
-        start_s = sent_words[0].timestamp[0]
-        end_s = sent_words[-1].timestamp[1]
         out.append(ASRSegment(
             idx=idx,
             slid="",
             text=sent_text,
             speaker="",
-            timestamp=[round(start_s, 3), round(end_s, 3)],
+            timestamp=[round(sent_words[0].timestamp[0], 3),
+                       round(sent_words[-1].timestamp[1], 3)],
             words=sent_words,
         ))
         idx += 1
