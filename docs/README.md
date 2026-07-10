@@ -561,8 +561,9 @@ SeACoParaformer/
 │   ├── test_split_onnx_pipeline.py   # ORT 分段串联推理
 │   ├── test_trt_pipeline.py          # TRT 分段推理（各部分独立精度）
 │   ├── test_model.py                 # 整体 ONNX 推理
-│   ├── test_service.py               # 服务压测
+│   ├── test_service.py               # 服务压测（含 GPU 利用率监测）
 │   ├── test_single.py                # 单次请求测试
+│   ├── test_punctuator.py            # CT-Transformer 句子级分句器测试（标点效果 + 测速）
 │   ├── test_asr_api.py               # HTTP ASR API 测试
 │   ├── test_hotword_api.py           # 热词热更新接口测试
 │   ├── test_error_api.py             # 错误码路径测试
