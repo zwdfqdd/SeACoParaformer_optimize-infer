@@ -149,6 +149,38 @@ class Settings:
     # 必须与导出 timestamp engine 时的 upsample_times 一致，否则时间戳整体缩放错误。
     TIMESTAMP_UPSAMPLE_TIMES: int = int(os.getenv("TIMESTAMP_UPSAMPLE_TIMES", "3"))
 
+    # ============================================================
+    # 句子级时间戳（sentences[]）：标点分句器 + 字级时间戳映射
+    # ============================================================
+    # 句子级时间戳总开关。默认 false。
+    #   true：对全文跑 ngram 标点模型断句，按句子边界结合字级时间戳构造句子级时间戳，
+    #         asr[] 每项变为「一句话」（idx/text=带标点句子/timestamp=句子时间/words=该句字级），
+    #         istar_asr 为各句带标点拼接。
+    #   false：维持当前段级输出（asr[] 每项为 VAD 切段单位），完全不变。
+    # ★强依赖 ENABLE_WORD_TIMESTAMP=true：句子时间边界由字级时间戳定位，无字级时间戳
+    #   则无法构造句子级时间戳。若本开关 true 但字级时间戳关闭，自动降级回段级 + 告警。
+    ENABLE_SENTENCE_TIMESTAMP: bool = os.getenv("ENABLE_SENTENCE_TIMESTAMP", "false").lower() in (
+        "1", "true", "yes"
+    )
+    # 标点模型本地目录（ModelScope 缓存根，模型文件缓存于此，离线优先）。
+    # 缺失时启动阶段告警并自动调用 scripts/download_punc.py 下载到此目录。
+    PUNC_MODEL_DIR: str = os.getenv("PUNC_MODEL_DIR", os.path.join("models", "punc"))
+    # ngram 阶数（3/4/5/6）。实测 order=3 模型最小、查询最快，标点精度足够，默认 3。
+    PUNC_NGRAM_ORDER: int = int(os.getenv("PUNC_NGRAM_ORDER", "3"))
+    # 标点模型 BPE 分词器 ModelScope id（与上游默认一致）
+    PUNC_TOKENIZER_ID: str = os.getenv("PUNC_TOKENIZER_ID", "Qwen/Qwen2.5-7B-Instruct")
+    # 困惑度下降阈值：越大剪枝越狠、越快但越易漏标点。实测 0.12 兼顾速度与断句完整度。
+    PUNC_PPL_DROP_RATIO: float = float(os.getenv("PUNC_PPL_DROP_RATIO", "0.12"))
+    # 候选标点集合（逗号分隔）。实测收窄到中文常用 3 种较全集 11 种快 3-4x，
+    # 且中英混合场景断句位置不受影响、标点风格统一为中文（多为优点）。
+    PUNC_CANDIDATES: list[str] = [
+        p for p in os.getenv("PUNC_CANDIDATES", "，,。,？").split(",") if p
+    ]
+    # 分句标点（在这些标点处切分句子；逗号/顿号为句内停顿，不切句）。
+    SENTENCE_SPLIT_PUNCTS: list[str] = [
+        p for p in os.getenv("SENTENCE_SPLIT_PUNCTS", "。,？,！,…").split(",") if p
+    ]
+
     # GPU 多 stream 多 execution_context 池大小（单卡榨干利用率）。
     # 每个 TRT engine 共享 weights，创建 N 个 execution_context + N 个 CUDA stream，
     # 推理时用 queue.Queue 连接池借还 (context, stream)，不同 stream 上的 batch
@@ -686,6 +718,18 @@ class Settings:
             if backend == "trt":
                 ts["timestamp_precision"] = cls.get_trt_precision_map()["timestamp"]
             cfg["字级时间戳"] = ts
+
+        # ── 句子级时间戳（仅启用时）──
+        # 强依赖字级时间戳：本开关 true 但字级时间戳关闭时会自动降级（sentence_active=False）。
+        if cls.ENABLE_SENTENCE_TIMESTAMP:
+            cfg["句子级时间戳"] = {
+                "sentence_active": cls.ENABLE_WORD_TIMESTAMP,  # 实际是否生效（依赖字级时间戳）
+                "PUNC_MODEL_DIR": cls.PUNC_MODEL_DIR,
+                "PUNC_NGRAM_ORDER": cls.PUNC_NGRAM_ORDER,
+                "PUNC_PPL_DROP_RATIO": cls.PUNC_PPL_DROP_RATIO,
+                "PUNC_CANDIDATES": cls.PUNC_CANDIDATES,
+                "SENTENCE_SPLIT_PUNCTS": cls.SENTENCE_SPLIT_PUNCTS,
+            }
 
         # ── 热词模块（路径 A，仅启用时）──
         if cls.ENABLE_HOTWORD:

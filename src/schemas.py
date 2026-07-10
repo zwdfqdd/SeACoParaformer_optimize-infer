@@ -31,8 +31,13 @@ class ASRWord(BaseModel):
 
 
 class ASRSegment(BaseModel):
-    """单段识别结果（与外部标准 asr 数组格式对齐）。"""
-    idx: int = Field(..., description="段序号（从 0 起）")
+    """单段识别结果（与外部标准 asr 数组格式对齐）。
+
+    默认粒度为 VAD 切段；开启句子级时间戳（ENABLE_SENTENCE_TIMESTAMP=true，且
+    ENABLE_WORD_TIMESTAMP=true）后，每项粒度变为「一句话」：text 为带标点句子，
+    timestamp 为句子起止（由句内字级时间戳定位），words 为该句字级时间戳。
+    """
+    idx: int = Field(..., description="段/句序号（从 0 起）")
     slid: str = Field(
         default="",
         description="语种识别结果（当前未实现，固定空字符串）",

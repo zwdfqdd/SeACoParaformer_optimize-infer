@@ -1,8 +1,15 @@
 """
 SeACo-Paraformer FastAPI 服务入口
 
-三级流水线（Stage1 解码/VAD/切段 → Stage2 特征提取 → Stage3 GPU 推理）+
-热词双路路由（A: SeACo 在线 / B: Faiss 后处理）+ 词表运行时热更新。
+三级流水线（Stage1 解码/VAD/切段 → Stage2 特征提取 → Stage3 GPU 推理）+ 结果后处理
+（贪心解码 → 字级时间戳 → Faiss 纠错 → 句子级标点分句）+ 热词双路路由
+（A: SeACo 在线 / B: Faiss 后处理）+ 词表运行时热更新。
+
+时间戳三级粒度（按开关递进）：
+    - 段级（默认）：asr[] 每项为 VAD 切段，timestamp 源自 VAD 时间轴
+    - 字级（ENABLE_WORD_TIMESTAMP）：asr[].words 每字时间戳（CIF timestamp head）
+    - 句子级（ENABLE_SENTENCE_TIMESTAMP，强依赖字级）：asr[] 每项为一句话，
+      ngram 标点模型断句 + 字级时间戳定位句子边界（见 src/sentence_segmenter.py）
 
 接口：
 - POST /chinese_asr      — 中文语音识别（base64 音频 + 可选 hotwords/article_url）
@@ -55,6 +62,7 @@ from src.schemas import (
     HotwordReloadResponse,
     HotwordStatusResponse,
 )
+from src.sentence_segmenter import sentence_segmenter
 from src.timestamp import compute_word_timestamps
 from src.tokenizer import tokenizer
 from src.vad import vad_engine
@@ -137,6 +145,18 @@ async def lifespan(app: FastAPI):
     vad_engine.load()
     asr_engine.load()
     await gpu_scheduler.start()
+
+    # 句子级时间戳（asr[] 粒度变为句）：强依赖字级时间戳定位句子时间边界。
+    # 开启句子级但未开字级时间戳 → 无法构造句子时间，自动降级回段级 + 告警。
+    if settings.ENABLE_SENTENCE_TIMESTAMP:
+        if not settings.ENABLE_WORD_TIMESTAMP:
+            logger.warning(
+                "ENABLE_SENTENCE_TIMESTAMP=true 但 ENABLE_WORD_TIMESTAMP=false："
+                "句子级时间戳依赖字级时间戳定位句子边界，已自动降级回段级输出。"
+                "如需句子级请同时开启 ENABLE_WORD_TIMESTAMP=true。"
+            )
+        else:
+            sentence_segmenter.load()
 
     # 默认词表加载 + 预编码缓存（路径 A）/ 热更新轮询
     # bias 编码统一收口到 GPU 单线程池（避免 CUDA stream 冲突）
@@ -475,11 +495,22 @@ async def hotwords_rollback():
 @app.post("/chinese_asr", response_model=ASRResponse)
 async def asr_recognize(req: ASRRequest):
     """
-    语音识别接口 — 三级流水线架构。
+    语音识别接口 — 三级流水线 + 结果后处理。
 
-    Stage 1 (CPU): 音频解码 + VAD 切段 + 长音频切分
-    Stage 2 (CPU): 特征提取（线程池并行）
-    Stage 3 (GPU): ASR 推理（Scheduler batch 调度）
+    准入：并发信号量（MAX_CONCURRENT_REQUESTS / ACQUIRE_TIMEOUT，超时 SERVICE_BUSY）。
+
+    Stage 1 (CPU 线程池): 音频解码 + VAD 切段（VAD_SESSION_POOL_SIZE）+ 均匀切段
+    Stage 2 (CPU 线程池 CPU_THREAD_POOL_SIZE): 热词路由 + 特征提取（多 chunk 并行）
+        热词路由（防误触发）：
+          - 客户端传 hotwords 且 ENABLE_HOTWORD → 路径 A：SeACo 在线编码 bias（Top-N 截断）
+          - 客户端不传 且 ENABLE_FAISS_CORRECTION → 路径 B：默认词表 Faiss 后处理纠错
+    Stage 3 (GPU 池 GPU_STREAM_POOL_SIZE): ASR 推理（dynamic batching：BATCH/BATCH_TIMEOUT）
+        - 超长音频分片限流 MAX_INFLIGHT_CHUNKS_PER_REQUEST（在途 chunk 上限）
+        - 单 chunk future 超时 INFER_TIMEOUT（防 GPU 卡死永久挂起）
+        - 字级时间戳 ENABLE_WORD_TIMESTAMP（第 5 段 timestamp engine 输出 us_alphas/us_cif_peak）
+    结果合并 (CPU 线程池): _build_response —— 贪心解码 → 字级时间戳 → Faiss 纠错（I3 回写 words）
+        → 句子级分句（ENABLE_SENTENCE_TIMESTAMP，KenLM 标点断句，asr[] 粒度变为句）
+        （CPU 密集，放线程池避免阻塞事件循环）
 
     多请求间各 Stage 独立并行，CPU/GPU 同时满载。
     """
@@ -622,11 +653,18 @@ async def asr_recognize(req: ASRRequest):
                 )
             chunk_results.append(result)
 
-        # ====== 结果合并 ======
-        response = _build_response(
-            chunks, chunk_results, hotwords=req.hotwords,
-            use_faiss_correction=use_faiss_correction,
-            article_url=req.article_url,
+        # ====== 结果合并（CPU 线程池） ======
+        # _build_response 含解码 + Faiss 纠错 + 句子级标点分句（KenLM 打分，CPU 密集，
+        # 单条中等文本 16-40ms）。放线程池执行，避免在事件循环线程阻塞几十毫秒、
+        # 拖累本 worker 其他请求的 async 调度（GPU 结果回收 / 新请求接入）。
+        # KenLM/Faiss 均为 C++ 后端会释放 GIL，可与其他 CPU 任务真正并行。
+        response = await loop.run_in_executor(
+            _cpu_executor,
+            lambda: _build_response(
+                chunks, chunk_results, hotwords=req.hotwords,
+                use_faiss_correction=use_faiss_correction,
+                article_url=req.article_url,
+            ),
         )
 
         # 记录日志
@@ -967,6 +1005,25 @@ def _build_response(
         ))
         full_text_parts.append(text)
 
+    # ── 句子级时间戳（asr[] 粒度变为句）──
+    # 启用且分句器就绪且字级时间戳可用时，把段级结果重组为句子级：
+    #   对全文跑标点模型断句，按句子字符区间映射字级 words 时间 → 句子 [start,end]。
+    # 任一前置不满足则保持段级输出（降级）。
+    if (
+        settings.ENABLE_SENTENCE_TIMESTAMP
+        and settings.ENABLE_WORD_TIMESTAMP
+        and sentence_segmenter.is_ready
+    ):
+        sent_segments = _build_sentence_segments(asr_segments)
+        if sent_segments is not None:
+            istar_asr = "".join(s.text for s in sent_segments)
+            return ASRResponse(
+                code=0,
+                article_url=article_url,
+                istar_asr=istar_asr,
+                asr=sent_segments,
+            )
+
     # istar_asr 段间用逗号分隔，便于阅读（各段为 VAD/切段单位，非完整句，用逗号最稳）
     istar_asr = "，".join(p for p in full_text_parts if p)
 
@@ -976,3 +1033,71 @@ def _build_response(
         istar_asr=istar_asr,
         asr=asr_segments,
     )
+
+
+def _build_sentence_segments(seg_list: list[ASRSegment]) -> list[ASRSegment] | None:
+    """将段级结果重组为句子级 asr[]（句子级时间戳）。
+
+    输入：段级 ASRSegment 列表（每段含字级 words，时间已全局单调）。
+    流程：
+        1. 汇总所有段的字级 words 为全局有序序列（words 拼接 = 全文无标点文本）；
+        2. 对全文跑标点模型断句，得到每句 [char_start, char_end) 原文字符区间；
+        3. 句子字符区间映射到全局 words 下标 → 句子 timestamp = [首字 start, 末字 end]，
+           句子 words = 该区间字级 words（text 用带标点句子）。
+    返回 None 表示无法构造（无字级 words / 字符数不匹配），上层保持段级输出。
+    """
+    # 汇总全局字级 words
+    all_words: list[ASRWord] = []
+    for seg in seg_list:
+        all_words.extend(seg.words)
+    if not all_words:
+        return None
+
+    full_text = "".join(w.text for w in all_words)
+    if not full_text:
+        return None
+
+    # words 与全文字符的对齐：逐 word 记录其覆盖的全局字符区间
+    # （word.text 可能是多字符英文 subword，故按字符长度累加）
+    word_char_end: list[int] = []
+    pos = 0
+    for w in all_words:
+        pos += len(w.text)
+        word_char_end.append(pos)  # 该 word 结束字符偏移（不含）
+    total_chars = pos
+
+    sentences = sentence_segmenter.split_sentences(full_text)
+    if not sentences:
+        return None
+
+    out: list[ASRSegment] = []
+    idx = 0
+    for sent_text, (c_start, c_end) in sentences:
+        # 字符区间 [c_start, c_end) → 覆盖的 word 下标区间
+        c_start = max(0, min(c_start, total_chars))
+        c_end = max(c_start, min(c_end, total_chars))
+        # 找首个结束偏移 > c_start 的 word 作为起始 word
+        w_lo = None
+        w_hi = None
+        for wi, wend in enumerate(word_char_end):
+            wstart = wend - len(all_words[wi].text)
+            if wend > c_start and wstart < c_end:
+                if w_lo is None:
+                    w_lo = wi
+                w_hi = wi
+        if w_lo is None or w_hi is None:
+            continue
+        sent_words = all_words[w_lo:w_hi + 1]
+        start_s = sent_words[0].timestamp[0]
+        end_s = sent_words[-1].timestamp[1]
+        out.append(ASRSegment(
+            idx=idx,
+            slid="",
+            text=sent_text,
+            speaker="",
+            timestamp=[round(start_s, 3), round(end_s, 3)],
+            words=sent_words,
+        ))
+        idx += 1
+
+    return out if out else None
