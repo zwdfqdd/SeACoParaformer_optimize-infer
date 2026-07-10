@@ -53,13 +53,39 @@ def _make_progress():
     return _hook
 
 
-def _download(path: str, dst: Path):
-    """HTTP 下载单文件到 dst（带进度）。"""
+# 各文件最小合理大小（字节），低于此判定为残缺下载（防中断残缺文件静默通过）
+_MIN_SIZE = {
+    "model_quant.onnx": 200 * 1024 * 1024,  # 量化版 ~280MB
+    "model.onnx": 200 * 1024 * 1024,         # 非量化同量级
+    "tokens.json": 1 * 1024 * 1024,          # 272727 词表 ~4MB
+    "config.yaml": 100,                       # 几百字节
+}
+
+
+def _download(path: str, dst: Path, retries: int = 2):
+    """HTTP 下载单文件到 dst（带进度 + 完整性校验，残缺自动重试）。"""
     url = MS_RESOLVE.format(repo=MODEL_ID, path=path)
-    print(f"  下载: {path}")
-    urllib.request.urlretrieve(url, str(dst), reporthook=_make_progress())
-    sys.stdout.write("\n")
-    print(f"       → {dst} ({dst.stat().st_size / (1024*1024):.1f} MB)")
+    min_size = _MIN_SIZE.get(dst.name, 0)
+    for attempt in range(1, retries + 2):
+        print(f"  下载: {path}" + (f"（第 {attempt} 次）" if attempt > 1 else ""))
+        try:
+            urllib.request.urlretrieve(url, str(dst), reporthook=_make_progress())
+            sys.stdout.write("\n")
+        except Exception as e:
+            sys.stdout.write("\n")
+            print(f"       下载出错: {e}")
+            if dst.exists():
+                dst.unlink()
+            continue
+        size = dst.stat().st_size
+        if size < min_size:
+            print(f"       [残缺] {dst.name} 仅 {size/(1024*1024):.1f} MB "
+                  f"(< {min_size/(1024*1024):.0f} MB)，删除重试")
+            dst.unlink()
+            continue
+        print(f"       → {dst} ({size / (1024*1024):.1f} MB)")
+        return
+    raise RuntimeError(f"下载 {path} 失败（残缺/网络问题），已重试 {retries} 次")
 
 
 def download_punc(output_dir: Path, onnx_name: str):
@@ -71,8 +97,12 @@ def download_punc(output_dir: Path, onnx_name: str):
     dst_tokens = output_dir / "tokens.json"
     dst_config = output_dir / "config.yaml"
 
-    if dst_onnx.exists() and dst_tokens.exists() and dst_config.exists():
-        print(f"标点模型已存在（扁平结构），跳过下载: {output_dir}")
+    def _ok(p: Path) -> bool:
+        return p.exists() and p.stat().st_size >= _MIN_SIZE.get(p.name, 0)
+
+    # 完整（大小达标）才跳过；残缺文件（如中断的 33MB onnx）会重新下载
+    if _ok(dst_onnx) and _ok(dst_tokens) and _ok(dst_config):
+        print(f"标点模型已存在（扁平结构，完整性校验通过），跳过下载: {output_dir}")
         return output_dir
 
     print("=" * 60)

@@ -34,12 +34,25 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
-class GPUMonitor:
-    """压测期间后台采样 GPU 利用率 + 显存（基于 nvidia-smi，零依赖）。
+def _read_cpu_times():
+    """读取 /proc/stat 首行 CPU 累计时间，返回 (busy, total)。非 Linux 返回 None。"""
+    try:
+        with open("/proc/stat", "r") as f:
+            line = f.readline()
+        # 形如: cpu  user nice system idle iowait irq softirq steal guest guest_nice
+        parts = [int(x) for x in line.split()[1:]]
+        idle = parts[3] + (parts[4] if len(parts) > 4 else 0)  # idle + iowait
+        total = sum(parts)
+        return total - idle, total
+    except Exception:
+        return None
 
-    每 interval 秒采样一次 utilization.gpu(%) 与 memory.used(MiB)，
-    停止后给出均值/峰值。nvidia-smi 不可用（无 GPU/CPU 部署）时自动禁用，不报错。
-    多卡时默认监测 --gpu-index 指定的卡（默认 0）。
+
+class ResourceMonitor:
+    """压测期间后台采样 GPU 利用率/显存（nvidia-smi）+ 整机 CPU 利用率（/proc/stat），零依赖。
+
+    每 interval 秒采样一次；停止后给出均值/峰值。
+    nvidia-smi 不可用（CPU 部署）→ 跳过 GPU；/proc/stat 不可用（非 Linux）→ 跳过 CPU。
     """
 
     def __init__(self, gpu_index: int = 0, interval: float = 0.5):
@@ -47,12 +60,15 @@ class GPUMonitor:
         self._interval = interval
         self._util_samples: list[float] = []
         self._mem_samples: list[float] = []
+        self._cpu_samples: list[float] = []
         self._running = False
         self._thread: threading.Thread | None = None
-        self._available = self._probe()
+        self._gpu_available = self._probe_gpu()
+        self._cpu_prev = _read_cpu_times()
+        self._cpu_available = self._cpu_prev is not None
 
     @staticmethod
-    def _probe() -> bool:
+    def _probe_gpu() -> bool:
         try:
             subprocess.run(
                 ["nvidia-smi", "--version"],
@@ -62,7 +78,7 @@ class GPUMonitor:
         except Exception:
             return False
 
-    def _sample_once(self):
+    def _sample_gpu(self):
         try:
             out = subprocess.run(
                 ["nvidia-smi",
@@ -73,7 +89,6 @@ class GPUMonitor:
             ).stdout.strip()
             if not out:
                 return
-            # 取第一行（单卡）：形如 "45, 12345"
             first = out.splitlines()[0]
             util_s, mem_s = [x.strip() for x in first.split(",")[:2]]
             self._util_samples.append(float(util_s))
@@ -81,27 +96,51 @@ class GPUMonitor:
         except Exception:
             pass
 
+    def _sample_cpu(self):
+        cur = _read_cpu_times()
+        if cur is None or self._cpu_prev is None:
+            return
+        busy0, total0 = self._cpu_prev
+        busy1, total1 = cur
+        dt = total1 - total0
+        if dt > 0:
+            self._cpu_samples.append((busy1 - busy0) / dt * 100.0)
+        self._cpu_prev = cur
+
     def _loop(self):
         while self._running:
-            self._sample_once()
+            if self._gpu_available:
+                self._sample_gpu()
+            if self._cpu_available:
+                self._sample_cpu()
             time.sleep(self._interval)
 
     def start(self):
-        if not self._available:
-            print("[GPU监测] nvidia-smi 不可用，跳过 GPU 利用率采样")
-            return
+        if not self._gpu_available:
+            print("[资源监测] nvidia-smi 不可用，跳过 GPU 采样")
+        if not self._cpu_available:
+            print("[资源监测] /proc/stat 不可用（非 Linux），跳过 CPU 采样")
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self) -> dict:
-        if not self._available:
-            return {}
         self._running = False
         if self._thread:
             self._thread.join(timeout=2)
+        result: dict = {}
+        if self._cpu_samples:
+            result["cpu"] = {
+                "samples": len(self._cpu_samples),
+                "util_avg": sum(self._cpu_samples) / len(self._cpu_samples),
+                "util_max": max(self._cpu_samples),
+            }
         if not self._util_samples:
-            return {}
+            return result
+        result["gpu"] = self._gpu_summary()
+        return result
+
+    def _gpu_summary(self) -> dict:
         return {
             "gpu_index": self._gpu_index,
             "samples": len(self._util_samples),
@@ -165,20 +204,20 @@ def send_request(url: str, payload: dict) -> dict:
 
 def run_benchmark(url: str, payload: dict, concurrency: int, total: int,
                   audio_duration: float, gpu_index: int = 0):
-    """并发压测（线程池模拟多客户端），期间后台采样 GPU 利用率。"""
+    """并发压测（线程池模拟多客户端），期间后台采样 GPU + CPU 利用率。"""
     print(f"开始压测: 并发={concurrency}, 总请求={total}")
     print(f"目标: {url}/chinese_asr")
     print()
 
-    gpu = GPUMonitor(gpu_index=gpu_index)
-    gpu.start()
+    mon = ResourceMonitor(gpu_index=gpu_index)
+    mon.start()
     wall_start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         results = list(pool.map(lambda _: send_request(url, payload), range(total)))
     wall_time = time.perf_counter() - wall_start
-    gpu_stats = gpu.stop()
+    res_stats = mon.stop()
 
-    return results, wall_time, gpu_stats
+    return results, wall_time, res_stats
 
 
 def compute_metrics(results: list, wall_time: float, audio_duration: float, concurrency: int):
@@ -288,6 +327,13 @@ def print_report(metrics: dict):
         print(f"  显存占用 平均: {gpu['mem_used_avg_mib']:.0f} MiB  "
               f"峰值: {gpu['mem_used_max_mib']:.0f} MiB")
 
+    # CPU 利用率（整机，压测期间后台采样 /proc/stat）
+    cpu = metrics.get("cpu")
+    if cpu:
+        print()
+        print(f"CPU 利用率（整机，采样 {cpu['samples']} 次）:")
+        print(f"  利用率 平均: {cpu['util_avg']:.1f}%  峰值: {cpu['util_max']:.1f}%")
+
 
 def main():
     parser = argparse.ArgumentParser(description="推理服务性能测试")
@@ -353,15 +399,18 @@ def main():
         sys.exit(f"服务不可用: {e}")
     print()
 
-    # 运行压测（含 GPU 利用率采样）
-    results, wall_time, gpu_stats = run_benchmark(
+    # 运行压测（含 GPU + CPU 利用率采样）
+    results, wall_time, res_stats = run_benchmark(
         args.url, payload, args.concurrency, args.total, audio_duration, args.gpu_index
     )
 
     # 计算指标
     metrics = compute_metrics(results, wall_time, audio_duration, args.concurrency)
-    if metrics and gpu_stats:
-        metrics["gpu"] = gpu_stats
+    if metrics and res_stats:
+        if res_stats.get("gpu"):
+            metrics["gpu"] = res_stats["gpu"]
+        if res_stats.get("cpu"):
+            metrics["cpu"] = res_stats["cpu"]
 
     # 打印报告
     print_report(metrics)

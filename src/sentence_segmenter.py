@@ -90,7 +90,13 @@ class SentenceSegmenter:
 
                 so = ort.SessionOptions()
                 so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                # 纯 CPU 标点推理，线程数跟随 ORT 默认（受 OMP 环境约束）
+                # ★线程数硬约束（默认 intra=inter=1）：CT 单条推理仅几 ms，单线程足够；
+                #   ORT CPU EP 默认 intra_op=物理核数，在多 worker × 高并发下每个分句推理
+                #   都想开满核 → 线程超额订阅 → CPU 打满、GPU 被饿死（实测 120 并发下
+                #   句子级吞吐暴跌 56%、CPU 90%、GPU 掉到 52%）。与 VAD 同策略（intra=inter=1），
+                #   并发靠 worker 进程 + 请求并发提供，不靠 session 内多线程。
+                so.intra_op_num_threads = settings.PUNC_INTRA_OP_THREADS
+                so.inter_op_num_threads = 1
                 self._sess = ort.InferenceSession(
                     onnx_path, so, providers=["CPUExecutionProvider"]
                 )
@@ -104,11 +110,17 @@ class SentenceSegmenter:
                 logger.warning(f"句子分句器加载失败（句子级时间戳禁用）: {e}")
                 self._load_failed = True
 
-    @staticmethod
-    def _files_ready(punc_dir: str) -> bool:
-        """判断扁平模型文件是否齐全（onnx + tokens.json）。"""
-        onnx_ok = os.path.exists(os.path.join(punc_dir, settings.PUNC_ONNX_NAME))
-        tok_ok = os.path.exists(os.path.join(punc_dir, "tokens.json"))
+    # 完整性下限（字节）：低于此判定为残缺下载，触发重新下载（防 33MB 残缺 onnx 被误判就绪）
+    _MIN_ONNX_BYTES = 200 * 1024 * 1024   # 量化版 ~280MB
+    _MIN_TOKENS_BYTES = 1 * 1024 * 1024   # 272727 词表 ~4MB
+
+    @classmethod
+    def _files_ready(cls, punc_dir: str) -> bool:
+        """判断扁平模型文件是否齐全且完整（onnx + tokens.json，按大小下限校验）。"""
+        onnx_p = os.path.join(punc_dir, settings.PUNC_ONNX_NAME)
+        tok_p = os.path.join(punc_dir, "tokens.json")
+        onnx_ok = os.path.exists(onnx_p) and os.path.getsize(onnx_p) >= cls._MIN_ONNX_BYTES
+        tok_ok = os.path.exists(tok_p) and os.path.getsize(tok_p) >= cls._MIN_TOKENS_BYTES
         return onnx_ok and tok_ok
 
     def _auto_download(self, punc_dir: str):

@@ -170,6 +170,11 @@ class Settings:
     # 单窗推理最大字符数（CT-Transformer 逐 token 分类，长文本按此滑窗，避免超长张量）。
     # CT 无 n-gram 的困惑度阈值失效问题，200 足够（实测 186 字重复口语一次推理即正确断句）。
     PUNC_MAX_LEN: int = int(os.getenv("PUNC_MAX_LEN", "200"))
+    # CT 标点 onnxruntime session 单次推理算子并行线程数。★默认 1（关键）：
+    # CT 单条推理仅几 ms，单线程足够；ORT CPU EP 默认 intra_op=物理核数，多 worker ×
+    # 高并发下每个分句推理都开满核 → 线程超额订阅 → CPU 打满、GPU 被饿死（实测 120 并发
+    # 句子级吞吐暴跌 56%）。并发靠 worker 进程 + 请求并发提供，不靠 session 内多线程。
+    PUNC_INTRA_OP_THREADS: int = int(os.getenv("PUNC_INTRA_OP_THREADS", "1"))
     # 断句粒度：CT-Transformer 逐 token 输出标点（，。？、），任何标点都切成独立子句，
     # asr[] 每项为一子句（子句内不残留标点）。无需额外配置候选/阈值（模型内建）。
 
@@ -720,6 +725,7 @@ class Settings:
                 "PUNC_MODEL_DIR": cls.PUNC_MODEL_DIR,
                 "PUNC_ONNX_NAME": cls.PUNC_ONNX_NAME,
                 "PUNC_MAX_LEN": cls.PUNC_MAX_LEN,
+                "PUNC_INTRA_OP_THREADS": cls.PUNC_INTRA_OP_THREADS,
             }
 
         # ── 热词模块（路径 A，仅启用时）──
