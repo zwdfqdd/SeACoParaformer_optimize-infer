@@ -106,17 +106,17 @@
 - **中英混合口径统一**（I5）：`words[].text` 已清理 BPE 连接标记（`@@`）与 sentencepiece
   前缀（`▁`），英文按 subword 各自带时间戳，拼接字面与段 `text` 一致；中文逐字一一对应。
 
-**句子级时间戳说明（asr[] 粒度变为句）**：
+**句子级时间戳说明（asr[] 粒度变为子句）**：
 - 开启 `ENABLE_SENTENCE_TIMESTAMP=true`（默认 false）后，`asr[]` 每项粒度由 VAD 切段
-  变为**一句话**：
-  - `asr[].text`：带标点的完整句子
-  - `asr[].timestamp`：句子起止秒（由句内字级时间戳定位首字 start / 末字 end）
-  - `asr[].words`：该句字级时间戳
-  - `istar_asr`：各句带标点顺序拼接
-- **强依赖 `ENABLE_WORD_TIMESTAMP=true`**：句子时间边界由字级时间戳定位；若未开字级
+  变为**一子句**（CT-Transformer 逐 token 恢复标点，任何标点 `，。？、` 都切成独立子句）：
+  - `asr[].text`：带标点的子句
+  - `asr[].timestamp`：子句起止秒（由句内字级时间戳定位首字 start / 末字 end）
+  - `asr[].words`：该子句字级时间戳
+  - `istar_asr`：各子句带标点顺序拼接
+- **强依赖 `ENABLE_WORD_TIMESTAMP=true`**：子句时间边界由字级时间戳定位；若未开字级
   时间戳，句子级自动降级回段级输出（启动日志告警）。
-- 标点由 ngram 标点模型（KenLM，纯 CPU）恢复，模型缓存于 `PUNC_MODEL_DIR`（缺失自动
-  下载）。依赖缺失或加载失败时自动降级回段级输出，不影响主链路。
+- 标点由 CT-Transformer 标点模型（纯 onnxruntime，逐 token 分类）恢复，模型缓存于
+  `PUNC_MODEL_DIR`（缺失自动下载）。加载失败时自动降级回段级输出，不影响主链路。
 
 ### 失败响应
 

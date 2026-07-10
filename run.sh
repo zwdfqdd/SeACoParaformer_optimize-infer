@@ -57,13 +57,10 @@ GPU_STREAM_POOL_SIZE=${GPU_STREAM_POOL_SIZE:-4}    # TRT 多 stream 多 context 
 ENABLE_WORD_TIMESTAMP=${ENABLE_WORD_TIMESTAMP:-false}  # 字级时间戳（asr[].words）；true 启用，吞吐降~30%；可选: true false
 
 # ─── 句子级时间戳（asr[] 粒度变为句；★强依赖 ENABLE_WORD_TIMESTAMP=true）───
-ENABLE_SENTENCE_TIMESTAMP=${ENABLE_SENTENCE_TIMESTAMP:-false}  # true 启用，asr[]每项为一句话；未开字级时间戳时自动降级回段级
-PUNC_MODEL_DIR=${PUNC_MODEL_DIR:-models/punc}          # ngram 标点模型缓存目录（缺失自动下载）
-PUNC_NGRAM_ORDER=${PUNC_NGRAM_ORDER:-3}               # ngram 阶数 3/4/5/6；实测 3 最快且精度足够
-PUNC_TOKENIZER_ID=${PUNC_TOKENIZER_ID:-Qwen/Qwen2.5-7B-Instruct}  # BPE 分词器 ModelScope id
-PUNC_PPL_DROP_RATIO=${PUNC_PPL_DROP_RATIO:-0.12}      # 困惑度下降阈值；越大越快越保守；实测 0.12 均衡
-PUNC_CANDIDATES=${PUNC_CANDIDATES:-，,。,？}          # 候选标点（逗号分隔）；中文子集比全集快 3-4x
-SENTENCE_SPLIT_PUNCTS=${SENTENCE_SPLIT_PUNCTS:-。,？,！,…}  # 在这些标点处切句（逗号/顿号为句内停顿不切句）
+ENABLE_SENTENCE_TIMESTAMP=${ENABLE_SENTENCE_TIMESTAMP:-false}  # true 启用，asr[]每项为一子句（任何标点都切）；未开字级时间戳时自动降级回段级
+PUNC_MODEL_DIR=${PUNC_MODEL_DIR:-models/punc}          # CT-Transformer 标点模型目录（缺失自动下载）
+PUNC_ONNX_NAME=${PUNC_ONNX_NAME:-model_quant.onnx}    # 标点 ONNX 文件名（量化版；非量化用 model.onnx）
+PUNC_MAX_LEN=${PUNC_MAX_LEN:-200}                     # 单窗推理最大字符数（长文本按此滑窗）
 
 # ─── 热词模块开关（按需裁剪推理路径，纯通用识别可全关省开销）───
 ENABLE_HOTWORD=${ENABLE_HOTWORD:-true}                 # 路径A SeACo 在线热词（客户端传 hotwords 时）；可选: true false
@@ -121,8 +118,7 @@ export MAX_INFLIGHT_CHUNKS_PER_REQUEST HEALTH_MAX_CONSECUTIVE_FAILURES HEALTH_AC
 export LOG_LEVEL VERBOSE
 export ORT_INTRA_OP_THREADS ORT_INTER_OP_THREADS CPU_THREAD_POOL_SIZE VAD_SESSION_POOL_SIZE GPU_STREAM_POOL_SIZE
 export ENABLE_WORD_TIMESTAMP ENABLE_HOTWORD ENABLE_FAISS_CORRECTION
-export ENABLE_SENTENCE_TIMESTAMP PUNC_MODEL_DIR PUNC_NGRAM_ORDER PUNC_TOKENIZER_ID
-export PUNC_PPL_DROP_RATIO PUNC_CANDIDATES SENTENCE_SPLIT_PUNCTS
+export ENABLE_SENTENCE_TIMESTAMP PUNC_MODEL_DIR PUNC_ONNX_NAME PUNC_MAX_LEN
 export OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS
 export BUCKET_SEQ_LENS VALID_BATCH_SIZES TRT_OPT_SEQ TRT_OPT_BATCH
 export MAX_HOTWORD_NUM OPT_HOTWORD_NUM NFILTER MAX_HOTWORD_LEN

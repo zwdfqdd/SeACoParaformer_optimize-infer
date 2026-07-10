@@ -158,11 +158,13 @@ ENABLE_WORD_TIMESTAMP=true ENABLE_SENTENCE_TIMESTAMP=true MODEL_PRECISION=trt_fp
 
 | 说明 | 内容 |
 |------|------|
-| 前提 | 必须 `ENABLE_WORD_TIMESTAMP=true`（句子边界靠字级时间戳定位）；否则启动告警并降级回段级 |
-| 模型 | ngram 标点模型（KenLM，纯 CPU），扁平存于 `models/punc`（prune*.bin ~253MB + vocab.json + merges.txt），缺失自动下载 |
-| 参数 | `PUNC_NGRAM_ORDER=3` / `PUNC_CANDIDATES=，。？` / `PUNC_PPL_DROP_RATIO=0.12`（实测最优，可覆盖） |
-| 输出 | asr[] 每项为一句话（text 带标点 / timestamp 句子起止 / words 该句字级）；istar_asr 为各句拼接 |
+| 前提 | 必须 `ENABLE_WORD_TIMESTAMP=true`（子句边界靠字级时间戳定位）；否则启动告警并降级回段级 |
+| 模型 | CT-Transformer 标点模型（纯 onnxruntime），扁平存于 `models/punc`（model_quant.onnx ~280MB + tokens.json + config.yaml），缺失自动下载 |
+| 参数 | `PUNC_ONNX_NAME=model_quant.onnx`（非量化用 model.onnx）/ `PUNC_MAX_LEN=200`（单窗字符数，可覆盖） |
+| 分句 | 逐 token 分类，任何标点（，。？、）都切成独立子句 |
+| 输出 | asr[] 每项为一子句（text 带标点 / timestamp 子句起止 / words 该句字级）；istar_asr 为各子句拼接 |
 | 内存 | 每 worker 独立加载一份标点模型，多进程随 WORKERS 线性增长 |
+| 性能 | 实测 20000+ 字/秒；对长文本/重复口语稳定（无 n-gram 阈值失效问题） |
 
 ### 手动分步生成（调试/单独验证用）
 
@@ -348,7 +350,7 @@ docker-compose logs -f seaco-asr
 > K8s 部署时 `start_period` 需设为 900s。
 > 注意：未挂载 engine 缓存 volume，容器**重建**会重新构建 engine（重启不会）。
 > 如需避免重建开销，可在镜像构建期预生成 engine 一并打包。
-> 句子级时间戳标点模型（`models/punc`，prune*.bin ~253MB）建议一并打包进镜像，
+> 句子级时间戳标点模型（`models/punc`，model_quant.onnx ~280MB）建议一并打包进镜像，
 > 避免容器重建时重新下载。
 
 ### 词表热更新的持久化
@@ -511,16 +513,16 @@ docker-compose logs -f seaco-asr
   （首次启动多几分钟），engine 命名 `{gpu}_timestamp_fp16.engine`
 
 #### `ENABLE_SENTENCE_TIMESTAMP`（默认 false）
-- 作用：asr[] 粒度由 VAD 切段变为**一句话**（text 带标点 / timestamp 句子起止 / words 该句字级）
-- 实现：ngram 标点模型（KenLM n-gram + Qwen2.5 BPE，纯 CPU，`src/sentence_segmenter.py`）
-  对全文恢复标点并按句末标点断句，再用字级时间戳定位每句 [start, end]
+- 作用：asr[] 粒度由 VAD 切段变为**一子句**（text 带标点 / timestamp 子句起止 / words 该句字级）
+- 实现：CT-Transformer 标点模型（纯 onnxruntime 手写推理，`src/sentence_segmenter.py`）
+  逐 token 恢复标点，任何标点（，。？、）都切成独立子句，再用字级时间戳定位每子句 [start, end]
 - **强依赖 `ENABLE_WORD_TIMESTAMP=true`**：未开字级时间戳时启动告警并自动降级回段级输出
-- 模型：扁平存于 `PUNC_MODEL_DIR`（默认 `models/punc`：prune*.bin ~253MB + vocab.json + merges.txt），
+- 模型：扁平存于 `PUNC_MODEL_DIR`（默认 `models/punc`：model_quant.onnx ~280MB + tokens.json + config.yaml），
   缺失自动 `scripts/download_punc.py`（HTTP 直链）下载；每 worker 独立加载一份（内存随 WORKERS 线性增长）
-- 参数：`PUNC_NGRAM_ORDER=3` / `PUNC_CANDIDATES=，。？` / `PUNC_PPL_DROP_RATIO=0.12`（实测最优，见
-  `scripts/benchmark_punctuator.py`；中文候选子集较全集快 3-4x）
-- **性能影响**：分句为 CPU 密集（KenLM 打分，单条中等文本 16-40ms），在结果合并环节走 CPU
-  线程池执行，不阻塞事件循环；对 GPU 吞吐影响小，主要占用 CPU
+- 参数：`PUNC_ONNX_NAME`（默认量化版 model_quant.onnx，非量化用 model.onnx）/ `PUNC_MAX_LEN`（单窗最大字符数，默认 200）
+- **性能**：实测 20000+ 字/秒（纯 CPU onnxruntime），对长文本/重复口语稳定（无 n-gram 困惑度
+  阈值失效问题）；在结果合并环节走 CPU 线程池执行，不阻塞事件循环，对 GPU 吞吐影响小
+- 长文本按 `PUNC_MAX_LEN` 滑窗推理（模型内建逐 token 分类，无需按 VAD 段分窗）
 
 #### `CPU_THREAD_POOL_SIZE` / `ORT_INTRA_OP_THREADS` / `ORT_INTER_OP_THREADS`（CPU 侧线程）
 三个参数职责与**生效后端**不同，务必区分：

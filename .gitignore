@@ -21,12 +21,9 @@ models/asr/**/seg_dict
 models/vad/**/*.onnx
 models/vad/**/*.pt
 models/vad/**/*.jit
-# 句子级标点模型缓存（ModelScope 下载，体积大不入库；保留 .gitkeep）
+# 句子级 CT-Transformer 标点模型（HTTP 下载，体积大不入库；保留 .gitkeep）
 models/punc/*
 !models/punc/.gitkeep
-
-# 上游参考项目源码（手动下载，不纳入本仓库版本控制）
-ngram-punctuator/
 
 # 推理必需的小配置文件纳入版本控制（显式不忽略）
 !models/asr/config.yaml

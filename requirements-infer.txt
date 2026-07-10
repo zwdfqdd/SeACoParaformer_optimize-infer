@@ -44,12 +44,8 @@ faiss-cpu==1.8.0               # 拼音向量检索（IndexFlatIP）
 pypinyin==0.51.0               # 中文 → 拼音音节
 python-Levenshtein==0.25.1     # 编辑距离
 
-# ─── 句子级时间戳：ngram 标点分句器（ENABLE_SENTENCE_TIMESTAMP=true 时启用） ───
-# 纯 CPU（KenLM n-gram + Qwen2.5 BPE 分词），缺失时句子级自动禁用（懒导入），
-# 降级回段级输出，不影响主推理。模型经 scripts/download_punc.py 下载到 models/punc。
-ngram-punctuator               # 标点恢复（KenLM）；代码兼容 punctuate/predict 两种方法名
-kenlm                          # ngram-punctuator 后端（C++ n-gram 打分，无 wheel 时需编译）
-# modelscope：ngram_punctuator 模块 import 期硬依赖（其 tokenizer.py 顶层 import
-#   model_file_download）。模型下载已改用 HTTP 直链（scripts/download_punc.py，无需
-#   modelscope），但 import ngram_punctuator 仍需 modelscope 可导入，故保留。
-modelscope
+# ─── 句子级时间戳：CT-Transformer 标点模型（ENABLE_SENTENCE_TIMESTAMP=true 时启用） ───
+# 纯 onnxruntime 推理（复用上方 onnxruntime-gpu，无新增依赖）；逐 token 标点分类，
+# 长文本/重复口语稳定，实测 20000+ 字/秒。模型经 scripts/download_punc.py（HTTP 直链）
+# 下载到 models/punc（model_quant.onnx + tokens.json + config.yaml，扁平结构）。
+# 缺失时句子级自动禁用，降级回段级输出，不影响主推理。无需 funasr/kenlm/modelscope。

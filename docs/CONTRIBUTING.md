@@ -129,17 +129,21 @@ python scripts/evaluate_cer.py --audio-dir calib_data/audio_data --csv report_ce
 
 字级时间戳是模型（各后端 engine/predictor）输出；**句子级时间戳是纯文本后处理**，
 与推理后端解耦，三后端行为一致：
-- 对全文跑 ngram 标点模型（KenLM n-gram + Qwen2.5 BPE，纯 CPU，`src/sentence_segmenter.py`）
-  恢复标点并按句末标点断句，再用**已有字级时间戳**定位每句 [start, end]，asr[] 每项变为一句话。
-- **强依赖 `ENABLE_WORD_TIMESTAMP=true`**：句子边界靠字级时间戳定位；未开字级时间戳时
+- 对全文跑 CT-Transformer 标点模型（`iic/punc_ct-transformer_zh-cn-common-vad_realtime-
+  vocab272727-onnx`，纯 onnxruntime 手写推理，`src/sentence_segmenter.py`）逐 token 恢复标点，
+  任何标点（，。？、）都切成独立子句，再用**已有字级时间戳**定位每子句 [start, end]，
+  asr[] 每项变为一子句。
+- **强依赖 `ENABLE_WORD_TIMESTAMP=true`**：子句边界靠字级时间戳定位；未开字级时间戳时
   服务启动告警并自动降级回段级输出（asr[] 保持 VAD 切段形态）。
-- 模型扁平存放于 `PUNC_MODEL_DIR`（默认 `models/punc`：prune*.bin / vocab.json / merges.txt），
+- 模型扁平存放于 `PUNC_MODEL_DIR`（默认 `models/punc`：model_quant.onnx / tokens.json / config.yaml），
   缺失时 `prepare_model.py`（ensure_punc）或加载阶段自动调 `scripts/download_punc.py`（HTTP 直链）下载。
-- 生产参数固化实测最优：`PUNC_NGRAM_ORDER=3` + `PUNC_CANDIDATES=，。？` + `PUNC_PPL_DROP_RATIO=0.12`
-  （网格实测见 `scripts/benchmark_punctuator.py`：中文候选子集较全集快 3-4x，中英混合断句
-  位置不受影响、标点风格统一为中文）。
-- 内存：每 worker 独立加载一份标点模型（prune*.bin ~253MB），多进程（WORKERS）随 worker 数线性增长。
-- 分句为 CPU 密集（KenLM 打分），在结果合并环节走 CPU 线程池执行，不阻塞事件循环。
+- ONNX 契约：输入 inputs(int32 token ids)/text_lengths/vad_masks/sub_masks，输出 logits[1,L,6]，
+  punc_list=[<unk>,_,，,。,？,、]（0/1 无标点，2..5 标点）；CharTokenizer 逐字查 tokens.json（272727）。
+- 参数：`PUNC_ONNX_NAME`（默认量化版 model_quant.onnx）/ `PUNC_MAX_LEN`（单窗最大字符数，默认 200）。
+- 选型：CT-Transformer 逐 token 分类，对长文本/重复口语无 n-gram 困惑度阈值失效问题，
+  实测 20000+ 字/秒（远快于早期 ngram-punctuator），标点完整自然，纯 onnxruntime 无新增依赖。
+- 内存：每 worker 独立加载一份标点模型（model_quant.onnx ~280MB），多进程随 worker 数线性增长。
+- 推理为 CPU 密集（onnxruntime），在结果合并环节走 CPU 线程池执行，不阻塞事件循环。
 
 要点：
 - **ORT 时间戳依赖分段 ONNX**：`onnx_fp32 + ENABLE_WORD_TIMESTAMP=true` 时 prepare_model

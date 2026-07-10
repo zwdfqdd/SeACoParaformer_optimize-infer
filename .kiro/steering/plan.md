@@ -250,19 +250,23 @@ v2.6 风险点闭环（已完成，M3/I3/I5/R12/R14）：
       通过 runtime.degraded_reason 暴露；HEALTH_ACTIVE_PROBE=true 可开主动 dummy 探针。
 
 v2.7 句子级时间戳（已完成）：
-    - 标点分句器 src/sentence_segmenter.py：懒加载 ngram-punctuator（KenLM n-gram +
-      Qwen2.5 BPE，纯 CPU），依赖/模型缺失自动禁用降级回段级，不阻塞主流程。
-    - asr[] 粒度变为句（ENABLE_SENTENCE_TIMESTAMP=true）：对全文跑标点模型断句，
-      句子字符区间经鲁棒双指针映射全局字级 words → 句子 timestamp=[首字start,末字end]，
-      asr[] 每项=一句话（text 带标点/timestamp 句子时间/words 该句字级），istar_asr 句拼接。
-    - ★强依赖 ENABLE_WORD_TIMESTAMP=true（句子时间边界靠字级定位）；未开则启动告警 +
+    - 标点分句器 src/sentence_segmenter.py：CT-Transformer 标点模型（iic/punc_ct-transformer_
+      zh-cn-common-vad_realtime-vocab272727-onnx）纯 onnxruntime 手写推理，懒加载，
+      依赖/模型缺失自动禁用降级回段级，不阻塞主流程。
+      * 早期用 ngram-punctuator（KenLM），因对长文本/重复口语困惑度阈值失效（整段不断句）
+        且慢，已弃用改 CT-Transformer：逐 token 分类无阈值问题，实测 20000+ 字/秒，标点完整。
+    - asr[] 粒度变为子句（ENABLE_SENTENCE_TIMESTAMP=true）：逐 token 恢复标点，任何标点
+      （，。？、）都切成独立子句，子句字符区间映射全局字级 words → timestamp=[首字start,末字end]，
+      asr[] 每项=一子句（text 带标点/timestamp 子句时间/words 该句字级），istar_asr 子句拼接。
+    - ★强依赖 ENABLE_WORD_TIMESTAMP=true（子句时间边界靠字级定位）；未开则启动告警 +
       自动降级回段级输出，段级形态完全不变。
-    - 生产参数固化实测最优：order=3 + puncts=［，。？］+ ppl_drop_ratio=0.12
-      （scripts/benchmark_punctuator.py 网格实测：中文子集较全集快 3-4x，中英混合断句
-      位置不受影响、标点风格统一为中文；order/ppl/candidates 均可环境变量覆盖）。
-    - 模型目录 models/punc（ModelScope 缓存）；缺失时告警并自动调 scripts/download_punc.py
-      下载；ASR PT 权重缺失同样自动调 scripts/download_asr.py（prepare_model.ensure_pt）。
-    - 依赖 ngram-punctuator/kenlm/modelscope 加入 requirements-infer.txt（缺失懒禁用）。
+    - ONNX 契约：输入 inputs/text_lengths/vad_masks/sub_masks，输出 logits[1,L,6]，
+      punc_list=[<unk>,_,，,。,？,、]；CharTokenizer 逐字查 tokens.json（272727）；长文本按
+      PUNC_MAX_LEN 滑窗。参数 PUNC_ONNX_NAME（默认 model_quant.onnx）/ PUNC_MAX_LEN（默认 200）。
+    - 模型扁平存于 models/punc（model_quant.onnx + tokens.json + config.yaml）；缺失时
+      自动调 scripts/download_punc.py（HTTP 直链）下载；ASR PT 权重缺失同样自动调
+      scripts/download_asr.py（prepare_model.ensure_pt）。
+    - 纯 onnxruntime（项目已有），无新增依赖（弃用 ngram-punctuator/kenlm/modelscope）。
 
 暂不实施（明确搁置）：
     - trt_int8_enc GPU 吞吐/显存实测、热词路径 A（带 hotwords）吞吐实测

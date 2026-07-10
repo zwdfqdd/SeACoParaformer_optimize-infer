@@ -419,12 +419,10 @@ models/asr/.hotwords.lock        跨进程互斥锁文件
 | VAD_SESSION_POOL_SIZE | 2 | Silero VAD ORT session 池（round-robin，实测最优 2）；单 session 线程硬编码 1 |
 | GPU_STREAM_POOL_SIZE | 4 | TRT 多 stream 多 context 池；作用于 encoder/cif/decoder(+timestamp)；bias_encoder 固定单 context |
 | ENABLE_WORD_TIMESTAMP | false | 字级时间戳（asr[].words）；true 启用，吞吐降约 30% |
-| ENABLE_SENTENCE_TIMESTAMP | false | 句子级时间戳（asr[] 粒度变为句）；★强依赖 ENABLE_WORD_TIMESTAMP=true，否则自动降级回段级 |
-| PUNC_MODEL_DIR | models/punc | ngram 标点模型缓存目录（缺失自动下载） |
-| PUNC_NGRAM_ORDER | 3 | ngram 阶数（3/4/5/6）；实测 3 最快且精度足够 |
-| PUNC_PPL_DROP_RATIO | 0.12 | 困惑度下降阈值；越大越快越保守；实测 0.12 均衡 |
-| PUNC_CANDIDATES | ，。？ | 候选标点（逗号分隔）；中文子集比全集快 3-4x |
-| SENTENCE_SPLIT_PUNCTS | 。？！… | 分句标点（逗号/顿号为句内停顿不切句） |
+| ENABLE_SENTENCE_TIMESTAMP | false | 句子级时间戳（asr[] 粒度变为子句，任何标点都切）；★强依赖 ENABLE_WORD_TIMESTAMP=true，否则自动降级回段级 |
+| PUNC_MODEL_DIR | models/punc | CT-Transformer 标点模型目录（缺失自动下载） |
+| PUNC_ONNX_NAME | model_quant.onnx | 标点 ONNX 文件名（量化版；非量化用 model.onnx） |
+| PUNC_MAX_LEN | 200 | 单窗推理最大字符数（长文本按此滑窗） |
 | ENABLE_HOTWORD | true | 路径 A（SeACo 在线热词）总开关 |
 | ENABLE_FAISS_CORRECTION | true | 路径 B（默认词表 Faiss 纠错）总开关 |
 | ORT_INTRA_OP_THREADS | 0(全核) | 主 ASR 单 session 算子并行；**仅 CPU 后端生效**，TRT/GPU 与 VAD 均无效 |
@@ -537,7 +535,7 @@ SeACoParaformer/
 │   ├── hotword_manager.py    # 默认词表加载 + 预编码缓存 + 热更新
 │   ├── hotword_faiss.py      # 路径 B：拼音检索纠错
 │   ├── timestamp.py          # 字级时间戳后处理（对齐 FunASR ts_prediction）
-│   └── sentence_segmenter.py # 句子级：ngram 标点分句（KenLM，扁平模型加载）
+│   └── sentence_segmenter.py # 子句级：CT-Transformer 标点分句（纯 onnxruntime）
 ├── scripts/                  # 工具脚本
 │   ├── prepare_model.py              # 启动编排：按精度检查/构建产物（核心）
 │   ├── export_onnx_whole.py          # PT → 整体 ONNX（onnx_fp32）
@@ -556,8 +554,7 @@ SeACoParaformer/
 │   ├── evaluate_cer.py               # 数据集级 CER 批量评测
 │   ├── download_vad.py               # VAD 模型下载（HTTP 直链）
 │   ├── download_asr.py               # ASR PT 权重下载（HTTP 直链，扁平到 models/asr/pt）
-│   ├── download_punc.py              # 句子级标点模型下载（HTTP 直链，扁平到 models/punc）
-│   ├── benchmark_punctuator.py       # 标点模型推理速度基准（参数网格 + 中英混合对比）
+│   ├── download_punc.py              # CT-Transformer 标点模型下载（HTTP 直链，扁平到 models/punc）
 │   └── entrypoint.sh                 # 镜像启动脚本（prepare_model → 启动服务）
 ├── tests/                    # 测试脚本
 │   ├── test_pt_inference_v2.py       # PT baseline（独立包推理）
@@ -615,17 +612,19 @@ SeACoParaformer/
 
 设计原则：
 - CPU 与 GPU 同时满载（VAD/特征/解码/分句占 CPU，ASR 占 GPU）
-- 请求间互不阻塞（流水线各级独立；结果合并含 KenLM 分句等 CPU 密集计算，同样放 CPU 线程池，不阻塞事件循环）
+- 请求间互不阻塞（流水线各级独立；结果合并含 CT-Transformer 标点分句等 CPU 密集计算，同样放 CPU 线程池，不阻塞事件循环）
 - 单请求延迟 ≈ max(Stage1, Stage2, Stage3) + 结果合并
 - 吞吐量随并发线性增长直至 GPU 饱和
 
 时间戳三级粒度（按开关递进）：
 - **段级**（默认）：asr[] 每项为 VAD 切段，timestamp 源自 VAD 时间轴
 - **字级**（ENABLE_WORD_TIMESTAMP）：asr[].words 每字时间戳
-- **句子级**（ENABLE_SENTENCE_TIMESTAMP，★强依赖字级）：asr[] 每项为一句话，
-  ngram 标点模型（KenLM，纯 CPU，模型在 models/punc）断句 + 字级时间戳定位句子边界；
-  未开字级时间戳时自动降级回段级。每 worker 独立加载一份标点模型（prune*.bin ~253MB），
-  多进程（WORKERS）部署时内存随 worker 数线性增长。
+- **子句级**（ENABLE_SENTENCE_TIMESTAMP，★强依赖字级）：asr[] 每项为一子句，
+  CT-Transformer 标点模型（纯 onnxruntime，模型在 models/punc）逐 token 恢复标点，
+  任何标点（，。？、）都切成独立子句 + 字级时间戳定位子句边界；未开字级时间戳时
+  自动降级回段级。实测 20000+ 字/秒，对长文本/重复口语稳定（无 n-gram 阈值失效问题）。
+  每 worker 独立加载一份标点模型（model_quant.onnx ~280MB），多进程（WORKERS）
+  部署时内存随 worker 数线性增长。
 
 ### GPU Scheduler 调度策略（工业标准 dynamic batching）
 
