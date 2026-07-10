@@ -520,8 +520,12 @@ docker-compose logs -f seaco-asr
 - 模型：扁平存于 `PUNC_MODEL_DIR`（默认 `models/punc`：model_quant.onnx ~280MB + tokens.json + config.yaml），
   缺失自动 `scripts/download_punc.py`（HTTP 直链）下载；每 worker 独立加载一份（内存随 WORKERS 线性增长）
 - 参数：`PUNC_ONNX_NAME`（默认量化版 model_quant.onnx，非量化用 model.onnx）/ `PUNC_MAX_LEN`（单窗最大字符数，默认 200）
-- **性能**：实测 20000+ 字/秒（纯 CPU onnxruntime），对长文本/重复口语稳定（无 n-gram 困惑度
-  阈值失效问题）；在结果合并环节走 CPU 线程池执行，不阻塞事件循环，对 GPU 吞吐影响小
+- **★`PUNC_INTRA_OP_THREADS`（默认 1，务必保持）**：CT session 算子并行线程数。ORT CPU EP
+  默认取物理核数，多 worker × 高并发下每个分句推理都开满核 → 线程超额订阅 → CPU 打满、
+  GPU 被饿死（实测 120 并发句子级吞吐暴跌 56%：820 vs 修复后 1852）。与 VAD 同策略，勿调大。
+- **性能**：实测 20000+ 字/秒（纯 CPU onnxruntime，单线程）；相对字级时间戳几乎零开销
+  （120 并发实测吞吐 -0.7%，GPU/CPU 几乎不变，详见性能报告第九章）；结果合并走 CPU 线程池
+  不阻塞事件循环
 - 长文本按 `PUNC_MAX_LEN` 滑窗推理（模型内建逐 token 分类，无需按 VAD 段分窗）
 
 #### `CPU_THREAD_POOL_SIZE` / `ORT_INTRA_OP_THREADS` / `ORT_INTER_OP_THREADS`（CPU 侧线程）

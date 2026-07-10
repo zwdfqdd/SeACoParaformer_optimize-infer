@@ -49,6 +49,7 @@ services:
       - PUNC_MODEL_DIR=${PUNC_MODEL_DIR:-models/punc}        # CT-Transformer 标点模型目录（缺失自动下载）
       - PUNC_ONNX_NAME=${PUNC_ONNX_NAME:-model_quant.onnx}  # 标点 ONNX 文件名（量化版；非量化用 model.onnx）
       - PUNC_MAX_LEN=${PUNC_MAX_LEN:-200}                   # 单窗推理最大字符数（长文本按此滑窗）
+      - PUNC_INTRA_OP_THREADS=${PUNC_INTRA_OP_THREADS:-1}   # ★CT标点session线程数，务必保持1（防高并发CPU超订）
       # 热词模块开关（按需裁剪推理路径，纯通用识别可全关省开销）
       - ENABLE_HOTWORD=${ENABLE_HOTWORD:-true}                    # 路径A SeACo 在线热词
       - ENABLE_FAISS_CORRECTION=${ENABLE_FAISS_CORRECTION:-true}  # 路径B 默认词表 Faiss 纠错
