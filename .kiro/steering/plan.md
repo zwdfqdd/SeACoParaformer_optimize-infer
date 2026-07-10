@@ -249,11 +249,20 @@ v2.6 风险点闭环（已完成，M3/I3/I5/R12/R14）：
       HEALTH_MAX_CONSECUTIVE_FAILURES=20 → degraded），后端静默回退（TRT→ORT 等）
       通过 runtime.degraded_reason 暴露；HEALTH_ACTIVE_PROBE=true 可开主动 dummy 探针。
 
-下一阶段（待实施）：
-    - 句子级时间戳 sentences[]（静音 + 标点分句器）：
-      规划后续接入「文本加标点模型」，对段文本预测标点断句，再结合已有字级时间戳
-      构造句子级时间戳。分句模型启用时，输出以句子级 timestamp + 句子内容替代当前
-      段级 timestamp 与段内容（asr[] 粒度变为句）；未启用则维持当前段级输出形式不变。
+v2.7 句子级时间戳（已完成）：
+    - 标点分句器 src/sentence_segmenter.py：懒加载 ngram-punctuator（KenLM n-gram +
+      Qwen2.5 BPE，纯 CPU），依赖/模型缺失自动禁用降级回段级，不阻塞主流程。
+    - asr[] 粒度变为句（ENABLE_SENTENCE_TIMESTAMP=true）：对全文跑标点模型断句，
+      句子字符区间经鲁棒双指针映射全局字级 words → 句子 timestamp=[首字start,末字end]，
+      asr[] 每项=一句话（text 带标点/timestamp 句子时间/words 该句字级），istar_asr 句拼接。
+    - ★强依赖 ENABLE_WORD_TIMESTAMP=true（句子时间边界靠字级定位）；未开则启动告警 +
+      自动降级回段级输出，段级形态完全不变。
+    - 生产参数固化实测最优：order=3 + puncts=［，。？］+ ppl_drop_ratio=0.12
+      （scripts/benchmark_punctuator.py 网格实测：中文子集较全集快 3-4x，中英混合断句
+      位置不受影响、标点风格统一为中文；order/ppl/candidates 均可环境变量覆盖）。
+    - 模型目录 models/punc（ModelScope 缓存）；缺失时告警并自动调 scripts/download_punc.py
+      下载；ASR PT 权重缺失同样自动调 scripts/download_asr.py（prepare_model.ensure_pt）。
+    - 依赖 ngram-punctuator/kenlm/modelscope 加入 requirements-infer.txt（缺失懒禁用）。
 
 暂不实施（明确搁置）：
     - trt_int8_enc GPU 吞吐/显存实测、热词路径 A（带 hotwords）吞吐实测

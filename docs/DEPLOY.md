@@ -149,6 +149,21 @@ OPENBLAS_NUM_THREADS=1
 > `onnx_int8 + ENABLE_WORD_TIMESTAMP=true` 会静默切 fp32 分段串联（无 int8 量化分段产物），
 > 失去 int8 体积/速度优势（启动日志有告警）。需 int8 体积请关字级时间戳。
 
+### 句子级时间戳（asr[] 粒度变为句，★强依赖字级时间戳）
+
+```bash
+# 同时开字级 + 句子级；标点模型缺失自动下载到 models/punc（HTTP 直链，扁平结构）
+ENABLE_WORD_TIMESTAMP=true ENABLE_SENTENCE_TIMESTAMP=true MODEL_PRECISION=trt_fp16 WORKERS=10 bash run.sh
+```
+
+| 说明 | 内容 |
+|------|------|
+| 前提 | 必须 `ENABLE_WORD_TIMESTAMP=true`（句子边界靠字级时间戳定位）；否则启动告警并降级回段级 |
+| 模型 | ngram 标点模型（KenLM，纯 CPU），扁平存于 `models/punc`（prune*.bin ~253MB + vocab.json + merges.txt），缺失自动下载 |
+| 参数 | `PUNC_NGRAM_ORDER=3` / `PUNC_CANDIDATES=，。？` / `PUNC_PPL_DROP_RATIO=0.12`（实测最优，可覆盖） |
+| 输出 | asr[] 每项为一句话（text 带标点 / timestamp 句子起止 / words 该句字级）；istar_asr 为各句拼接 |
+| 内存 | 每 worker 独立加载一份标点模型，多进程随 WORKERS 线性增长 |
+
 ### 手动分步生成（调试/单独验证用）
 
 ```bash
@@ -322,15 +337,19 @@ docker-compose logs -f seaco-asr
 ### 首次启动流程
 
 1. `entrypoint.sh` 调用 `prepare_model.py` 按 `MODEL_PRECISION` 检查产物
-2. 缺失则从本地 PT 权重（`PT_MODEL_DIR`，默认 `models/asr/pt`）逐级转换：
-   PT → 分段 ONNX →（QDQ ONNX）→ TRT engine
-3. Engine 写入镜像内 `models/asr/trt/`（容器层，无 volume 持久化）
-4. 启动 uvicorn 服务 + 模型预热
+2. PT 权重缺失（`PT_MODEL_DIR`，默认 `models/asr/pt`）→ 自动 `scripts/download_asr.py` 下载；
+   VAD 缺失 → `scripts/download_vad.py`；`ENABLE_SENTENCE_TIMESTAMP=true` 且标点模型缺失
+   （`PUNC_MODEL_DIR`，默认 `models/punc`）→ `scripts/download_punc.py`（均 HTTP 直链，扁平下载）
+3. ASR 产物缺失则从 PT 权重逐级转换：PT → 分段 ONNX →（QDQ ONNX）→ TRT engine
+4. Engine 写入镜像内 `models/asr/trt/`（容器层，无 volume 持久化）
+5. 启动 uvicorn 服务 + 模型预热（含句子分句器加载，若启用句子级时间戳）
 
 > 首次启动总耗时约 15-20 分钟（engine 构建 + 预热）。
 > K8s 部署时 `start_period` 需设为 900s。
 > 注意：未挂载 engine 缓存 volume，容器**重建**会重新构建 engine（重启不会）。
 > 如需避免重建开销，可在镜像构建期预生成 engine 一并打包。
+> 句子级时间戳标点模型（`models/punc`，prune*.bin ~253MB）建议一并打包进镜像，
+> 避免容器重建时重新下载。
 
 ### 词表热更新的持久化
 
@@ -490,6 +509,18 @@ docker-compose logs -f seaco-asr
   - **纯转写、追求吞吐** → false（默认，words 为空）
 - 启用前提：`ENABLE_WORD_TIMESTAMP=true` 时 prepare_model 会额外构建 timestamp engine
   （首次启动多几分钟），engine 命名 `{gpu}_timestamp_fp16.engine`
+
+#### `ENABLE_SENTENCE_TIMESTAMP`（默认 false）
+- 作用：asr[] 粒度由 VAD 切段变为**一句话**（text 带标点 / timestamp 句子起止 / words 该句字级）
+- 实现：ngram 标点模型（KenLM n-gram + Qwen2.5 BPE，纯 CPU，`src/sentence_segmenter.py`）
+  对全文恢复标点并按句末标点断句，再用字级时间戳定位每句 [start, end]
+- **强依赖 `ENABLE_WORD_TIMESTAMP=true`**：未开字级时间戳时启动告警并自动降级回段级输出
+- 模型：扁平存于 `PUNC_MODEL_DIR`（默认 `models/punc`：prune*.bin ~253MB + vocab.json + merges.txt），
+  缺失自动 `scripts/download_punc.py`（HTTP 直链）下载；每 worker 独立加载一份（内存随 WORKERS 线性增长）
+- 参数：`PUNC_NGRAM_ORDER=3` / `PUNC_CANDIDATES=，。？` / `PUNC_PPL_DROP_RATIO=0.12`（实测最优，见
+  `scripts/benchmark_punctuator.py`；中文候选子集较全集快 3-4x）
+- **性能影响**：分句为 CPU 密集（KenLM 打分，单条中等文本 16-40ms），在结果合并环节走 CPU
+  线程池执行，不阻塞事件循环；对 GPU 吞吐影响小，主要占用 CPU
 
 #### `CPU_THREAD_POOL_SIZE` / `ORT_INTRA_OP_THREADS` / `ORT_INTER_OP_THREADS`（CPU 侧线程）
 三个参数职责与**生效后端**不同，务必区分：

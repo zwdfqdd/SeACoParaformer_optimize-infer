@@ -44,6 +44,13 @@ services:
       - GPU_STREAM_POOL_SIZE=${GPU_STREAM_POOL_SIZE:-4}
       # 字级时间戳（asr[].words）：true 启用第 5 段 timestamp engine，吞吐降约 30%
       - ENABLE_WORD_TIMESTAMP=${ENABLE_WORD_TIMESTAMP:-false}
+      # 句子级时间戳（asr[] 粒度变为句）：★强依赖 ENABLE_WORD_TIMESTAMP=true，否则自动降级回段级
+      - ENABLE_SENTENCE_TIMESTAMP=${ENABLE_SENTENCE_TIMESTAMP:-false}
+      - PUNC_MODEL_DIR=${PUNC_MODEL_DIR:-models/punc}        # 标点模型缓存目录（缺失自动下载）
+      - PUNC_NGRAM_ORDER=${PUNC_NGRAM_ORDER:-3}              # ngram 阶数（实测 3 最快）
+      - PUNC_PPL_DROP_RATIO=${PUNC_PPL_DROP_RATIO:-0.12}     # 困惑度下降阈值（0.12 均衡）
+      - PUNC_CANDIDATES=${PUNC_CANDIDATES:-，,。,？}         # 候选标点（中文子集快 3-4x）
+      - SENTENCE_SPLIT_PUNCTS=${SENTENCE_SPLIT_PUNCTS:-。,？,！,…}  # 分句标点
       # 热词模块开关（按需裁剪推理路径，纯通用识别可全关省开销）
       - ENABLE_HOTWORD=${ENABLE_HOTWORD:-true}                    # 路径A SeACo 在线热词
       - ENABLE_FAISS_CORRECTION=${ENABLE_FAISS_CORRECTION:-true}  # 路径B 默认词表 Faiss 纠错

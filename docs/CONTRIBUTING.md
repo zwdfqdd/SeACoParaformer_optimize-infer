@@ -21,7 +21,14 @@ seaco_paraformer/
 └── load_model.py        # 加载本地 PT 权重（PT_MODEL_DIR）
 ```
 
-PT 权重提前下载并打包进 `models/asr/pt/`（默认 `PT_MODEL_DIR`），不在运行时下载。
+PT 权重存放于 `models/asr/pt/`（默认 `PT_MODEL_DIR`，扁平结构：model.pt / config.yaml /
+am.mvn / tokens.json / seg_dict）。推荐提前打包进镜像；若缺失，`prepare_model.py`
+（ensure_pt）会自动调 `scripts/download_asr.py`（ModelScope HTTP 直链，扁平下载）拉取，
+也可手动运行：
+
+```bash
+python scripts/download_asr.py --output-dir models/asr/pt   # 已存在则跳过
+```
 
 ### 2. 启动编排（推荐方式）
 
@@ -114,8 +121,25 @@ python scripts/evaluate_cer.py --audio-dir calib_data/audio_data --csv report_ce
 
 开关（三后端通用）：
 - `ENABLE_WORD_TIMESTAMP`（默认 false）：字级时间戳（asr[].words）
+- `ENABLE_SENTENCE_TIMESTAMP`（默认 false）：句子级时间戳（asr[] 粒度变为句）
 - `ENABLE_HOTWORD`（默认 true）：客户端热词 SeACo 在线增强（路径 A）
 - `ENABLE_FAISS_CORRECTION`（默认 true）：默认词表 Faiss 后处理纠错（路径 B）
+
+### 句子级时间戳（后端无关的结果后处理）
+
+字级时间戳是模型（各后端 engine/predictor）输出；**句子级时间戳是纯文本后处理**，
+与推理后端解耦，三后端行为一致：
+- 对全文跑 ngram 标点模型（KenLM n-gram + Qwen2.5 BPE，纯 CPU，`src/sentence_segmenter.py`）
+  恢复标点并按句末标点断句，再用**已有字级时间戳**定位每句 [start, end]，asr[] 每项变为一句话。
+- **强依赖 `ENABLE_WORD_TIMESTAMP=true`**：句子边界靠字级时间戳定位；未开字级时间戳时
+  服务启动告警并自动降级回段级输出（asr[] 保持 VAD 切段形态）。
+- 模型扁平存放于 `PUNC_MODEL_DIR`（默认 `models/punc`：prune*.bin / vocab.json / merges.txt），
+  缺失时 `prepare_model.py`（ensure_punc）或加载阶段自动调 `scripts/download_punc.py`（HTTP 直链）下载。
+- 生产参数固化实测最优：`PUNC_NGRAM_ORDER=3` + `PUNC_CANDIDATES=，。？` + `PUNC_PPL_DROP_RATIO=0.12`
+  （网格实测见 `scripts/benchmark_punctuator.py`：中文候选子集较全集快 3-4x，中英混合断句
+  位置不受影响、标点风格统一为中文）。
+- 内存：每 worker 独立加载一份标点模型（prune*.bin ~253MB），多进程（WORKERS）随 worker 数线性增长。
+- 分句为 CPU 密集（KenLM 打分），在结果合并环节走 CPU 线程池执行，不阻塞事件循环。
 
 要点：
 - **ORT 时间戳依赖分段 ONNX**：`onnx_fp32 + ENABLE_WORD_TIMESTAMP=true` 时 prepare_model
