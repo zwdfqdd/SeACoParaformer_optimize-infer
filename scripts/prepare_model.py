@@ -248,8 +248,19 @@ def ensure_pt() -> bool:
     if ckpt_found:
         print(f"[OK] 本地 PT 权重目录就绪: {PT_MODEL_DIR}")
         return True
-    print(f"[缺失] 本地 PT 权重目录不存在或无权重文件: {PT_MODEL_DIR}")
-    print(f"       请提前下载模型并打包到该目录（或设环境变量 PT_MODEL_DIR）")
+    # 缺失 → 告警并自动下载（download_asr.py 从 ModelScope 拉取到 PT_MODEL_DIR）
+    print(f"[警告] 本地 PT 权重缺失: {PT_MODEL_DIR}，自动启动下载脚本...")
+    ok = _run([sys.executable, "scripts/download_asr.py", "--output-dir", PT_MODEL_DIR])
+    if ok and os.path.isdir(PT_MODEL_DIR):
+        for name in ("model.pt", "model.pth", "pytorch_model.bin"):
+            if os.path.exists(os.path.join(PT_MODEL_DIR, name)):
+                print(f"[OK] PT 权重下载完成: {PT_MODEL_DIR}")
+                return True
+        for ext in ("*.pt", "*.pth"):
+            if list(Path(PT_MODEL_DIR).rglob(ext)):
+                print(f"[OK] PT 权重下载完成: {PT_MODEL_DIR}")
+                return True
+    print(f"[失败] PT 权重下载失败，请手动运行 scripts/download_asr.py 或设 PT_MODEL_DIR")
     return False
 
 
@@ -316,6 +327,39 @@ def ensure_vad() -> bool:
     return ok
 
 
+PUNC_DIR = os.path.join(MODEL_DIR, "punc")
+
+
+def _has_punc_model() -> bool:
+    """判断 models/punc 下扁平结构标点模型是否齐全（prune*.bin + vocab.json + merges.txt）。"""
+    if not os.path.isdir(PUNC_DIR):
+        return False
+    order = Settings.PUNC_NGRAM_ORDER
+    prune = os.path.join(PUNC_DIR, f"prune{''.join(map(str, range(order)))}.bin")
+    vocab = os.path.join(PUNC_DIR, "vocab.json")
+    merges = os.path.join(PUNC_DIR, "merges.txt")
+    return os.path.exists(prune) and os.path.exists(vocab) and os.path.exists(merges)
+
+
+def ensure_punc() -> bool:
+    """确保 ngram 标点模型存在（仅 ENABLE_SENTENCE_TIMESTAMP 启用时需要）。缺失则下载。
+
+    句子级时间戳强依赖字级时间戳；此处仅负责标点模型产物就绪，开关校验在服务侧。
+    缺失仅告警不阻断（句子级会降级回段级）。
+    """
+    if _has_punc_model():
+        print("[OK] ngram 标点模型已存在")
+        return True
+    order = Settings.PUNC_NGRAM_ORDER
+    print(f"[构建] ngram 标点模型缺失，尝试下载到 {PUNC_DIR}（order={order}）...")
+    ok = _run([sys.executable, "scripts/download_punc.py",
+               "--output-dir", PUNC_DIR, "--order", str(order),
+               "--tokenizer-id", Settings.PUNC_TOKENIZER_ID])
+    if not ok:
+        print(f"[警告] 标点模型下载失败，句子级时间戳将降级回段级: {PUNC_DIR}")
+    return ok
+
+
 # ============================================================
 # 按 precision 编排
 # ============================================================
@@ -330,6 +374,10 @@ def prepare(precision: str, check_only: bool = False) -> bool:
 
     # VAD 模型服务启动必需，所有精度都先确保（缺失则下载，失败仅告警不阻断）
     ensure_vad()
+
+    # 句子级时间戳标点模型（仅启用时准备，缺失下载失败仅降级不阻断）
+    if Settings.ENABLE_SENTENCE_TIMESTAMP:
+        ensure_punc()
 
     if precision == "pt":
         return ensure_pt()
