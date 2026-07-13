@@ -2,7 +2,7 @@
 # 用法：docker-compose up -d
 services:
   seaco-asr:
-    image: seaco-asr:latest
+    image: zhxgharbor.istarshine.com/asr/asr_infer_master:v1-20260713
     build:
       context: .
       dockerfile: Dockerfile
@@ -10,15 +10,15 @@ services:
     ports:
       - "${HOST_PORT:-8099}:8080"
     environment:
-      # ─── 部署形态（详见 docs/DEPLOY.md 高并发性能调优）───
-      # 默认 WORKERS=11（模式 B，A10 24GB 最优，QPS ~93/conc=120）
+      # ─── 部署形态（详见 docs/DEPLOY.md 高并发性能调优；默认值对齐 deploy/k8s.yaml 线上）───
+      # 默认 WORKERS=10（模式 B，A10 24GB 线上实测，开字级+句子级时间戳需回落 10 防 OOM）
       # ★小 GPU/低显存（如 2080Ti 11GB）务必改回 WORKERS=1（模式 A）防 OOM
-      - WORKERS=${WORKERS:-11}
+      - WORKERS=${WORKERS:-10}
       - BATCH=${BATCH:-12}
       # BATCH_TIMEOUT：工业标准 dynamic batching 的 max_queue_delay（ms），实测 10 吞吐最优
       - BATCH_TIMEOUT=${BATCH_TIMEOUT:-10}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-2000}
+      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-2048}
       # 音频最大时长（ms），超出返回 1005；默认 2 小时，0=不限
       - MAX_AUDIO_DURATION_MS=${MAX_AUDIO_DURATION_MS:-7200000}
       # 过载拒绝：并发等待超时（秒），超时返回 1007；0=无限等待
@@ -43,16 +43,25 @@ services:
       # TRT engine 多 stream 多 execution_context 池（weights 共享，activation 独立）
       - GPU_STREAM_POOL_SIZE=${GPU_STREAM_POOL_SIZE:-4}
       # 字级时间戳（asr[].words）：true 启用第 5 段 timestamp engine，吞吐降约 30%
-      - ENABLE_WORD_TIMESTAMP=${ENABLE_WORD_TIMESTAMP:-false}
-      # 句子级时间戳（asr[] 粒度变为句）：★强依赖 ENABLE_WORD_TIMESTAMP=true，否则自动降级回段级
-      - ENABLE_SENTENCE_TIMESTAMP=${ENABLE_SENTENCE_TIMESTAMP:-false}   # asr[] 粒度变为子句（任何标点都切）
+      # 默认对齐 k8s.yaml 线上：字级 + 句子级时间戳均开启
+      - ENABLE_WORD_TIMESTAMP=${ENABLE_WORD_TIMESTAMP:-true}
+      # 句子级时间戳（asr[] 粒度变为子句，任何标点都切）：★强依赖 ENABLE_WORD_TIMESTAMP=true，否则自动降级回段级
+      - ENABLE_SENTENCE_TIMESTAMP=${ENABLE_SENTENCE_TIMESTAMP:-true}
       - PUNC_MODEL_DIR=${PUNC_MODEL_DIR:-models/punc}        # CT-Transformer 标点模型目录（缺失自动下载）
       - PUNC_ONNX_NAME=${PUNC_ONNX_NAME:-model_quant.onnx}  # 标点 ONNX 文件名（量化版；非量化用 model.onnx）
-      - PUNC_MAX_LEN=${PUNC_MAX_LEN:-200}                   # 单窗推理最大字符数（长文本按此滑窗）
+      - PUNC_MAX_LEN=${PUNC_MAX_LEN:-200}                   # 单窗推理最大字符数（长文本按此无重叠分块）
       - PUNC_INTRA_OP_THREADS=${PUNC_INTRA_OP_THREADS:-1}   # ★CT标点session线程数，务必保持1（防高并发CPU超订）
       # 热词模块开关（按需裁剪推理路径，纯通用识别可全关省开销）
       - ENABLE_HOTWORD=${ENABLE_HOTWORD:-true}                    # 路径A SeACo 在线热词
       - ENABLE_FAISS_CORRECTION=${ENABLE_FAISS_CORRECTION:-true}  # 路径B 默认词表 Faiss 纠错
+      # 路径 A/B 参数（默认对齐 config.py；与 k8s.yaml 线上显式声明保持一致）
+      - NFILTER=${NFILTER:-50}                              # 路径A ASF 过滤注入 decoder 的 top-K
+      - FAISS_TOPK=${FAISS_TOPK:-30}                        # 路径B Faiss 召回 TopK
+      - FAISS_PINYIN_WEIGHT=${FAISS_PINYIN_WEIGHT:-0.75}    # 路径B 拼音相似度权重
+      - FAISS_EDIT_WEIGHT=${FAISS_EDIT_WEIGHT:-0.25}        # 路径B 编辑距离权重
+      - FAISS_SCORE_THRESHOLD=${FAISS_SCORE_THRESHOLD:-0.85}  # 路径B Faiss 检索分门槛
+      - GAP_THRESHOLD=${GAP_THRESHOLD:-0.05}                # 路径B top1-top2 区分度门槛
+      - FINAL_SCORE_THRESHOLD=${FINAL_SCORE_THRESHOLD:-0.88}  # 路径B 融合分门槛
       # OMP/BLAS 单线程：★必须，Silero VAD 是串行 LSTM 无 OMP 收益，多线程反致 libgomp 崩溃
       - OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
       - MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
@@ -72,8 +81,7 @@ services:
       # - TRT_OPT_BATCH=4
       # ─── 热词参数（路径 A：SeACo 在线热词，改动 MAX/OPT 后需重新转 engine）───
       # - MAX_HOTWORD_NUM=256   # 客户端热词硬上限/截断点（默认词表恒走 Faiss，不作路由切换）
-      # - OPT_HOTWORD_NUM=64    # TRT profile opt point
-      # - NFILTER=50            # ASF 过滤注入 decoder 的 top-K
+      # - OPT_HOTWORD_NUM=64    # TRT profile opt point（NFILTER 已在上方激活声明）
       # ─── 词表热更新（默认词表 + 多 worker 轮询收敛）───
       # - DEFAULT_HOTWORD_PATH=models/asr/hotwords.txt
       # - HOTWORD_RELOAD_ENABLED=true
