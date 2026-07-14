@@ -19,19 +19,72 @@
 
     # 自定义服务地址
     python tests/test_service.py --audio test_data/audio_16000_30s.wav --url http://localhost:8099 --concurrency 20 --total 100
+
+    # 随机时长模式（模拟线上不定长音频，每请求随机截取 2~30s）
+    python tests/test_service.py --audio test_data/audio_16000_30s.wav --concurrency 200 --total 3000 --random-duration
+    python tests/test_service.py --audio test_data/audio_16000_30s.wav --concurrency 200 --total 3000 --random-duration --min-dur 2 --max-dur 30 --seed 42
 """
 
 import argparse
 import base64
+import io
 import json
+import random
 import subprocess
 import sys
 import threading
 import time
 import urllib.request
 import urllib.error
+import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+
+class AudioSampler:
+    """音频随机时长采样器（模拟线上不定长音频，2~30s）。
+
+    预读源 WAV 的 PCM 帧到内存，每次 sample() 随机截取 [min_dur, max_dur] 秒的片段，
+    在内存重新打包为 WAV 字节并 base64（零落盘）。源音频不足所需时长时循环拼接补齐。
+    """
+
+    def __init__(self, wav_path: str, min_dur: float, max_dur: float):
+        with wave.open(wav_path, "rb") as w:
+            self._nchannels = w.getnchannels()
+            self._sampwidth = w.getsampwidth()
+            self._framerate = w.getframerate()
+            self._frames = w.readframes(w.getnframes())
+        self._src_dur = len(self._frames) / (self._framerate * self._sampwidth * self._nchannels)
+        self._min_dur = min_dur
+        self._max_dur = max_dur
+        if self._src_dur <= 0:
+            raise ValueError("源音频时长为 0，无法采样")
+
+    def sample(self) -> tuple[str, float]:
+        """随机截取一段，返回 (base64_wav, 实际时长秒)。"""
+        dur = random.uniform(self._min_dur, self._max_dur)
+        need_frames = int(dur * self._framerate)
+        bytes_per_frame = self._sampwidth * self._nchannels
+        need_bytes = need_frames * bytes_per_frame
+        buf = self._frames
+        # 源不足则循环拼接补齐
+        if need_bytes > len(buf):
+            reps = need_bytes // len(buf) + 1
+            buf = buf * reps
+        # 随机起点截取（对齐 frame 边界）
+        max_start = len(buf) - need_bytes
+        start = random.randint(0, max_start) if max_start > 0 else 0
+        start -= start % bytes_per_frame
+        seg = buf[start:start + need_bytes]
+        actual_dur = len(seg) / (self._framerate * bytes_per_frame)
+
+        bio = io.BytesIO()
+        with wave.open(bio, "wb") as w:
+            w.setnchannels(self._nchannels)
+            w.setsampwidth(self._sampwidth)
+            w.setframerate(self._framerate)
+            w.writeframes(seg)
+        return base64.b64encode(bio.getvalue()).decode(), actual_dur
 
 
 def _read_cpu_times():
@@ -164,8 +217,13 @@ def _percentile(sorted_vals: list, pct: float) -> float:
     return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * frac
 
 
-def send_request(url: str, payload: dict) -> dict:
-    """发送单个 ASR 请求（同步，urllib），返回结果和耗时。"""
+def send_request(url: str, build_payload) -> dict:
+    """发送单个 ASR 请求（同步，urllib），返回结果和耗时。
+
+    build_payload: 无参回调，返回 (payload_dict, audio_dur_s)。每次调用可返回不同
+    时长的随机音频（模拟线上不定长），故 payload 在请求线程内实时构建。
+    """
+    payload, audio_dur = build_payload()
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"{url}/chinese_asr", data=data, headers={"Content-Type": "application/json"}, method="POST"
@@ -180,6 +238,7 @@ def send_request(url: str, payload: dict) -> dict:
             "success": status == 200,
             "status": status,
             "elapsed_s": elapsed,
+            "audio_dur_s": audio_dur,
             "text_len": len(body.get("istar_asr", "")) if status == 200 else 0,
             "error": body.get("error", "") if status != 200 else "",
         }
@@ -190,21 +249,26 @@ def send_request(url: str, payload: dict) -> dict:
             err = body.get("error", f"HTTP {e.code}")
         except Exception:
             err = f"HTTP {e.code}"
-        return {"success": False, "status": e.code, "elapsed_s": elapsed, "text_len": 0, "error": err}
+        return {"success": False, "status": e.code, "elapsed_s": elapsed,
+                "audio_dur_s": audio_dur, "text_len": 0, "error": err}
     except Exception as e:
         elapsed = time.perf_counter() - t0
         return {
             "success": False,
             "status": 0,
             "elapsed_s": elapsed,
+            "audio_dur_s": audio_dur,
             "text_len": 0,
             "error": f"{type(e).__name__}: {e}",
         }
 
 
-def run_benchmark(url: str, payload: dict, concurrency: int, total: int,
-                  audio_duration: float, gpu_index: int = 0):
-    """并发压测（线程池模拟多客户端），期间后台采样 GPU + CPU 利用率。"""
+def run_benchmark(url: str, build_payload, concurrency: int, total: int,
+                  gpu_index: int = 0):
+    """并发压测（线程池模拟多客户端），期间后台采样 GPU + CPU 利用率。
+
+    build_payload: 无参回调，返回 (payload, audio_dur_s)；随机时长模式下每次不同。
+    """
     print(f"开始压测: 并发={concurrency}, 总请求={total}")
     print(f"目标: {url}/chinese_asr")
     print()
@@ -213,7 +277,7 @@ def run_benchmark(url: str, payload: dict, concurrency: int, total: int,
     mon.start()
     wall_start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        results = list(pool.map(lambda _: send_request(url, payload), range(total)))
+        results = list(pool.map(lambda _: send_request(url, build_payload), range(total)))
     wall_time = time.perf_counter() - wall_start
     res_stats = mon.stop()
 
@@ -221,7 +285,11 @@ def run_benchmark(url: str, payload: dict, concurrency: int, total: int,
 
 
 def compute_metrics(results: list, wall_time: float, audio_duration: float, concurrency: int):
-    """计算性能指标。"""
+    """计算性能指标。
+
+    audio_duration：固定时长模式传单值；随机时长模式传 None，改用每请求实际时长
+    （results[].audio_dur_s）计算 RTF/吞吐，更贴合线上不定长场景。
+    """
     success_results = [r for r in results if r["success"]]
     failed_results = [r for r in results if not r["success"]]
     total = len(results)
@@ -244,11 +312,24 @@ def compute_metrics(results: list, wall_time: float, audio_duration: float, conc
     min_latency = min(latencies)
     max_latency = max(latencies)
 
+    # 成功请求的音频时长：随机模式逐请求实际时长求和 + 均值；固定模式退回单值
+    audio_durs = [r.get("audio_dur_s") for r in success_results if r.get("audio_dur_s")]
+    if audio_durs:
+        total_audio_s = sum(audio_durs)
+        avg_audio_dur = total_audio_s / len(audio_durs)
+        min_audio_dur = min(audio_durs)
+        max_audio_dur = max(audio_durs)
+    else:
+        avg_audio_dur = audio_duration or 0.0
+        total_audio_s = avg_audio_dur * success_count
+        min_audio_dur = max_audio_dur = avg_audio_dur
+
     # 性能指标
-    rtf = avg_latency / audio_duration  # 单请求 RTF
-    rtx = audio_duration / avg_latency  # 单请求加速比
+    # RTF/RTX 用平均音频时长；吞吐用「成功请求实际音频秒数总和 / 墙钟」（随机时长下更准确）
+    rtf = avg_latency / avg_audio_dur if avg_audio_dur > 0 else 0.0
+    rtx = avg_audio_dur / avg_latency if avg_latency > 0 else 0.0
     qps = success_count / wall_time  # 每秒完成请求数
-    throughput = qps * audio_duration  # 每秒处理的音频秒数
+    throughput = total_audio_s / wall_time  # 每秒处理的音频秒数（实际总音频/墙钟）
 
     metrics = {
         "total_requests": total,
@@ -256,7 +337,10 @@ def compute_metrics(results: list, wall_time: float, audio_duration: float, conc
         "failed": len(failed_results),
         "concurrency": concurrency,
         "wall_time_s": wall_time,
-        "audio_duration_s": audio_duration,
+        "audio_duration_s": round(avg_audio_dur, 2),
+        "audio_dur_min_s": round(min_audio_dur, 2),
+        "audio_dur_max_s": round(max_audio_dur, 2),
+        "total_audio_s": round(total_audio_s, 1),
         "avg_latency_ms": avg_latency * 1000,
         "p50_ms": p50 * 1000,
         "p90_ms": p90 * 1000,
@@ -289,7 +373,13 @@ def print_report(metrics: dict):
     print(f"  失败: {metrics['failed']}")
     print(f"  并发数: {metrics['concurrency']}")
     print(f"  总耗时: {metrics['wall_time_s']:.2f}s")
-    print(f"  音频时长: {metrics['audio_duration_s']:.2f}s")
+    if metrics.get("audio_dur_min_s") is not None and \
+       metrics["audio_dur_min_s"] != metrics["audio_dur_max_s"]:
+        print(f"  音频时长: 均值 {metrics['audio_duration_s']:.2f}s "
+              f"(范围 {metrics['audio_dur_min_s']:.1f}~{metrics['audio_dur_max_s']:.1f}s, "
+              f"总 {metrics.get('total_audio_s', 0):.0f}s)")
+    else:
+        print(f"  音频时长: {metrics['audio_duration_s']:.2f}s")
     print()
 
     print(f"延迟分布:")
@@ -344,31 +434,60 @@ def main():
     parser.add_argument("--hotwords", nargs="*", default=None, help="热词列表")
     parser.add_argument("--output", default="service_benchmark.json", help="结果输出文件")
     parser.add_argument("--gpu-index", type=int, default=0, help="监测的 GPU 卡号（nvidia-smi）")
+    # 随机时长（模拟线上不定长音频）：每个请求随机截取 [min-dur, max-dur] 秒
+    parser.add_argument("--random-duration", action="store_true",
+                        help="随机时长模式：每请求随机截取音频片段（模拟线上 0-30s 不定长）")
+    parser.add_argument("--min-dur", type=float, default=2.0, help="随机时长下限（秒），默认 2")
+    parser.add_argument("--max-dur", type=float, default=30.0, help="随机时长上限（秒），默认 30")
+    parser.add_argument("--seed", type=int, default=None, help="随机种子（复现用，默认不固定）")
     args = parser.parse_args()
 
     if not Path(args.audio).exists():
         sys.exit(f"错误：音频不存在: {args.audio}")
 
     # 读取音频时长（标准库 wave，仅用于 RTF/RTX 计算）
-    import wave
     try:
         with wave.open(args.audio, "rb") as w:
             audio_duration = w.getnframes() / w.getframerate()
     except Exception as e:
         sys.exit(f"错误：无法读取音频时长（需 WAV 格式）: {e}")
 
-    # 读取原始字节做 base64
-    with open(args.audio, "rb") as f:
-        b64_audio = base64.b64encode(f.read()).decode()
+    # ─── 构建 payload 回调（固定 / 随机时长两种模式）───
+    if args.random_duration:
+        if args.seed is not None:
+            random.seed(args.seed)
+        if args.min_dur <= 0 or args.max_dur < args.min_dur:
+            sys.exit(f"错误：随机时长区间非法（min={args.min_dur}, max={args.max_dur}）")
+        sampler = AudioSampler(args.audio, args.min_dur, args.max_dur)
 
-    payload = {"base64": b64_audio}
-    if args.hotwords:
-        payload["hotwords"] = args.hotwords
+        def build_payload():
+            b64, dur = sampler.sample()
+            p = {"base64": b64}
+            if args.hotwords:
+                p["hotwords"] = args.hotwords
+            return p, dur
+
+        # compute_metrics 用每请求实际时长（传 None）
+        metric_audio_dur = None
+    else:
+        with open(args.audio, "rb") as f:
+            b64_audio = base64.b64encode(f.read()).decode()
+        _fixed_payload = {"base64": b64_audio}
+        if args.hotwords:
+            _fixed_payload["hotwords"] = args.hotwords
+
+        def build_payload():
+            return _fixed_payload, audio_duration
+
+        metric_audio_dur = audio_duration
 
     print("=" * 60)
     print("SeACo-Paraformer 推理服务性能测试")
     print("=" * 60)
-    print(f"音频: {args.audio} ({audio_duration:.2f}s)")
+    if args.random_duration:
+        print(f"音频: {args.audio} (随机时长 {args.min_dur:.0f}~{args.max_dur:.0f}s，模拟线上不定长)")
+    else:
+        print(f"音频: {args.audio} ({audio_duration:.2f}s)")
     print(f"服务: {args.url}")
     print(f"并发: {args.concurrency}")
     print(f"总请求: {args.total}")
@@ -401,11 +520,11 @@ def main():
 
     # 运行压测（含 GPU + CPU 利用率采样）
     results, wall_time, res_stats = run_benchmark(
-        args.url, payload, args.concurrency, args.total, audio_duration, args.gpu_index
+        args.url, build_payload, args.concurrency, args.total, args.gpu_index
     )
 
-    # 计算指标
-    metrics = compute_metrics(results, wall_time, audio_duration, args.concurrency)
+    # 计算指标（随机时长模式 metric_audio_dur=None → 用每请求实际时长）
+    metrics = compute_metrics(results, wall_time, metric_audio_dur, args.concurrency)
     if metrics and res_stats:
         if res_stats.get("gpu"):
             metrics["gpu"] = res_stats["gpu"]
