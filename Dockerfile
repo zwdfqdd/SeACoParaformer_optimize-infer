@@ -59,6 +59,9 @@ ENV LOG_LEVEL=INFO
 ENV MAX_CONCURRENT_REQUESTS=2000
 ENV MODEL_PRECISION=trt_int8_enc
 ENV VERBOSE=0
+# Prometheus 多进程指标聚合目录（多 worker QPS 汇总）。entrypoint 启动时清空重建；
+# 置空可关闭多进程聚合（退回单进程 registry）。
+ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc
 
 EXPOSE 8080
 

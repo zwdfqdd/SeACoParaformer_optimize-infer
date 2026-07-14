@@ -25,6 +25,7 @@ import asyncio
 import base64
 import io
 import logging
+import os
 import signal
 import time
 from contextlib import asynccontextmanager
@@ -33,7 +34,14 @@ import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Histogram,
+    generate_latest,
+    multiprocess,
+)
 
 from src.asr_engine import asr_engine
 from src.audio_segment import ChunkMeta, extract_chunk_audio, segment_to_chunks
@@ -221,6 +229,13 @@ async def lifespan(app: FastAPI):
         _gpu_executor.shutdown(wait=False, cancel_futures=True)
     except Exception:
         pass
+    # 多进程 Prometheus：本 worker 退出时标记进程死亡，清理其 gauge 分片，
+    # 避免死进程的指标残留污染聚合结果（Counter/Histogram 保留累计值供聚合）。
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        try:
+            multiprocess.mark_process_dead(os.getpid())
+        except Exception:
+            pass
     logger.info("服务已关闭")
 
 
@@ -385,12 +400,32 @@ async def health_check():
 
 @app.get("/metrics")
 async def metrics():
-    """Prometheus 指标接口。"""
+    """Prometheus 指标接口。
+
+    多进程聚合：uvicorn 多 worker（WORKERS>1）时每个 worker 是独立进程，各自的
+    Counter/Histogram 互不相通。若设置了环境变量 PROMETHEUS_MULTIPROC_DIR，则用
+    MultiProcessCollector 从该目录聚合所有 worker 的指标（QPS 等按全进程汇总，
+    否则 /metrics 只反映被抓到的那个 worker，QPS 严重偏低失真）。
+    未设置该环境变量时退回单进程默认 registry（兼容 WORKERS=1）。
+
+    QPS 由 Prometheus 服务端对 asr_request_total 做 rate() 计算（Counter + rate 是
+    标准做法），本端点只需保证多进程下计数完整可聚合。
+    """
     # scrape 时刷新 GPU 显存实际值（Gauge 标准做法）
     _update_gpu_memory_metric()
     _update_scheduler_metrics()
+
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        # 多进程模式：聚合所有 worker 的指标
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        data = generate_latest(registry)
+    else:
+        # 单进程模式：默认全局 registry
+        data = generate_latest()
+
     return JSONResponse(
-        content=generate_latest().decode("utf-8"),
+        content=data.decode("utf-8"),
         media_type=CONTENT_TYPE_LATEST,
     )
 
