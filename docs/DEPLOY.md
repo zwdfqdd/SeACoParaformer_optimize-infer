@@ -89,6 +89,7 @@ OPENBLAS_NUM_THREADS=1
 | OMP_NUM_THREADS | 1 | ★必须 1，防 libgomp 崩溃（run.sh 已固化） |
 | MKL_NUM_THREADS | 1 | 同上 |
 | OPENBLAS_NUM_THREADS | 1 | 同上 |
+| PROMETHEUS_MULTIPROC_DIR | /tmp/prometheus_multiproc | 多进程 Prometheus 指标聚合目录（镜像已内置默认值）；`WORKERS>1` 时各 worker 指标写入此目录，`/metrics` 聚合全部 worker（否则 QPS 偏低约 1/WORKERS）。entrypoint.sh 启动时清空重建 |
 | VERBOSE | 0 | 详细日志输出（1=开启，输出各阶段耗时） |
 
 > **两种部署形态**（详见「高并发性能调优」章节）：
@@ -98,6 +99,11 @@ OPENBLAS_NUM_THREADS=1
 > 代码已按多 worker 安全设计——词表热更新通过容器本地文件 + 版本轮询在各 worker 间收敛
 > （见 API.md 词表热更新）。每个 worker 独立加载一份 engine + CUDA context，
 > 显存随 WORKERS 线性增长，需确认显存充足。
+>
+> **多进程指标聚合**：模式 B（`WORKERS>1`）下 `/metrics` 依赖 `PROMETHEUS_MULTIPROC_DIR`
+> 聚合各 worker 指标，镜像已内置默认值（`/tmp/prometheus_multiproc`），开箱即用。
+> QPS 由 Prometheus 服务端 `rate(asr_request_total{status="success"}[1m])` 计算
+> （详见 API.md「GET /metrics — 多进程聚合」）。
 
 ### MODEL_PRECISION 说明
 

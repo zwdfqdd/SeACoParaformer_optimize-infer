@@ -256,6 +256,40 @@
 - `asr_inference_duration_seconds` — 推理耗时直方图
 - `gpu_memory_usage_bytes` — GPU 显存使用量
 
+### 多进程聚合（WORKERS>1 必读）
+
+uvicorn 多 worker（`WORKERS>1`）时每个 worker 是独立进程，各自的 Counter/Histogram
+互不相通。若不做聚合，Prometheus 每次抓取只会命中其中一个 worker，导致 `/metrics`
+只反映单 worker 的计数，按此算出的 QPS 会偏低约 `1/WORKERS`。
+
+本服务通过环境变量 `PROMETHEUS_MULTIPROC_DIR` 解决：
+
+- 设置该变量后，各 worker 把指标写入该目录的共享分片文件，`/metrics` 端点用
+  `multiprocess.MultiProcessCollector` 从该目录聚合**所有 worker** 的指标后返回。
+- 未设置时退回单进程默认 registry（兼容 `WORKERS=1`）。
+- worker 退出时自动 `mark_process_dead(pid)` 清理其指标分片，避免死进程残留污染聚合。
+
+配套约定（镜像已开箱即用，见 DEPLOY.md）：
+
+- `Dockerfile` 默认 `ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc`
+- `scripts/entrypoint.sh` 启动时清空并重建该目录（`rm -rf` + `mkdir -p`），
+  避免上次运行的陈旧分片被计入。
+
+### QPS 计算（服务端）
+
+`/metrics` 端点本身不导出 QPS 指标。QPS 是速率量，标准做法是由 Prometheus 服务端对
+累计 Counter 做 `rate()`：
+
+```promql
+# 成功请求 QPS（1 分钟窗口，已聚合全部 worker）
+rate(asr_request_total{status="success"}[1m])
+
+# 全部请求 QPS（含失败）
+sum(rate(asr_request_total[1m]))
+```
+
+本端点只需保证多进程下 Counter 计数完整可聚合，速率交给 Prometheus 计算。
+
 ---
 
 ## 词表热更新接口
