@@ -416,7 +416,8 @@ models/asr/.hotwords.lock        跨进程互斥锁文件
 | BATCH_TIMEOUT | 10 | batch 等待超时（ms），dynamic batching 的 max_queue_delay（实测 10 吞吐最优） |
 | MODEL_PRECISION | auto | 模型精度（见上表；部署脚本默认 trt_fp16） |
 | CPU_THREAD_POOL_SIZE | 32 | CPU 流水线线程池（Stage1 VAD + Stage2 特征）；默认 32（256 核最优，per-worker）；★所有后端生效 |
-| VAD_SESSION_POOL_SIZE | 2 | Silero VAD ORT session 池（round-robin，实测最优 2）；单 session 线程硬编码 1 |
+| ENABLE_VAD | true | VAD 开关；false 跳过 VAD 对整段固定 4s 均匀切段（<2s pad 到 2s，尾段<2s 并前段、≥2s 独立）|
+| VAD_SESSION_POOL_SIZE | 2 | Silero VAD ORT session 池（round-robin，实测最优 2）；单 session 线程硬编码 1；`ENABLE_VAD=false` 时不生效 |
 | GPU_STREAM_POOL_SIZE | 4 | TRT 多 stream 多 context 池；作用于 encoder/cif/decoder(+timestamp)；bias_encoder 固定单 context |
 | ENABLE_WORD_TIMESTAMP | false | 字级时间戳（asr[].words）；true 启用，吞吐降约 30% |
 | ENABLE_SENTENCE_TIMESTAMP | false | 句子级时间戳（asr[] 粒度变为子句，任何标点都切）；★强依赖 ENABLE_WORD_TIMESTAMP=true，否则自动降级回段级 |

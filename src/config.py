@@ -124,6 +124,18 @@ class Settings:
     CPU_THREAD_POOL_SIZE: int = int(os.getenv("CPU_THREAD_POOL_SIZE", "32"))
 
     # ============================================================
+    # VAD 开关（语音活动检测）
+    # ============================================================
+    # 默认 true。
+    #   true：Silero VAD 检测语音段，按 VAD 时间跨度均匀切段（segment_to_chunks）；
+    #   false：不加载/不运行 VAD，对整段音频按固定 4s 均匀切段
+    #          （segment_to_chunks_no_vad）：
+    #            - 总时长 < 2s → 单段并 pad 到 2s；
+    #            - 尾段 < 2s → 并入前一段；尾段 >= 2s → 独立成段。
+    #   关闭后省去 VAD 推理开销（纯定长切段），适合已知无长静音的音频流。
+    ENABLE_VAD: bool = os.getenv("ENABLE_VAD", "true").lower() in ("1", "true", "yes")
+
+    # ============================================================
     # 热词模块开关（按需裁剪推理路径，纯通用识别可全关省开销）
     # ============================================================
     # 路径 A（SeACo 在线热词）开关。默认 true。
@@ -687,7 +699,8 @@ class Settings:
             "CPU_THREAD_POOL_SIZE": cls.CPU_THREAD_POOL_SIZE,
             "CPU_THREAD_POOL_effective": cpu_pool,
             "CPU_threads_total_est": cls.WORKERS * cpu_pool,
-            "VAD_SESSION_POOL_SIZE": cls.VAD_SESSION_POOL_SIZE,
+            "ENABLE_VAD": cls.ENABLE_VAD,
+            "VAD_SESSION_POOL_SIZE": cls.VAD_SESSION_POOL_SIZE if cls.ENABLE_VAD else "(VAD 已关闭)",
             "HEALTH_MAX_CONSECUTIVE_FAILURES": cls.HEALTH_MAX_CONSECUTIVE_FAILURES,
             "HEALTH_ACTIVE_PROBE": cls.HEALTH_ACTIVE_PROBE,
         }

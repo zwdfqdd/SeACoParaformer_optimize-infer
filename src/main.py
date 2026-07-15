@@ -44,7 +44,12 @@ from prometheus_client import (
 )
 
 from src.asr_engine import asr_engine
-from src.audio_segment import ChunkMeta, extract_chunk_audio, segment_to_chunks
+from src.audio_segment import (
+    ChunkMeta,
+    extract_chunk_audio,
+    segment_to_chunks,
+    segment_to_chunks_no_vad,
+)
 from src.config import settings
 from src.errors import ASRException, ErrorCode, ERROR_HTTP_STATUS
 from src.feature_extractor import extract_features, load_cmvn
@@ -151,7 +156,10 @@ async def lifespan(app: FastAPI):
     # 启动：加载模型
     logger.info("服务启动中...")
     _load_resources()
-    vad_engine.load()
+    if settings.ENABLE_VAD:
+        vad_engine.load()
+    else:
+        logger.info("ENABLE_VAD=false：跳过 VAD 加载，改用固定 4s 均匀切段")
     asr_engine.load()
     await gpu_scheduler.start()
 
@@ -191,12 +199,13 @@ async def lifespan(app: FastAPI):
     logger.info("特征提取预热完成")
 
     # 端到端预热（完整走一遍 VAD + 特征 + 推理，触发所有 lazy init）
-    logger.info("端到端预热中...")
-    try:
-        dummy_segments = vad_engine.detect(dummy_pcm, 16000)
-    except Exception:
-        pass  # 静音可能无 VAD 段，忽略
-    logger.info("端到端预热完成")
+    if settings.ENABLE_VAD:
+        logger.info("端到端预热中...")
+        try:
+            dummy_segments = vad_engine.detect(dummy_pcm, 16000)
+        except Exception:
+            pass  # 静音可能无 VAD 段，忽略
+        logger.info("端到端预热完成")
 
     # 打印所有实际生效的运行配置（复现 / 排错用；结构化 JSON 字段，按启用模块动态组装）
     _cfg_record = logger.makeRecord(
@@ -398,7 +407,9 @@ async def health_check():
     HEALTH_ACTIVE_PROBE=true 时额外主动跑一次极小 dummy 推理（带 INFER_TIMEOUT 超时），
     直接验证 GPU 链路存活（探测被动统计未覆盖的“无流量期间”卡死）。
     """
-    loaded = vad_engine.is_loaded and asr_engine.is_loaded
+    # ENABLE_VAD=false 时 VAD 未加载属预期，不纳入 loaded 判定（否则误判 degraded）
+    vad_ok = vad_engine.is_loaded if settings.ENABLE_VAD else True
+    loaded = vad_ok and asr_engine.is_loaded
     runtime = asr_engine.runtime_health()
 
     # 主动探针（可选）：真跑一次极小推理验证 GPU 链路（超时视为不健康）
@@ -606,20 +617,29 @@ async def asr_recognize(req: ASRRequest):
 
         loop = asyncio.get_event_loop()
 
-        # ====== Stage 1: 音频解码 + VAD + 切段（CPU 线程池） ======
+        # ====== Stage 1: 音频解码 +（VAD）+ 切段（CPU 线程池） ======
+        # ENABLE_VAD=true：Silero VAD 检测语音段 → 按 VAD 时间跨度均匀切段；
+        # ENABLE_VAD=false：跳过 VAD，对整段音频固定 4s 均匀切段
+        #   （<2s 单段 pad 到 2s；尾段 <2s 并入前段，>=2s 独立成段），vad_segments 恒为空。
         def _stage1_cpu():
             t0 = time.time()
             pcm, sample_rate, audio_duration_ms = _decode_audio(req.base64)
             t1 = time.time()
-            vad_segments = vad_engine.detect(pcm, sample_rate)
-            t2 = time.time()
-            chunks = segment_to_chunks(vad_segments, audio_duration_ms)
+            if settings.ENABLE_VAD:
+                vad_segments = vad_engine.detect(pcm, sample_rate)
+                t2 = time.time()
+                chunks = segment_to_chunks(vad_segments, audio_duration_ms)
+            else:
+                vad_segments = []
+                t2 = time.time()
+                chunks = segment_to_chunks_no_vad(audio_duration_ms)
             t3 = time.time()
             sub_ms = {"decode": t1 - t0, "vad": t2 - t1, "segment": t3 - t2}
             if settings.VERBOSE:
                 logger.debug(
                     f"[Stage1] 解码={int(sub_ms['decode']*1000)}ms, "
-                    f"VAD={int(sub_ms['vad']*1000)}ms({len(vad_segments)}段), "
+                    f"VAD={int(sub_ms['vad']*1000)}ms({len(vad_segments)}段"
+                    f"{'' if settings.ENABLE_VAD else ',已关闭'}), "
                     f"切段={int(sub_ms['segment']*1000)}ms({len(chunks)}chunks)"
                 )
             return pcm, sample_rate, audio_duration_ms, vad_segments, chunks, sub_ms
