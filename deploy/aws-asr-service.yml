@@ -1,0 +1,124 @@
+---
+kind: ReplicaSet
+metadata:
+  annotations:
+    deployment.kubernetes.io/desired-replicas: '10'
+    deployment.kubernetes.io/max-replicas: '10'
+    k8s.kuboard.cn/workload: asr-api
+  labels:
+    k8s.kuboard.cn/layer: svc
+    k8s.kuboard.cn/name: asr-api
+    pod-template-hash: 6fff947445
+  name: asr-api-6fff947445
+  namespace: default
+  ownerReferences:
+    - apiVersion: apps/v1
+      blockOwnerDeletion: true
+      controller: true
+      kind: Deployment
+      name: asr-api
+      uid: e9cc7245-a4fa-4538-89f8-4fc6eddda94e
+  resourceVersion: '14571018'
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      k8s.kuboard.cn/layer: svc
+      k8s.kuboard.cn/name: asr-api
+      pod-template-hash: 6fff947445
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/restartedAt: '2026-06-09T17:08:09+08:00'
+      labels:
+        k8s.kuboard.cn/layer: svc
+        k8s.kuboard.cn/name: asr-api
+        pod-template-hash: 6fff947445
+    spec:
+      containers:
+        - env:
+            - name: WORKERS
+              value: '11'
+            - name: BATCH
+              value: '12'
+            - name: BATCH_TIMEOUT
+              value: '10'
+            - name: LOG_LEVEL
+              value: INFO
+            - name: MAX_CONCURRENT_REQUESTS
+              value: '2048'
+            - name: MODEL_PRECISION
+              value: trt_fp16
+            - name: VAD_SESSION_POOL_SIZE
+              value: '2'
+            - name: GPU_STREAM_POOL_SIZE
+              value: '4'
+            - name: CPU_THREAD_POOL_SIZE
+              value: '24'
+            - name: ENABLE_WORD_TIMESTAMP
+              value: 'false'
+            - name: ENABLE_SENTENCE_TIMESTAMP
+              value: 'false'
+            - name: PUNC_MAX_LEN
+              value: '200'
+            - name: PUNC_INTRA_OP_THREADS
+              value: '1'
+            - name: ENABLE_HOTWORD
+              value: 'false'
+            - name: NFILTER
+              value: '50'
+            - name: ENABLE_FAISS_CORRECTION
+              value: 'false'
+            - name: FAISS_TOPK
+              value: '30'
+            - name: FAISS_PINYIN_WEIGHT
+              value: '0.75'
+            - name: FAISS_EDIT_WEIGHT
+              value: '0.25'
+            - name: FAISS_SCORE_THRESHOLD
+              value: '0.92'
+            - name: GAP_THRESHOLD
+              value: '0.1'
+            - name: FINAL_SCORE_THRESHOLD
+              value: '0.95'
+            - name: OMP_NUM_THREADS
+              value: '1'
+            - name: MKL_NUM_THREADS
+              value: '1'
+            - name: OPENBLAS_NUM_THREADS
+              value: '1'
+            - name: VERBOSE
+              value: '0'
+            - name: PROMETHEUS_MULTIPROC_DIR
+              value: /tmp/prometheus_multiproc
+          image: >-
+            191433500463.dkr.ecr.cn-northwest-1.amazonaws.com.cn/zhxg/asr_trt_fp16:202607151020
+          imagePullPolicy: IfNotPresent
+          name: asr-api
+          resources:
+            limits:
+              cpu: '32'
+              nvidia.com/gpu: '1'
+            requests:
+              cpu: '24'
+              nvidia.com/gpu: '1'
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /tmp/prometheus_multiproc
+              name: fastapi-metrics-disk
+      dnsPolicy: ClusterFirst
+      nodeSelector:
+        beta.kubernetes.io/instance-type: g5.8xlarge
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 120
+      volumes:
+        - emptyDir:
+            medium: Memory
+          name: fastapi-metrics-disk
+status:
+  observedGeneration: 2
+  replicas: 0
+  terminatingReplicas: 0
