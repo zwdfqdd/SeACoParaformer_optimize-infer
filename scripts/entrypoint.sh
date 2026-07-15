@@ -26,7 +26,7 @@ echo ""
 # ─── Prometheus 多进程指标目录（多 worker QPS 聚合）───
 # uvicorn 多 worker（WORKERS>1）时各 worker 独立进程，Counter 互不相通；
 # 设置 PROMETHEUS_MULTIPROC_DIR 后 main.py 的 /metrics 用 MultiProcessCollector
-# 聚合所有 worker（QPS 由服务端对 asr_request_total 做 rate 计算）。
+# 聚合所有 worker（QPS 由服务端对 fastapi_requests_total 做 rate 计算）。
 # 该目录必须在启动前清空，否则残留的旧进程指标文件会污染聚合结果。
 if [ -n "${PROMETHEUS_MULTIPROC_DIR:-}" ]; then
     echo "[Prometheus] 多进程指标目录: ${PROMETHEUS_MULTIPROC_DIR}（清空并重建）"
