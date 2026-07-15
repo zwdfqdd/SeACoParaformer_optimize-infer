@@ -80,7 +80,7 @@
 | asr[].slid | string | 语种识别结果（**当前未实现**，固定空字符串） |
 | asr[].text | string | 该段识别文本 |
 | asr[].speaker | string | 说话人识别结果（**当前未实现**，固定空字符串） |
-| asr[].timestamp | [float, float] | [起始秒, 结束秒]，段级时间戳，源自 VAD 时间轴 |
+| asr[].timestamp | [float, float] | [起始秒, 结束秒]，段级时间戳；VAD 开启时源自 VAD 时间轴，关闭时为固定 4s 均匀切段边界 |
 | asr[].words | array | 字级时间戳数组（CIF alphas 反推得到，需 CIF engine 输出 alphas） |
 | asr[].words[].text | string | 字符（中文单字或英文 BPE subword） |
 | asr[].words[].timestamp | [float, float] | [起始秒, 结束秒]，字级时间戳，粒度约 60ms |
@@ -91,6 +91,13 @@
   `code=0, istar_asr="", asr=[], message="音频内容为空"`（不再报 500 错误）
 - **VAD 有效但整体时长 < 2040ms**（最小桶 34 帧 × 60ms，约 2s）：尾部自动 pad 到 2040ms
   后正常识别（保证 encoder 输入不低于 TRT profile 下界）
+
+**VAD 开关（`ENABLE_VAD`，默认 true）对切段的影响**：
+- **开启**（默认）：Silero VAD 检测语音段，按 VAD 时间跨度均匀切段（跳过首尾/段间静音）
+- **关闭**（`ENABLE_VAD=false`）：不做 VAD，对整段音频按固定 4s 均匀切段：
+  - 整段 < 2s → 单段并 pad 到 2s；
+  - 尾段 < 2s → 并入前一段；尾段 ≥ 2s → 独立成段。
+  - 段级 `timestamp` 为切段边界（非语音边界），空音频仍返回 `message="音频内容为空"`。
 
 **字级时间戳说明**：
 - 由独立 timestamp engine（第 5 段，upsample CIF timestamp head）计算，对齐 FunASR

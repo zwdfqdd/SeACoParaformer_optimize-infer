@@ -132,6 +132,68 @@ def segment_to_chunks(
     return chunks
 
 
+# VAD 关闭时的最小段长阈值：整段 < 此值 pad 到此值；尾段 < 此值并入前段，>= 此值独立成段。
+# 取 2000ms（对齐 min 桶 2040ms 附近），保证送入 encoder 的段不低于 profile 下界。
+NO_VAD_MIN_MS = 2000
+
+
+def segment_to_chunks_no_vad(total_duration_ms: int) -> list[ChunkMeta]:
+    """
+    VAD 关闭路径：对整段音频 [0, total_duration_ms] 按 UNIFORM_CHUNK_MS(4s) 均匀切段。
+
+    规则（不依赖 VAD 时间戳）：
+      - 整段时长 < NO_VAD_MIN_MS(2s) → 单段，raw_end 扩展 pad 到 2s
+        （extract_chunk_audio 会 clip 到 pcm 长度，不足部分特征提取补零）；
+      - 从 0 起每 UNIFORM_CHUNK_MS 切一刀；
+      - 尾段 < NO_VAD_MIN_MS → 并入前一段；尾段 >= NO_VAD_MIN_MS → 独立成段。
+
+    与 VAD 版 segment_to_chunks 的差异：
+      - 时间轴从 0 到整段末尾（不裁剪静音），不做 VAD 检测；
+      - 尾块合并阈值用 NO_VAD_MIN_MS(2s) 而非 MIN_TAIL_MS(1s)（按需求“尾段<2s缀前段”）。
+    """
+    if total_duration_ms <= 0:
+        return []
+
+    # 短音频：整段不足 2s，单段 pad 到 2s
+    if total_duration_ms < NO_VAD_MIN_MS:
+        return [ChunkMeta(
+            chunk_id=0,
+            segment_index=0,
+            raw_start_ms=0,
+            raw_end_ms=NO_VAD_MIN_MS,
+        )]
+
+    # 均匀切分
+    chunks: list[ChunkMeta] = []
+    cur = 0
+    idx = 0
+    while cur < total_duration_ms:
+        nxt = min(cur + UNIFORM_CHUNK_MS, total_duration_ms)
+        chunks.append(ChunkMeta(
+            chunk_id=idx,
+            segment_index=0,
+            raw_start_ms=cur,
+            raw_end_ms=nxt,
+        ))
+        cur = nxt
+        idx += 1
+
+    # 尾段保护：< NO_VAD_MIN_MS(2s) 并入前一段；>= 2s 独立成段（不处理）
+    if len(chunks) >= 2:
+        tail = chunks[-1]
+        if tail.duration_ms < NO_VAD_MIN_MS:
+            prev = chunks[-2]
+            merged = ChunkMeta(
+                chunk_id=prev.chunk_id,
+                segment_index=prev.segment_index,
+                raw_start_ms=prev.raw_start_ms,
+                raw_end_ms=tail.raw_end_ms,
+            )
+            chunks = chunks[:-2] + [merged]
+
+    return chunks
+
+
 def extract_chunk_audio(
     pcm: np.ndarray, chunk: ChunkMeta, sample_rate: int = 16000
 ) -> np.ndarray:

@@ -84,7 +84,8 @@ OPENBLAS_NUM_THREADS=1
 | MAX_CONCURRENT_REQUESTS | 2000 | 最大并发请求数 |
 | MODEL_PRECISION | auto | 模型精度选择（见 README MODEL_PRECISION 取值表） |
 | CPU_THREAD_POOL_SIZE | 32 | CPU 流水线线程池（Stage1 VAD+Stage2 特征）；默认 32（256 核最优，per-worker）|
-| VAD_SESSION_POOL_SIZE | 2 | Silero VAD ORT session 池大小，round-robin 分配（实测最优 2）|
+| ENABLE_VAD | true | VAD 开关；true 用 Silero VAD 按语音段切；false 跳过 VAD 对整段固定 4s 均匀切段（<2s pad 到 2s，尾段<2s 并前段、≥2s 独立）|
+| VAD_SESSION_POOL_SIZE | 2 | Silero VAD ORT session 池大小，round-robin 分配（实测最优 2）；`ENABLE_VAD=false` 时不生效 |
 | GPU_STREAM_POOL_SIZE | 4 | TRT engine 多 stream 多 execution_context 池 |
 | OMP_NUM_THREADS | 1 | ★必须 1，防 libgomp 崩溃（run.sh 已固化） |
 | MKL_NUM_THREADS | 1 | 同上 |
@@ -545,9 +546,20 @@ docker-compose logs -f seaco-asr
 - **`CPU_THREAD_POOL_SIZE` 取值建议**（256 核机器，WORKERS=10）：总线程 ≈ WORKERS × 值，
   不超订分界 ≈ 256/10 ≈ 25/worker；推荐扫描 `{8, 16, 24, 32}`，勿到 64（10×64=640 严重超订）。
 
+#### `ENABLE_VAD`（默认 true）
+- 作用：是否启用 Silero VAD 语音活动检测
+- **true（默认）**：VAD 检测语音段，按 VAD 时间跨度（跳过首尾/段间静音）均匀切段
+- **false**：不加载/不运行 VAD，对整段音频按固定 4s（`UNIFORM_CHUNK_MS`）均匀切段：
+  - 整段 < 2s → 单段并 pad 到 2s；
+  - 尾段 < 2s → 并入前一段；尾段 ≥ 2s → 独立成段。
+- 关闭收益：省去 Stage1 VAD 推理开销（每 30s 音频约 937 次 session.run），
+  且 `/health` 不再检查 VAD 加载态；`VAD_SESSION_POOL_SIZE` 随之失效
+- 适用：音频无长静音、或上游已切好段、追求 Stage1 极限吞吐的场景
+- 代价：不跳过静音，纯静音段也会被切进 chunk 送入 encoder（含语音的定长流场景无影响）
+
 #### `VAD_SESSION_POOL_SIZE`（推荐 2，可调 2-8）
 - 作用：Silero VAD ORT session 池大小，多请求 round-robin 分配
-- 影响范围：仅 Stage1 VAD
+- 影响范围：仅 Stage1 VAD（`ENABLE_VAD=false` 时不生效）
 - **单 session 线程数硬编码 intra=inter=1**（见 vad.py），并行度完全由本 pool 提供
 - 建议值：**2**（默认，实测最优）
 - 调优场景：
