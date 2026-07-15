@@ -83,7 +83,7 @@ def run(url: str):
     status, _, text = _http("GET", f"{url}/metrics", timeout=10)
     print(f"\n[metrics] {status}, len={len(text)}")
     check(status == 200, "metrics 返回 200")
-    check("asr_request_total" in text, "含 asr_request_total")
+    check("fastapi_requests_total" in text, "含 fastapi_requests_total")
     check("asr_inference_duration_seconds" in text, "含 asr_inference_duration_seconds")
 
     # 3. 非法 base64 → 1001 DECODE_FAILED

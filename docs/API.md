@@ -252,7 +252,12 @@
 
 返回 Prometheus 格式的指标数据，包含：
 
-- `asr_request_total{status="success|error"}` — 请求总数
+- `fastapi_requests_total{method,endpoint,status,http_status}` — 客户端请求总数
+  （由 HTTP 中间件统一记录，覆盖成功/业务异常/兜底异常三种路径）
+  - `method` — HTTP 方法（GET/POST）
+  - `endpoint` — 路由模板（如 `/chinese_asr`、`/health`，非原始 path，避免高基数）
+  - `status` — `success`（http_status<400）/ `error`（≥400）
+  - `http_status` — HTTP 状态码字符串（如 `200`、`400`、`503`）
 - `asr_inference_duration_seconds` — 推理耗时直方图
 - `gpu_memory_usage_bytes` — GPU 显存使用量
 
@@ -282,10 +287,13 @@ uvicorn 多 worker（`WORKERS>1`）时每个 worker 是独立进程，各自的 
 
 ```promql
 # 成功请求 QPS（1 分钟窗口，已聚合全部 worker）
-rate(asr_request_total{status="success"}[1m])
+sum(rate(fastapi_requests_total{status="success"}[1m]))
 
 # 全部请求 QPS（含失败）
-sum(rate(asr_request_total[1m]))
+sum(rate(fastapi_requests_total[1m]))
+
+# 仅 /chinese_asr 端点成功 QPS
+sum(rate(fastapi_requests_total{endpoint="/chinese_asr",status="success"}[1m]))
 ```
 
 本端点只需保证多进程下 Counter 计数完整可聚合，速率交给 Prometheus 计算。

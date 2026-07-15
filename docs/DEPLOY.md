@@ -102,7 +102,7 @@ OPENBLAS_NUM_THREADS=1
 >
 > **多进程指标聚合**：模式 B（`WORKERS>1`）下 `/metrics` 依赖 `PROMETHEUS_MULTIPROC_DIR`
 > 聚合各 worker 指标，镜像已内置默认值（`/tmp/prometheus_multiproc`），开箱即用。
-> QPS 由 Prometheus 服务端 `rate(asr_request_total{status="success"}[1m])` 计算
+> QPS 由 Prometheus 服务端 `sum(rate(fastapi_requests_total{status="success"}[1m]))` 计算
 > （详见 API.md「GET /metrics — 多进程聚合」）。
 
 ### MODEL_PRECISION 说明
