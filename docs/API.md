@@ -98,6 +98,8 @@
   - 整段 < 2s → 单段并 pad 到 2s；
   - 尾段 < 2s → 并入前一段；尾段 ≥ 2s → 独立成段。
   - 段级 `timestamp` 为切段边界（非语音边界），空音频仍返回 `message="音频内容为空"`。
+- ★关 VAD 非提吞吐手段：含静音音频关 VAD 反而降吞吐（静音帧白送 GPU），
+  详见 `docs/DEPLOY.md` 的 `ENABLE_VAD` 说明与性能报告第十章。
 
 **字级时间戳说明**：
 - 由独立 timestamp engine（第 5 段，upsample CIF timestamp head）计算，对齐 FunASR

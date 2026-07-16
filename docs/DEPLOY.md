@@ -143,6 +143,7 @@ OPENBLAS_NUM_THREADS=1
 | PT 原生（验证/无 TRT） | `MODEL_PRECISION=pt WORKERS=1 bash run.sh` |
 | 小 GPU（2080Ti 防 OOM） | `MODEL_PRECISION=trt_fp16 WORKERS=1 bash run.sh` |
 | 纯转写极限吞吐 | `ENABLE_HOTWORD=false ENABLE_FAISS_CORRECTION=false bash run.sh` |
+| 纯 ASR 最小链路（全功能关闭） | `ENABLE_VAD=false ENABLE_HOTWORD=false ENABLE_FAISS_CORRECTION=false ENABLE_WORD_TIMESTAMP=false ENABLE_SENTENCE_TIMESTAMP=false bash run.sh` |
 
 ### 字级时间戳（任意后端，加 `ENABLE_WORD_TIMESTAMP=true`）
 
@@ -191,6 +192,81 @@ ENABLE_WORD_TIMESTAMP=true python scripts/prepare_model.py --precision trt_fp16 
 # 4. 启动服务
 python -m uvicorn src.main:app --host 0.0.0.0 --port 8080 --workers 11
 ```
+
+---
+
+## 纯 ASR 最小链路 + 功能测试
+
+关闭全部可选功能（VAD / 热词 / Faiss / 字级时间戳 / 句子级时间戳），只跑
+encoder → cif → decoder 三段主链路，用于纯转写吞吐基线与功能对照。
+
+### 启动（纯 ASR 模式）
+
+```bash
+# 全功能关闭：VAD 关闭后对整段音频固定 4s 均匀切段（<2s pad 到 2s；尾段<2s 并前段、>=2s 独立）
+ENABLE_VAD=false \
+ENABLE_HOTWORD=false \
+ENABLE_FAISS_CORRECTION=false \
+ENABLE_WORD_TIMESTAMP=false \
+ENABLE_SENTENCE_TIMESTAMP=false \
+MODEL_PRECISION=trt_fp16 \
+bash run.sh
+```
+
+各开关关闭的功能：
+
+| 开关 | 值 | 关闭的功能 |
+|------|-----|-----------|
+| `ENABLE_VAD` | false | 跳过 Silero VAD，整段固定 4s 均匀切段 |
+| `ENABLE_HOTWORD` | false | 路径 A（SeACo 在线热词） |
+| `ENABLE_FAISS_CORRECTION` | false | 路径 B（默认词表 Faiss 纠错） |
+| `ENABLE_WORD_TIMESTAMP` | false | 字级时间戳（第 5 段 timestamp engine），`asr[].words` 为空数组 |
+| `ENABLE_SENTENCE_TIMESTAMP` | false | 句子级标点分句（CT-Transformer） |
+
+> docker run 形式：把上述开关用 `-e KEY=value` 传入，命令末尾接 `bash run.sh`。
+> 启动日志会 dump 生效配置，确认无热词/Faiss/时间戳分组即为纯 ASR 模式。
+
+### 功能测试
+
+```bash
+# 单请求功能验证（确认纯 ASR 模式能正常识别）
+python tests/test_service.py --audio test_data/audio_16000_30s.wav --url http://localhost:8080
+
+# 短音频验证（<2s，关 VAD 时应单段 pad 到 2s 正常返回）
+python tests/test_service.py --audio test_data/audio_16000_1s.wav --url http://localhost:8080
+
+# 健康检查（确认 models_loaded / runtime_ok）
+curl http://localhost:8080/health
+```
+
+### 吞吐压测
+
+```bash
+# 固定 30s 音频压测（120 并发，2000 请求，采卡 0 的 GPU/CPU 利用率）
+python tests/test_service.py --audio test_data/audio_16000_30s.wav \
+  --url http://localhost:8080 --concurrency 120 --total 2000 --gpu-index 0
+
+# 随机时长压测（模拟线上 2~30s 不定长，验证尾段并入/独立逻辑）
+python tests/test_service.py --audio test_data/audio_16000_30s.wav \
+  --url http://localhost:8080 --concurrency 120 --total 2000 \
+  --random-duration --min-dur 2 --max-dur 30 --gpu-index 0
+```
+
+### QPS 指标监控（多进程聚合）
+
+```bash
+# 另开终端，配合上面压测实时观察各 endpoint QPS（每 2s 采样一次差分）
+python tests/test_metrics_qps.py --url http://localhost:8080 --interval 2
+
+# 只看当前累计计数快照
+python tests/test_metrics_qps.py --url http://localhost:8080 --once
+```
+
+> VAD 开/关吞吐对照：分别用 `ENABLE_VAD=false` 与默认（VAD 开）启动，跑同一条压测命令，
+> 对比 `吞吐(audio_s/s)`；`VERBOSE=1` 启动可在日志看 Stage1 内部 `stage1_vad` 耗时差异。
+>
+> ★注意：**含静音音频关 VAD 反而更慢**（实测 -24%，瓶颈在 GPU，静音帧被白送 GPU），
+> 详见「性能网格测试报告」第十章。关 VAD 仅适合无静音音频或定长切段功能需求，非提吞吐手段。
 
 ---
 
@@ -558,10 +634,16 @@ docker-compose logs -f seaco-asr
 - **false**：不加载/不运行 VAD，对整段音频按固定 4s（`UNIFORM_CHUNK_MS`）均匀切段：
   - 整段 < 2s → 单段并 pad 到 2s；
   - 尾段 < 2s → 并入前一段；尾段 ≥ 2s → 独立成段。
-- 关闭收益：省去 Stage1 VAD 推理开销（每 30s 音频约 937 次 session.run），
+- 关闭收益：省去 Stage1 VAD 推理开销（每 30s 音频约 937 次 session.run），CPU 占用下降；
   且 `/health` 不再检查 VAD 加载态；`VAD_SESSION_POOL_SIZE` 随之失效
-- 适用：音频无长静音、或上游已切好段、追求 Stage1 极限吞吐的场景
-- 代价：不跳过静音，纯静音段也会被切进 chunk 送入 encoder（含语音的定长流场景无影响）
+- 适用：**音频几乎无静音**（上游已切好的纯语音流、连续语音）、或需要固定 4s 定长切段、
+  不想要 VAD 静音裁剪行为的功能场景
+- ★**吞吐反直觉：含静音音频关 VAD 反而更慢**。实测（A10，30s 音频约 24% 静音，200 并发）
+  关 VAD 吞吐 **2230 vs 开 VAD 2912 audio_s/s（-24%）**，P90 延迟 6345 vs 3407ms。
+  原因：瓶颈在 GPU，VAD 裁掉静音减少了送进 encoder 的总帧数；关 VAD 后静音帧被白送 GPU
+  空算，抵消了省下的 CPU 开销（该链路 CPU 远未饱和）。详见「性能网格测试报告」第十章。
+- **决策**：含静音的真实音频保持 `ENABLE_VAD=true`（吞吐+延迟双优）；仅在音频无静音或
+  确需定长切段功能时才关。切勿为「提吞吐」盲目关 VAD。
 
 #### `VAD_SESSION_POOL_SIZE`（推荐 2，可调 2-8）
 - 作用：Silero VAD ORT session 池大小，多请求 round-robin 分配
