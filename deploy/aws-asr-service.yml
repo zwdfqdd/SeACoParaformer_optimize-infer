@@ -49,6 +49,8 @@ spec:
               value: '2048'
             - name: MODEL_PRECISION
               value: trt_fp16
+            - name: ENABLE_VAD
+              value: 'true'
             - name: VAD_SESSION_POOL_SIZE
               value: '2'
             - name: GPU_STREAM_POOL_SIZE
