@@ -38,7 +38,10 @@ services:
       # ─── 稳定性/性能池化参数（★必须显式设，防 libgomp 崩溃 + 榨干 GPU）───
       # CPU 流水线线程池（Stage1 VAD + Stage2 特征提取）；默认 32（256 核最优，per-worker）
       - CPU_THREAD_POOL_SIZE=${CPU_THREAD_POOL_SIZE:-32}
-      # VAD ORT session 池（round-robin 让多请求 VAD 真正并行）；默认 2（实测最优）
+      # VAD 开关；true 按语音段切；false 整段固定 4s 均匀切（<2s pad 到 2s，尾段<2s 并前段、>=2s 独立）
+      # ★含静音音频关 VAD 反降吞吐（静音帧白送 GPU），非提吞吐手段；仅无静音/定长切段场景才关
+      - ENABLE_VAD=${ENABLE_VAD:-true}
+      # VAD ORT session 池（round-robin 让多请求 VAD 真正并行）；默认 2（实测最优）；ENABLE_VAD=false 时不生效
       - VAD_SESSION_POOL_SIZE=${VAD_SESSION_POOL_SIZE:-2}
       # TRT engine 多 stream 多 execution_context 池（weights 共享，activation 独立）
       - GPU_STREAM_POOL_SIZE=${GPU_STREAM_POOL_SIZE:-4}
