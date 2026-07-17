@@ -31,7 +31,7 @@ from contextlib import asynccontextmanager
 
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
@@ -400,10 +400,10 @@ async def metrics():
     # scrape 时刷新 GPU 显存实际值（Gauge 标准做法）
     _update_gpu_memory_metric()
     _update_scheduler_metrics()
-    return JSONResponse(
-        content=generate_latest().decode("utf-8"),
-        media_type=CONTENT_TYPE_LATEST,
-    )
+    # ★必须用 Response 返回裸 bytes：JSONResponse 会把内容 JSON 序列化（字符串加引号、
+    # 换行转义为 \n），Prometheus 抓取器解析报 "expected a valid start token, got \"",
+    # target 被标记 DOWN。generate_latest 已是标准 Prometheus 文本格式，原样返回即可。
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 def _update_gpu_memory_metric():
