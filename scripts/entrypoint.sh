@@ -23,6 +23,19 @@ echo "=========================================="
 echo "MODEL_PRECISION: ${MODEL_PRECISION}"
 echo ""
 
+# ─── Prometheus 多进程指标目录（多 worker QPS 聚合）───
+# uvicorn 多 worker（WORKERS>1）时各 worker 独立进程，Counter 互不相通；
+# 设置 PROMETHEUS_MULTIPROC_DIR 后 main.py 的 /metrics 用 MultiProcessCollector
+# 聚合所有 worker（QPS 由服务端对 fastapi_requests_total 做 rate 计算）。
+# 该目录必须在启动前清空，否则残留的旧进程指标文件会污染聚合结果。
+if [ -n "${PROMETHEUS_MULTIPROC_DIR:-}" ]; then
+    echo "[Prometheus] 多进程指标目录: ${PROMETHEUS_MULTIPROC_DIR}（清空并重建）"
+    rm -rf "${PROMETHEUS_MULTIPROC_DIR}"
+    mkdir -p "${PROMETHEUS_MULTIPROC_DIR}"
+    export PROMETHEUS_MULTIPROC_DIR
+fi
+echo ""
+
 # ─── 1. 检查 + 按需构建模型产物 ───
 echo "[准备] 检查模型产物，缺失则按依赖链转换..."
 if python scripts/prepare_model.py --precision "${MODEL_PRECISION}"; then

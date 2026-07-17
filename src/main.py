@@ -25,6 +25,7 @@ import asyncio
 import base64
 import io
 import logging
+import os
 import signal
 import time
 from contextlib import asynccontextmanager
@@ -33,7 +34,14 @@ import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Histogram,
+    generate_latest,
+    multiprocess,
+)
 
 from src.asr_engine import asr_engine
 from src.audio_segment import (
@@ -83,9 +91,9 @@ _cmvn_istd: np.ndarray | None = None
 # Prometheus 指标
 # ============================================================
 asr_request_total = Counter(
-    "asr_request_total",
-    "ASR 请求总数",
-    ["status"],
+    "fastapi_requests_total",
+    "FastAPI 客户端请求总数 (按 endpoint/method/status/http_status 维度)",
+    labelnames=["method", "endpoint", "status", "http_status"],
 )
 asr_inference_duration = Histogram(
     "asr_inference_duration_seconds",
@@ -230,6 +238,13 @@ async def lifespan(app: FastAPI):
         _gpu_executor.shutdown(wait=False, cancel_futures=True)
     except Exception:
         pass
+    # 多进程 Prometheus：本 worker 退出时标记进程死亡，清理其 gauge 分片，
+    # 避免死进程的指标残留污染聚合结果（Counter/Histogram 保留累计值供聚合）。
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        try:
+            multiprocess.mark_process_dead(os.getpid())
+        except Exception:
+            pass
     logger.info("服务已关闭")
 
 
@@ -299,6 +314,35 @@ app = FastAPI(
 
 
 # ============================================================
+# 指标中间件（统一记录所有 HTTP 请求）
+# ============================================================
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    """按 method/endpoint/status/http_status 维度统一记录请求计数。
+
+    统一在中间件出口打点，覆盖成功、业务异常（ASRException）、兜底异常三种路径
+    （异常经异常处理器转成 JSONResponse 后仍会回到这里），避免在各处手动 inc
+    造成漏记或重复计数。endpoint 用路由模板（如 /chinese_asr）而非原始 path，
+    避免高基数 label 撑爆 Prometheus。
+    """
+    response = await call_next(request)
+
+    # 路由模板优先（无匹配路由时退回原始 path，如 404）
+    route = request.scope.get("route")
+    endpoint = getattr(route, "path", None) or request.url.path
+    status = "success" if response.status_code < 400 else "error"
+
+    asr_request_total.labels(
+        method=request.method,
+        endpoint=endpoint,
+        status=status,
+        http_status=str(response.status_code),
+    ).inc()
+
+    return response
+
+
+# ============================================================
 # 异常处理器
 # ============================================================
 @app.exception_handler(ASRException)
@@ -308,8 +352,10 @@ async def asr_exception_handler(request: Request, exc: ASRException):
     /chinese_asr 接口的失败响应补充 text/detail 空值字段，与成功响应结构保持一致，
     便于客户端用统一结构解析（成功 text 有值/detail 有段，失败均为空）。
     其他接口（如 /hotwords/*）保持精简的 code/error/message 结构。
+
+    请求计数统一由 metrics 中间件按 method/endpoint/status/http_status 记录，
+    此处不再手动 inc（避免与中间件重复计数）。
     """
-    asr_request_total.labels(status="error").inc()
     content = {"code": int(exc.code)}
     if request.url.path == "/chinese_asr":
         # 失败响应保持与成功响应结构一致（istar_asr/article_url/asr 空值），
@@ -330,9 +376,10 @@ async def asr_exception_handler(request: Request, exc: ASRException):
 async def unhandled_exception_handler(request: Request, exc: Exception):
     """兜底异常处理：未被 ASRException 包装的异常（切段/特征/解码等）统一转为
     结构化 500（ASR_INFER_FAILED），避免 FastAPI 默认处理器返回无 code/asr 字段的
-    原生 500 破坏 API 契约。"""
+    原生 500 破坏 API 契约。
+
+    请求计数由 metrics 中间件统一记录（见上）。"""
     logger.error(f"未处理异常: {type(exc).__name__}: {exc}")
-    asr_request_total.labels(status="error").inc()
     content = {"code": int(ErrorCode.ASR_INFER_FAILED)}
     if request.url.path == "/chinese_asr":
         content["article_url"] = None
@@ -396,14 +443,33 @@ async def health_check():
 
 @app.get("/metrics")
 async def metrics():
-    """Prometheus 指标接口。"""
+    """Prometheus 指标接口。
+
+    多进程聚合：uvicorn 多 worker（WORKERS>1）时每个 worker 是独立进程，各自的
+    Counter/Histogram 互不相通。若设置了环境变量 PROMETHEUS_MULTIPROC_DIR，则用
+    MultiProcessCollector 从该目录聚合所有 worker 的指标（QPS 等按全进程汇总，
+    否则 /metrics 只反映被抓到的那个 worker，QPS 严重偏低失真）。
+    未设置该环境变量时退回单进程默认 registry（兼容 WORKERS=1）。
+
+    QPS 由 Prometheus 服务端对 fastapi_requests_total 做 rate() 计算（Counter + rate
+    是标准做法），本端点只需保证多进程下计数完整可聚合。
+    """
     # scrape 时刷新 GPU 显存实际值（Gauge 标准做法）
     _update_gpu_memory_metric()
     _update_scheduler_metrics()
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        # 多进程模式：聚合所有 worker 的指标
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        data = generate_latest(registry)
+    else:
+        # 单进程模式：默认全局 registry
+        data = generate_latest()
+
     # ★必须用 Response 返回裸 bytes：JSONResponse 会把内容 JSON 序列化（字符串加引号、
     # 换行转义为 \n），Prometheus 抓取器解析报 "expected a valid start token, got \"",
     # target 被标记 DOWN。generate_latest 已是标准 Prometheus 文本格式，原样返回即可。
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 
 def _update_gpu_memory_metric():
@@ -535,7 +601,7 @@ async def asr_recognize(req: ASRRequest):
                 timeout=settings.ACQUIRE_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            asr_request_total.labels(status="error").inc()
+            # 计数由 metrics 中间件统一记录（SERVICE_BUSY → 503 → status=error）
             raise ASRException(
                 ErrorCode.SERVICE_BUSY,
                 f"服务过载，并发已达上限 {settings.MAX_CONCURRENT_REQUESTS}，请稍后重试",
@@ -589,7 +655,6 @@ async def asr_recognize(req: ASRRequest):
         # VAD 后无有效语音（静音/极短音频）：不报错，返回成功空结果 + 提示
         if not chunks:
             logger.info("VAD 后无有效语音段，返回空结果（音频内容为空）")
-            asr_request_total.labels(status="success").inc()
             return ASRResponse(
                 code=0,
                 article_url=req.article_url,
@@ -696,7 +761,6 @@ async def asr_recognize(req: ASRRequest):
             asr_latency_ms=elapsed_ms,
             result_length=len(response.istar_asr),
         )
-        asr_request_total.labels(status="success").inc()
 
         return response
     finally:
