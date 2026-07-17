@@ -268,6 +268,29 @@ v2.7 句子级时间戳（已完成）：
       scripts/download_asr.py（prepare_model.ensure_pt）。
     - 纯 onnxruntime（项目已有），无新增依赖（弃用 ngram-punctuator/kenlm/modelscope）。
 
+v2.8 VAD 开关 + Prometheus 可观测性增强（已完成，tag v2.8.0）：
+    - VAD 开关 ENABLE_VAD（默认 true）：关闭后跳过 Silero VAD，对整段音频固定 4s
+      均匀切段（segment_to_chunks_no_vad）：整段 <2s pad 到 2s；尾段 <2s 并入前段、
+      >=2s 独立成段。关闭时 /health 不再检查 VAD 加载态，VAD_SESSION_POOL_SIZE 失效。
+      ★实测：含静音音频关 VAD 反降吞吐（两组 GPU 均满载，静音帧白送 GPU 空算，-24%，
+      2230 vs 2912 audio_s/s），仅适合无静音/定长切段功能场景，非提吞吐手段
+      （见 docs/性能网格测试报告.md 第十章，含机制分析 + 复现命令）。
+    - Prometheus 多进程指标聚合 PROMETHEUS_MULTIPROC_DIR：多 worker（WORKERS>1）下
+      /metrics 用 multiprocess.MultiProcessCollector 聚合所有 worker，解决 QPS 只反映
+      单 worker、偏低约 1/WORKERS 的问题；worker 退出 mark_process_dead 清理分片。
+      Dockerfile 内置默认目录 /tmp/prometheus_multiproc，entrypoint 启动清空重建。
+    - 请求计数改造 fastapi_requests_total：多维标签 method/endpoint/status/http_status，
+      HTTP 中间件统一出口打点（覆盖成功/业务异常/兜底异常三路径，endpoint 用路由模板防
+      高基数），QPS 由 Prometheus 端 rate() 计算。新增 tests/test_metrics_qps.py 监控脚本。
+    - 修复 /metrics：改用 Response 返回裸 Prometheus 文本（原 JSONResponse 会 JSON 序列化
+      加引号/转义换行，抓取器报 "expected a valid start token"、target DOWN）。
+    - 修复 entrypoint.sh CRLF：Windows 换行致 shebang 变 #!/bin/bash\r，容器报
+      "exec /entrypoint.sh: no such file or directory"；转 LF + 新增 .gitattributes
+      固化 *.sh 为 eol=lf 防复发。
+    - 部署：run.sh / docker-compose 系列 / .env 补 ENABLE_VAD；新增 AWS EKS 部署清单
+      deploy/aws-asr-service.yml（g5.8xlarge/ECR，WORKERS=11 trt_fp16，
+      PROMETHEUS_MULTIPROC_DIR 挂载 emptyDir tmpfs）；Dockerfile 默认改 trt_fp16 / 2048。
+
 暂不实施（明确搁置）：
     - trt_int8_enc GPU 吞吐/显存实测、热词路径 A（带 hotwords）吞吐实测
     - 真实标注测试集 CER 复核（当前以 fp16 输出为参考基准）
